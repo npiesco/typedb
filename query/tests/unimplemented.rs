@@ -11,17 +11,17 @@ use concept::{error::ConceptReadError, thing::thing_manager::ThingManager, type_
 use encoding::graph::definition::definition_key_generator::DefinitionKeyGenerator;
 use error::UnimplementedFeature;
 use executor::{
-    pipeline::{stage::ExecutionContext, PipelineExecutionError},
-    row::MaybeOwnedRow,
     ExecutionInterrupt,
+    pipeline::{PipelineExecutionError, stage::ExecutionContext},
+    row::MaybeOwnedRow,
 };
 use function::function_manager::FunctionManager;
-use ir::{pipeline::FunctionRepresentationError, RepresentationError};
+use ir::RepresentationError;
 use itertools::Either;
 use lending_iterator::LendingIterator;
-use query::{error::QueryError, query_cache::QueryCache, query_manager::QueryManager};
+use query::{error::QueryError, given_rows::GivenRowsSimple, query_cache::QueryCache, query_manager::QueryManager};
 use resource::profile::CommitProfile;
-use storage::{durability_client::WALClient, snapshot::CommittableSnapshot, MVCCStorage};
+use storage::{MVCCStorage, durability_client::WALClient, snapshot::CommittableSnapshot};
 use test_utils::TempDir;
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;
@@ -30,7 +30,7 @@ struct Context {
     storage: Arc<MVCCStorage<WALClient>>,
     type_manager: Arc<TypeManager>,
     thing_manager: Arc<ThingManager>,
-    function_manager: FunctionManager,
+    function_manager: Arc<FunctionManager>,
     query_manager: QueryManager,
     _tmp_dir: TempDir,
 }
@@ -40,13 +40,13 @@ fn setup_common(schema: &str) -> Context {
     setup_concept_storage(&mut storage);
 
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let function_manager = FunctionManager::new(Arc::new(DefinitionKeyGenerator::new()), None);
+    let function_manager = Arc::new(FunctionManager::new(Arc::new(DefinitionKeyGenerator::new()), None));
     let query_manager = QueryManager::new(None);
 
     let mut snapshot = storage.clone().open_snapshot_schema();
     let define = typeql::parse_query(schema).unwrap().into_structure().into_schema();
     query_manager
-        .execute_schema(&mut snapshot, &type_manager, &thing_manager, &function_manager, define, schema)
+        .execute_schema(&mut snapshot, &type_manager, &thing_manager, &function_manager, &define, schema)
         .unwrap();
     snapshot.commit(&mut CommitProfile::DISABLED).unwrap();
 
@@ -71,8 +71,9 @@ fn run_read_query(
             snapshot,
             &context.type_manager,
             context.thing_manager.clone(),
-            &context.function_manager,
+            context.function_manager.clone(),
             &match_,
+            None::<GivenRowsSimple>,
             query,
         )
         .map_err(|query_error| Either::Left(query_error))?;
@@ -97,8 +98,9 @@ fn run_write_query(
             snapshot,
             &context.type_manager,
             context.thing_manager.clone(),
-            &context.function_manager,
+            context.function_manager.clone(),
             &query_as_pipeline,
+            None::<GivenRowsSimple>,
             query,
         )
         .unwrap();
@@ -172,37 +174,6 @@ fn structs_lists_optionals() {
         "#;
         let Either::Left(err) = run_read_query(&context, query).unwrap_err() else { unreachable!() };
         check_unimplemented_language_feature(&err, &error::UnimplementedFeature::Lists);
-    }
-
-    {
-        let query = r#"
-        with
-        fun return_optional() -> { integer? }:
-        match
-            try {
-                let $x = 5;
-            };
-        return { $x };
-
-        match
-            let $y in return_optional();
-
-        "#;
-        let mut matches = false;
-        let outer_err = run_read_query(&context, query).unwrap_err();
-        if let Either::Left(err) = &outer_err {
-            if let QueryError::Representation { typedb_source: err, .. } = err.as_ref() {
-                if let RepresentationError::FunctionRepresentation {
-                    typedb_source: FunctionRepresentationError::UnimplementedFunctionOptionals { feature, .. },
-                } = err.as_ref()
-                {
-                    matches = feature == &error::UnimplementedFeature::OptionalFunctions
-                }
-            }
-        }
-        if !matches {
-            Err::<(), _>(outer_err).unwrap();
-        }
     }
 }
 

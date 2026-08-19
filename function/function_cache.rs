@@ -6,16 +6,16 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use compiler::annotation::function::{annotate_stored_functions, AnnotatedFunction, AnnotatedSchemaFunctions};
+use compiler::annotation::function::{AnnotatedFunction, AnnotatedSchemaFunctions, annotate_stored_functions};
 use concept::type_::type_manager::TypeManager;
 use encoding::graph::definition::definition_key::DefinitionKey;
 use ir::pipeline::function_signature::{FunctionSignatureIndex, HashMapFunctionSignatureIndex};
-use storage::{sequence_number::SequenceNumber, snapshot::ReadableSnapshot, MVCCStorage};
+use storage::{MVCCStorage, sequence_number::SequenceNumber, snapshot::ReadableSnapshot};
 
 use crate::{
+    FunctionError,
     function::SchemaFunction,
     function_manager::{FunctionManager, FunctionReader},
-    FunctionError,
 };
 
 #[derive(Debug)]
@@ -30,7 +30,7 @@ impl FunctionCache {
         storage: Arc<MVCCStorage<D>>,
         type_manager: &TypeManager,
         open_sequence_number: SequenceNumber,
-    ) -> Result<Self, FunctionError> {
+    ) -> Result<Self, Box<FunctionError>> {
         let snapshot = storage.open_snapshot_read_at(open_sequence_number);
         let cache = Self::build_cache(&snapshot, type_manager);
         cache
@@ -39,7 +39,7 @@ impl FunctionCache {
     pub(crate) fn build_cache(
         snapshot: &impl ReadableSnapshot,
         type_manager: &TypeManager,
-    ) -> Result<FunctionCache, FunctionError> {
+    ) -> Result<FunctionCache, Box<FunctionError>> {
         let schema_functions = FunctionReader::get_functions_all(snapshot)
             .map_err(|typedb_source| FunctionError::FunctionRetrieval { typedb_source })?;
         // Prepare ir

@@ -6,34 +6,38 @@
 
 #![deny(unused_must_use)]
 #![deny(elided_lifetimes_in_paths)]
-extern crate core;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{fs, future::Future, net::SocketAddr, path::Path, pin::Pin, sync::Arc};
 
-use axum_server::{tls_rustls::RustlsConfig, Handle};
-use database::database_manager::DatabaseManager;
-use projection::{
-    catalog::MaterializedCatalog,
-    pgwire::{authenticator::AuthMode, connection::ServerParams, listener::PgWireListener},
-};
+use axum_server::{Handle, tls_rustls::RustlsConfig};
+use concurrency::{TokioTaskSpawner, TokioTaskTracker};
+use database::database_manager::ImportOwnership;
+use futures::future::try_join_all;
+use projection::pgwire::{authenticator::AuthMode, connection::ServerParams, listener::PgWireListener};
+use rand::prelude::SliceRandom;
 use resource::{
-    constants::server::{GRPC_CONNECTION_KEEPALIVE, SERVER_INFO},
-    server_info::ServerInfo,
+    constants::{
+        common::STUDIO_URL,
+        server::{
+            DISTRIBUTION_INFO, GRPC_CONNECTION_KEEPALIVE, GRPC_MAX_MESSAGE_SIZE, HTTP_MAX_MESSAGE_SIZE,
+            SERVER_ID_ALPHABET, SERVER_ID_FILE_NAME, SERVER_ID_LENGTH,
+        },
+    },
+    distribution_info::DistributionInfo,
+    server_info::{EndpointInfo, ServingInfo, print_serving_block},
 };
-use tokio::{
-    net::lookup_host,
-    sync::watch::{channel, Receiver, Sender},
-};
+use tokio::sync::watch::{Receiver, Sender, channel};
 use tracing::info;
 
 use crate::{
     error::ServerOpenError,
-    parameters::config::{Config, EncryptionConfig},
+    parameters::config::{Config, EncryptionConfig, ServerConfig, StorageConfig},
     service::{
+        admin::transport::{self, AdminPath},
         grpc, http,
         pgwire::{CatalogQueryHandler, ServerStateAuthenticator},
     },
-    state::{BoxServerState, LocalServerState},
+    state::{BoxServerStatus, ServerState},
 };
 
 pub mod authentication;
@@ -41,21 +45,62 @@ pub mod error;
 pub mod parameters;
 pub mod service;
 pub mod state;
+pub mod status;
+pub mod system_init;
+pub mod transaction;
 
-#[derive(Default)]
+pub mod admin_proto {
+    pub use server_admin_proto::*;
+}
+
+pub type AdminServeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerOpenError>> + Send>>;
+
 pub struct ServerBuilder {
-    server_info: Option<ServerInfo>,
-    server_state: Option<BoxServerState>,
+    distribution_info: Option<DistributionInfo>,
+    server_state: Option<Arc<ServerState>>,
     shutdown_channel: Option<(Sender<()>, Receiver<()>)>,
+    storage_server_id: Option<String>,
+    background_tasks_tracker: Option<TokioTaskTracker>,
+    admin_serve_override: Option<AdminServeFuture>,
+}
+
+impl std::fmt::Debug for ServerBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerBuilder")
+            .field("distribution_info", &self.distribution_info)
+            .field("server_state", &self.server_state)
+            .field("shutdown_channel", &self.shutdown_channel)
+            .field("storage_server_id", &self.storage_server_id)
+            .field("background_tasks_tracker", &self.background_tasks_tracker)
+            .field("admin_serve_override", &self.admin_serve_override.as_ref().map(|_| "..."))
+            .finish()
+    }
+}
+
+impl Default for ServerBuilder {
+    fn default() -> Self {
+        Self {
+            distribution_info: None,
+            server_state: None,
+            shutdown_channel: None,
+            storage_server_id: None,
+            background_tasks_tracker: None,
+            admin_serve_override: None,
+        }
+    }
 }
 
 impl ServerBuilder {
-    pub fn server_info(mut self, server_info: ServerInfo) -> Self {
-        self.server_info = Some(server_info);
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn distribution_info(mut self, distribution_info: DistributionInfo) -> Self {
+        self.distribution_info = Some(distribution_info);
         self
     }
 
-    pub fn server_state(mut self, server_state: BoxServerState) -> Self {
+    pub fn server_state(mut self, server_state: Arc<ServerState>) -> Self {
         self.server_state = Some(server_state);
         self
     }
@@ -65,124 +110,251 @@ impl ServerBuilder {
         self
     }
 
-    pub async fn build(self, config: Config) -> Result<Server, ServerOpenError> {
-        let server_info = self.server_info.unwrap_or(SERVER_INFO);
+    pub fn background_tasks_tracker(mut self, background_tasks_tracker: TokioTaskTracker) -> Self {
+        self.background_tasks_tracker = Some(background_tasks_tracker);
+        self
+    }
+
+    pub fn admin_serve_override(mut self, serve_future: AdminServeFuture) -> Self {
+        self.admin_serve_override = Some(serve_future);
+        self
+    }
+
+    pub async fn build(mut self, config: Config) -> Result<Server, ServerOpenError> {
+        let server_id = self.initialise_storage(&config.storage)?.to_string();
+        let distribution_info = self.distribution_info.unwrap_or(DISTRIBUTION_INFO);
         let (shutdown_sender, shutdown_receiver) = self.shutdown_channel.unwrap_or_else(|| channel(()));
+        let background_tasks_tracker =
+            self.background_tasks_tracker.unwrap_or_else(|| TokioTaskTracker::new(shutdown_receiver.clone()));
+
         let server_state = match self.server_state {
-            Some(s) => s,
+            Some(server_state) => server_state,
             None => {
-                Box::new(LocalServerState::new(SERVER_INFO, config.clone(), None, shutdown_receiver.clone()).await?)
+                let server_state = ServerState::new(
+                    distribution_info,
+                    config.clone(),
+                    server_id,
+                    None,
+                    ImportOwnership::Exclusive,
+                    shutdown_receiver.clone(),
+                    background_tasks_tracker.get_spawner(),
+                )
+                .await?
+                .build();
+                server_state
+                    .initialise()
+                    .await
+                    .map_err(|error| ServerOpenError::ServerState { typedb_source: error })?;
+                Arc::new(server_state)
             }
         };
-        Ok(Server::new(server_info, config, Arc::new(server_state), shutdown_sender, shutdown_receiver))
+
+        Ok(Server::new(
+            distribution_info,
+            config,
+            server_state,
+            shutdown_sender,
+            shutdown_receiver,
+            background_tasks_tracker,
+            self.admin_serve_override,
+        ))
+    }
+
+    pub fn initialise_storage(&mut self, storage_config: &StorageConfig) -> Result<&str, ServerOpenError> {
+        if self.storage_server_id.is_none() {
+            Self::may_initialise_storage_directory(&storage_config.data_directory)?;
+            self.storage_server_id = Some(Self::may_initialise_server_id(&storage_config.data_directory)?);
+        }
+        Ok(self.storage_server_id.as_ref().unwrap())
+    }
+
+    fn may_initialise_storage_directory(storage_directory: &Path) -> Result<(), ServerOpenError> {
+        debug_assert!(storage_directory.is_absolute());
+        if !storage_directory.exists() {
+            Self::create_storage_directory(storage_directory)
+        } else if !storage_directory.is_dir() {
+            Err(ServerOpenError::NotADirectory { path: storage_directory.to_str().unwrap_or("").to_owned() })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn create_storage_directory(storage_directory: &Path) -> Result<(), ServerOpenError> {
+        fs::create_dir_all(storage_directory).map_err(|source| ServerOpenError::CouldNotCreateDataDirectory {
+            path: storage_directory.to_str().unwrap_or("").to_owned(),
+            source: Arc::new(source),
+        })?;
+        Ok(())
+    }
+
+    fn may_initialise_server_id(storage_directory: &Path) -> Result<String, ServerOpenError> {
+        let server_id_file = storage_directory.join(SERVER_ID_FILE_NAME);
+        if server_id_file.exists() {
+            let server_id = fs::read_to_string(&server_id_file)
+                .map_err(|source| ServerOpenError::CouldNotReadServerIDFile {
+                    path: server_id_file.to_str().unwrap_or("").to_owned(),
+                    source: Arc::new(source),
+                })?
+                .trim()
+                .to_owned();
+            if server_id.is_empty() {
+                Err(ServerOpenError::InvalidServerID { path: server_id_file.to_str().unwrap_or("").to_owned() })
+            } else {
+                Ok(server_id)
+            }
+        } else {
+            let server_id = Self::generate_server_id();
+            assert!(!server_id.is_empty(), "Generated server ID should not be empty");
+            fs::write(server_id_file.clone(), &server_id).map_err(|source| {
+                ServerOpenError::CouldNotCreateServerIDFile {
+                    path: server_id_file.to_str().unwrap_or("").to_owned(),
+                    source: Arc::new(source),
+                }
+            })?;
+            Ok(server_id)
+        }
+    }
+
+    fn generate_server_id() -> String {
+        let mut rng = rand::thread_rng();
+        (0..SERVER_ID_LENGTH).map(|_| SERVER_ID_ALPHABET.choose(&mut rng).unwrap()).collect()
     }
 }
 
-#[derive(Debug)]
 pub struct Server {
-    server_info: ServerInfo,
+    distribution_info: DistributionInfo,
     config: Config,
-    server_state: Arc<BoxServerState>,
+    server_state: Arc<ServerState>,
     shutdown_sender: Sender<()>,
     shutdown_receiver: Receiver<()>,
+    background_tasks_tracker: TokioTaskTracker,
+    admin_serve_override: Option<AdminServeFuture>,
+}
+
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server")
+            .field("distribution_info", &self.distribution_info)
+            .field("config", &self.config)
+            .field("server_state", &self.server_state)
+            .field("shutdown_sender", &self.shutdown_sender)
+            .field("shutdown_receiver", &self.shutdown_receiver)
+            .field("background_tasks_tracker", &self.background_tasks_tracker)
+            .field("admin_serve_override", &self.admin_serve_override.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl Server {
     pub fn new(
-        server_info: ServerInfo,
+        distribution_info: DistributionInfo,
         config: Config,
-        server_state: Arc<BoxServerState>,
+        server_state: Arc<ServerState>,
         shutdown_sender: Sender<()>,
         shutdown_receiver: Receiver<()>,
+        background_tasks_tracker: TokioTaskTracker,
+        admin_serve_override: Option<AdminServeFuture>,
     ) -> Self {
-        Self { server_info, config, server_state, shutdown_sender, shutdown_receiver }
+        Self {
+            distribution_info,
+            config,
+            server_state,
+            shutdown_sender,
+            shutdown_receiver,
+            background_tasks_tracker,
+            admin_serve_override,
+        }
     }
 
     pub async fn serve(self) -> Result<(), ServerOpenError> {
-        Self::print_hello(self.server_info, self.config.development_mode.enabled);
+        Self::print_hello(self.distribution_info, self.config.development_mode.enabled);
+        let serve_result = Self::serve_all(
+            self.distribution_info,
+            self.config.server.clone(),
+            self.server_state,
+            self.shutdown_sender.clone(),
+            self.shutdown_receiver,
+            self.background_tasks_tracker.get_spawner(),
+            self.admin_serve_override,
+        )
+        .await;
+        let _ = self.shutdown_sender.send(());
+        self.background_tasks_tracker.join().await;
+        serve_result
+    }
 
+    async fn serve_all(
+        distribution_info: DistributionInfo,
+        server_config: ServerConfig,
+        server_state: Arc<ServerState>,
+        shutdown_sender: Sender<()>,
+        shutdown_receiver: Receiver<()>,
+        background_tasks_spawner: TokioTaskSpawner,
+        admin_serve_override: Option<AdminServeFuture>,
+    ) -> Result<(), ServerOpenError> {
         Self::install_default_encryption_provider()?;
 
-        let grpc_address = Self::resolve_address(self.config.server.address).await;
-        let http_address_opt = if self.config.server.http.enabled {
-            Some(
-                Self::validate_and_resolve_http_address(self.config.server.http.address.clone(), grpc_address.clone())
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let pgwire_address_opt = if self.config.server.pgwire.enabled {
-            Some(Self::resolve_address(self.config.server.pgwire.address).await)
-        } else {
-            None
-        };
+        let mut servers: Vec<Pin<Box<dyn Future<Output = Result<(), ServerOpenError>> + Send>>> = Vec::new();
 
         let grpc_server = Self::serve_grpc(
-            grpc_address,
-            &self.config.server.encryption,
-            self.server_state.clone(),
-            self.shutdown_receiver.clone(),
+            server_state.grpc_listen_address(),
+            &server_config.encryption,
+            server_state.clone(),
+            shutdown_receiver.clone(),
         );
-        let http_server = if let Some(http_address) = http_address_opt {
-            let server = Self::serve_http(
-                self.server_info,
-                http_address,
-                &self.config.server.encryption,
-                self.server_state.clone(),
-                self.shutdown_receiver.clone(),
+        servers.push(Box::pin(grpc_server));
+
+        if let Some(http_listen_address) = server_state.http_listen_address() {
+            let http_server = Self::serve_http(
+                http_listen_address,
+                &server_config.encryption,
+                server_state.clone(),
+                shutdown_receiver.clone(),
+                background_tasks_spawner.clone(),
             );
-            Some(server)
-        } else {
-            None
-        };
-        let pgwire_server = if let Some(pgwire_address) = pgwire_address_opt {
-            let catalog = MaterializedCatalog::new();
-            let server =
-                Self::serve_pgwire(pgwire_address, self.server_state.clone(), catalog, self.shutdown_receiver.clone());
-            Some(server)
-        } else {
-            None
-        };
-
-        Self::print_serving_information(grpc_address, http_address_opt, &self.config.server.encryption);
-        if let Some(addr) = pgwire_address_opt {
-            info!("Serving pgwire (Postgres) on {addr}");
+            servers.push(Box::pin(http_server));
         }
 
-        Self::spawn_shutdown_handler(self.shutdown_sender);
-        match (http_server, pgwire_server) {
-            (Some(http), Some(pgwire)) => {
-                let (grpc_result, http_result, pgwire_result) = tokio::join!(grpc_server, http, pgwire);
-                grpc_result?;
-                http_result?;
-                pgwire_result?;
-            }
-            (Some(http), None) => {
-                let (grpc_result, http_result) = tokio::join!(grpc_server, http);
-                grpc_result?;
-                http_result?;
-            }
-            (None, Some(pgwire)) => {
-                let (grpc_result, pgwire_result) = tokio::join!(grpc_server, pgwire);
-                grpc_result?;
-                pgwire_result?;
-            }
-            (None, None) => {
-                grpc_server.await?;
-            }
+        if server_config.pgwire.enabled {
+            let pgwire_address = ServerState::resolve_address(&server_config.pgwire.address).await?;
+            let pgwire_server = Self::serve_pgwire(pgwire_address, server_state.clone(), shutdown_receiver.clone());
+            servers.push(Box::pin(pgwire_server));
         }
-        Ok(())
+
+        if let Some(admin_endpoint) = server_state.admin_endpoint().cloned() {
+            let admin_server = admin_serve_override.unwrap_or_else(|| {
+                Self::serve_admin(
+                    admin_endpoint,
+                    server_state.clone(),
+                    background_tasks_spawner.clone(),
+                    shutdown_receiver.clone(),
+                )
+            });
+            servers.push(Box::pin(admin_server));
+        }
+
+        let server_status = server_state
+            .servers()
+            .status()
+            .await
+            .map_err(|typedb_source| ServerOpenError::ServerState { typedb_source })?;
+        Self::print_serving_information(&server_status, &server_config.encryption);
+        if distribution_info.is_default_distribution() {
+            Self::print_ready();
+        }
+
+        Self::spawn_shutdown_handler(shutdown_sender);
+        try_join_all(servers).await.map(|_| ())
     }
 
     async fn serve_grpc(
         address: SocketAddr,
         encryption_config: &EncryptionConfig,
-        server_state: Arc<BoxServerState>,
+        server_state: Arc<ServerState>,
         mut shutdown_receiver: Receiver<()>,
     ) -> Result<(), ServerOpenError> {
         let authenticator = grpc::authenticator::Authenticator::new(server_state.clone());
-        let service = grpc::typedb_service::TypeDBService::new(address.clone(), server_state.clone());
+        let service = grpc::typedb_service::GRPCTypeDBService::new(server_state.clone());
         let mut grpc_server =
             tonic::transport::Server::builder().http2_keepalive_interval(Some(GRPC_CONNECTION_KEEPALIVE));
         if let Some(tls_config) = grpc::encryption::prepare_tls_config(encryption_config)? {
@@ -192,7 +364,11 @@ impl Server {
         }
         grpc_server
             .layer(&authenticator)
-            .add_service(typedb_protocol::type_db_server::TypeDbServer::new(service))
+            .add_service(
+                typedb_protocol::type_db_server::TypeDbServer::new(service)
+                    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE),
+            )
             .serve_with_shutdown(address, async {
                 // The tonic server starts a shutdown process when this closure execution finishes
                 shutdown_receiver.changed().await.expect("Expected shutdown receiver signal");
@@ -202,20 +378,21 @@ impl Server {
     }
 
     async fn serve_http(
-        server_info: ServerInfo,
         address: SocketAddr,
         encryption_config: &EncryptionConfig,
-        server_state: Arc<BoxServerState>,
+        server_state: Arc<ServerState>,
         mut shutdown_receiver: Receiver<()>,
+        background_tasks: TokioTaskSpawner,
     ) -> Result<(), ServerOpenError> {
         let authenticator = http::authenticator::Authenticator::new(server_state.clone());
-        let service = http::typedb_service::TypeDBService::new(server_info, address, server_state.clone());
+        let service = http::typedb_service::HTTPTypeDBService::new(server_state.clone(), background_tasks);
         let encryption_config = http::encryption::prepare_tls_config(encryption_config)?;
         let http_service = Arc::new(service);
-        let router_service = http::typedb_service::TypeDBService::create_protected_router(http_service.clone())
+        let router_service = http::typedb_service::HTTPTypeDBService::create_protected_router(http_service.clone())
             .layer(authenticator)
-            .merge(http::typedb_service::TypeDBService::create_unprotected_router(http_service))
-            .layer(http::typedb_service::TypeDBService::create_cors_layer())
+            .merge(http::typedb_service::HTTPTypeDBService::create_unprotected_router(http_service))
+            .layer(http::typedb_service::HTTPTypeDBService::create_cors_layer())
+            .layer(axum::extract::DefaultBodyLimit::max(HTTP_MAX_MESSAGE_SIZE))
             .into_make_service();
 
         let shutdown_handle = Handle::new();
@@ -239,16 +416,11 @@ impl Server {
 
     async fn serve_pgwire(
         address: SocketAddr,
-        server_state: Arc<BoxServerState>,
-        catalog: MaterializedCatalog,
+        server_state: Arc<ServerState>,
         mut shutdown_receiver: Receiver<()>,
     ) -> Result<(), ServerOpenError> {
-        // Build the query handler backed by the materialized catalog.
-        let handler = Arc::new(CatalogQueryHandler::new(catalog));
-
-        // Build the auth mode.
+        let handler = Arc::new(CatalogQueryHandler::new(server_state.clone()));
         let auth_mode = AuthMode::CleartextPassword(Arc::new(ServerStateAuthenticator::new(server_state)));
-
         let params = ServerParams::default();
 
         let listener = PgWireListener::bind(&address.to_string(), handler, params)
@@ -263,73 +435,135 @@ impl Server {
             let _ = shutdown_tx.send(true);
         });
 
-        let _handles = listener.run(shutdown_rx).await;
-
-        // Wait for outstanding connections to finish (best-effort).
-        for handle in _handles {
+        for handle in listener.run(shutdown_rx).await {
             let _ = handle.await;
         }
 
         Ok(())
     }
 
-    async fn validate_and_resolve_http_address(
-        http_address: String,
-        grpc_address: SocketAddr,
-    ) -> Result<SocketAddr, ServerOpenError> {
-        let http_address = Self::resolve_address(http_address).await;
-        if grpc_address == http_address {
-            return Err(ServerOpenError::GrpcHttpConflictingAddress { address: grpc_address });
-        }
-        Ok(http_address)
+    fn serve_admin(
+        endpoint: AdminPath,
+        server_state: Arc<ServerState>,
+        task_spawner: TokioTaskSpawner,
+        mut shutdown_receiver: Receiver<()>,
+    ) -> AdminServeFuture {
+        let admin_service = service::admin::AdminService::new(server_state);
+        let bind_shutdown_receiver = shutdown_receiver.clone();
+        Box::pin(async move {
+            let listener = transport::bind_admin_endpoint(&endpoint, &task_spawner, bind_shutdown_receiver)?;
+            let endpoint_for_error = transport::endpoint_to_string(&endpoint);
+            let endpoint_for_cleanup = endpoint.clone();
+            let incoming = listener.into_incoming();
+            let serve_result = tonic::transport::Server::builder()
+                .add_service(admin_proto::type_db_admin_server::TypeDbAdminServer::new(admin_service))
+                .serve_with_incoming_shutdown(incoming, async {
+                    // The tonic server starts a shutdown process when this closure execution finishes
+                    shutdown_receiver.changed().await.expect("Expected shutdown receiver signal");
+                })
+                .await
+                .map_err(|err| ServerOpenError::AdminServe { path: endpoint_for_error, source: Arc::new(err) });
+            transport::cleanup_admin_endpoint(&endpoint_for_cleanup);
+            serve_result
+        })
     }
 
-    pub async fn resolve_address(address: String) -> SocketAddr {
-        lookup_host(address.clone())
-            .await
-            .unwrap()
-            .next()
-            .unwrap_or_else(|| panic!("Unable to map address '{}' to any IP addresses", address))
-    }
-
-    fn print_hello(server_info: ServerInfo, is_development_mode_enabled: bool) {
-        println!("{}", server_info.logo); // very important
+    fn print_hello(distribution_info: DistributionInfo, is_development_mode_enabled: bool) {
+        println!("{}", distribution_info.logo); // very important
+        let version = distribution_info.version.trim();
         if is_development_mode_enabled {
-            println!("Running {} {} in development mode.", server_info.distribution, server_info.version);
+            println!("Running {} {} in development mode.", distribution_info.distribution, version);
         } else {
-            println!("Running {} {}.", server_info.distribution, server_info.version);
+            println!("Running {} {}.", distribution_info.distribution, version);
         }
     }
 
-    fn print_serving_information(
-        grpc_address: SocketAddr,
-        http_address: Option<SocketAddr>,
-        encryption_config: &EncryptionConfig,
-    ) {
+    pub fn print_serving_information(server_status: &BoxServerStatus, encryption_config: &EncryptionConfig) {
+        let info = ServingInfo {
+            grpc: EndpointInfo {
+                listen: server_status.grpc_listen_address().map(str::to_string),
+                advertise: server_status.grpc_advertise_address().map(str::to_string),
+            },
+            http: server_status.http_listen_address().map(|listen| EndpointInfo {
+                listen: Some(listen.to_string()),
+                advertise: server_status.http_advertise_address().map(str::to_string),
+            }),
+            admin: server_status.admin_address().map(str::to_string),
+            monitoring: server_status.monitoring_address().map(str::to_string),
+        };
+        print_serving_block(&info);
+
         if encryption_config.enabled {
-            print!("Serving gRPC on {grpc_address}");
-            if let Some(http_address) = http_address {
-                print!(" and HTTP on {http_address}");
-            }
-            println!(" with TLS enabled.");
-            println!("**To allow driver connections, drivers must also be configured to use TLS.**")
+            println!("TLS: enabled");
+            println!("  Drivers must also be configured to use TLS.");
         } else {
-            print!("Serving gRPC on {grpc_address}");
-            if let Some(http_address) = http_address {
-                print!(" and HTTP on {http_address}");
-            }
-            println!(" without TLS.");
-            println!("WARNING: TLS NOT ENABLED. This means connections are insecure and transmit username/password credentials unencrypted over the network.");
-            println!("**To allow driver connections, drivers must also be configured to *not* use TLS**")
+            println!("TLS: disabled");
+            println!("  WARNING: TLS NOT ENABLED. Credentials are transmitted unencrypted in plaintext.");
+            println!("  Drivers must be configured to connect *without TLS*.");
         }
+
+        let grpc_connect_address =
+            Self::connect_address(server_status.grpc_advertise_address(), server_status.grpc_listen_address());
+        let http_connect_address =
+            Self::connect_address(server_status.http_advertise_address(), server_status.http_listen_address());
+        if grpc_connect_address.is_some() || http_connect_address.is_some() {
+            println!("\nTo connect:");
+            if let Some(http_connect_address) = http_connect_address.as_deref() {
+                println!("  Studio:  {}", Self::studio_connect_link(http_connect_address, encryption_config));
+            }
+            if let Some(grpc_connect_address) = grpc_connect_address.as_deref() {
+                println!("  Console: {}", Self::console_connect_command(grpc_connect_address, encryption_config));
+            }
+        }
+
         println!();
+    }
+
+    pub fn print_ready() {
         info!("\nReady!");
+    }
+
+    fn connect_address(advertise: Option<&str>, listen: Option<&str>) -> Option<String> {
+        if let Some(advertise) = advertise {
+            Some(advertise.to_owned())
+        } else {
+            listen.map(|listen| listen.replace("0.0.0.0", "127.0.0.1"))
+        }
+    }
+
+    fn studio_connect_link(http_advertise_address: &str, encryption_config: &EncryptionConfig) -> String {
+        let address = Self::ensure_http_scheme(http_advertise_address, encryption_config);
+        format!("{STUDIO_URL}/connect?address={address}&username=admin")
+    }
+
+    fn ensure_http_scheme(address: &str, encryption_config: &EncryptionConfig) -> String {
+        if address.starts_with("http://") || address.starts_with("https://") {
+            address.to_owned()
+        } else {
+            let scheme = if encryption_config.enabled { "https" } else { "http" };
+            format!("{scheme}://{address}")
+        }
+    }
+
+    fn console_connect_command(grpc_advertise_address: &str, encryption_config: &EncryptionConfig) -> String {
+        if encryption_config.enabled {
+            if let Some(cert_path) = encryption_config.ca_certificate.as_ref() {
+                let cert_path = cert_path.as_path().display();
+                format!(
+                    "typedb console --address https://{grpc_advertise_address} --username admin --tls-root-ca={cert_path}"
+                )
+            } else {
+                format!("typedb console --address https://{grpc_advertise_address} --username admin")
+            }
+        } else {
+            format!("typedb console --address {grpc_advertise_address} --tls-disabled --username admin")
+        }
     }
 
     fn spawn_shutdown_handler(shutdown_sender: Sender<()>) {
         tokio::spawn(async move {
-            Self::wait_for_ctrl_c_signal().await;
-            println!("\nReceived CTRL-C. Initiating shutdown...");
+            let initial_signal = Self::wait_for_shutdown_signal().await;
+            println!("\nReceived {initial_signal}. Initiating shutdown...");
             shutdown_sender.send(()).expect("Expected a successful shutdown signal");
 
             tokio::spawn(Self::forced_shutdown_handler());
@@ -337,13 +571,29 @@ impl Server {
     }
 
     async fn forced_shutdown_handler() {
-        Self::wait_for_ctrl_c_signal().await;
-        println!("\nReceived CTRL-C. Forcing shutdown...");
+        let forced_signal = Self::wait_for_shutdown_signal().await;
+        println!("\nReceived {forced_signal}. Forcing shutdown...");
         std::process::exit(1);
     }
 
-    async fn wait_for_ctrl_c_signal() {
-        tokio::signal::ctrl_c().await.expect("Failed to listen for CTRL-C signal");
+    async fn wait_for_shutdown_signal() -> &'static str {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to install SIGTERM handler");
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result.expect("Failed to listen for SIGINT");
+                    "SIGINT"
+                }
+                _ = sigterm.recv() => "SIGTERM",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl-C");
+            "CTRL-C"
+        }
     }
 
     fn install_default_encryption_provider() -> Result<(), ServerOpenError> {
@@ -352,7 +602,7 @@ impl Server {
             .map_err(|_| ServerOpenError::HttpTlsUnsetDefaultCryptoProvider {})
     }
 
-    pub fn database_manager(&self) -> Arc<DatabaseManager> {
-        self.server_state.database_manager()
+    pub fn server_state(&self) -> Arc<ServerState> {
+        self.server_state.clone()
     }
 }

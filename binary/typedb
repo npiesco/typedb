@@ -12,14 +12,22 @@ if [ -d "${TYPEDB_HOME}/console" ]; then
   CONSOLE_EXISTS=1
 fi
 
+if [ -d "${TYPEDB_HOME}/loader" ]; then
+  LOADER_EXISTS=1
+fi
+
 # ================================================
 # common helper functions
 # ================================================
 
 print_usage() {
     echo "  Server:          typedb server [--help]"
+    echo "  Admin:           typedb admin [--help]"
     if [[ $CONSOLE_EXISTS ]]; then
       echo "  Console:         typedb console [--help]"
+    fi
+    if [[ $LOADER_EXISTS ]]; then
+      echo "  Loader:          typedb loader [--help]"
     fi
     echo "  Postgres shell:  typedb psql [--host HOST] [--port PORT] [--user USER] [--database DB]"
 }
@@ -30,6 +38,11 @@ print_usage() {
 
 
 case "$1" in
+    admin)
+        TYPEDB_ADMIN_BIN="${TYPEDB_HOME}/admin/typedb_admin_bin"
+        exec ${TYPEDB_ADMIN_BIN} "${@:2}"
+        ;;
+
     console)
         if [[ ! $CONSOLE_EXISTS ]]; then
             echo "TypeDB console was not included in this distribution. Please download it separately."
@@ -38,6 +51,16 @@ case "$1" in
         # exec replaces current shell process so no commands after this one will ever get executed
         TYPEDB_CONSOLE_BIN="${TYPEDB_HOME}/console/typedb_console_bin"
         exec ${TYPEDB_CONSOLE_BIN} "${@:2}"
+        ;;
+
+    loader)
+        if [[ ! $LOADER_EXISTS ]]; then
+            echo "TypeDB loader was not included in this distribution. Please download it separately."
+            exit 1
+        fi
+        # exec replaces current shell process so no commands after this one will ever get executed
+        TYPEDB_LOADER_BIN="${TYPEDB_HOME}/loader/typedb_loader_bin"
+        exec ${TYPEDB_LOADER_BIN} "${@:2}"
         ;;
 
     server)
@@ -91,4 +114,3 @@ case "$1" in
         exit 1
         ;;
     esac
-fi

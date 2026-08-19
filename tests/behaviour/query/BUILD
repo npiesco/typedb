@@ -26,8 +26,10 @@ rust_test(
         "@typedb_behaviour//query/language:delete.feature",
         "@typedb_behaviour//query/language:expression.feature",
         "@typedb_behaviour//query/language:fetch.feature",
+        "@typedb_behaviour//query/language:given.feature",
         "@typedb_behaviour//query/language:insert.feature",
         "@typedb_behaviour//query/language:match.feature",
+        "@typedb_behaviour//query/language:metadata.feature",
         "@typedb_behaviour//query/language:modifiers.feature",
         "@typedb_behaviour//query/language:negation.feature",
         "@typedb_behaviour//query/language:disjunction.feature",
@@ -38,6 +40,7 @@ rust_test(
         "@typedb_behaviour//query/language:reduce.feature",
         "@typedb_behaviour//query/language:undefine.feature",
         "@typedb_behaviour//query/language:update.feature",
+        "@typedb_behaviour//query/language:variables.feature",
 
         "@typedb_behaviour//query/analyze:structure.feature",
         "@typedb_behaviour//query/analyze:annotations.feature",
@@ -47,6 +50,7 @@ rust_test(
     crate_features = ["bazel"],
     env = {"RUST_MIN_STACK" : "40960000"}, # for recursion.feature
     size = "enormous",
+    tags = ["manual_build"],
 )
 
 rustfmt_test(

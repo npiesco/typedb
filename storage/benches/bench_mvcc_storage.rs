@@ -9,7 +9,8 @@
 use std::{fs::File, os::raw::c_int, path::Path, sync::Arc};
 
 use bytes::byte_array::ByteArray;
-use criterion::{criterion_group, criterion_main, profiler::Profiler, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main, profiler::Profiler};
+use diagnostics::metrics::FsyncMetrics;
 use durability::wal::WAL;
 use pprof::ProfilerGuard;
 use resource::{
@@ -17,14 +18,15 @@ use resource::{
     profile::{CommitProfile, StorageCounters},
 };
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     key_range::KeyRange,
     key_value::{StorageKey, StorageKeyArray, StorageKeyReference},
     keyspace::{KeyspaceId, KeyspaceSet},
     snapshot::{CommittableSnapshot, ReadableSnapshot, WritableSnapshot},
-    MVCCStorage,
 };
-use test_utils::{create_tmp_dir, init_logging};
+use test_utils::{create_tmp_storage_dir, init_logging};
+use test_utils_storage::create_rocks_resources;
 
 use self::TestKeyspaceSet::Keyspace;
 
@@ -117,11 +119,13 @@ fn bench_snapshot_write_put(storage: Arc<MVCCStorage<WALClient>>, keyspace: Test
 }
 
 fn setup_storage(storage_path: &Path, key_count: usize) -> Arc<MVCCStorage<WALClient>> {
+    let resources = create_rocks_resources();
     let storage = Arc::new(
         MVCCStorage::create::<TestKeyspaceSet>(
             "storage_bench",
             storage_path,
-            WALClient::new(WAL::create(storage_path).unwrap()),
+            WALClient::new(WAL::create(storage_path, FsyncMetrics::disabled()).unwrap()),
+            &resources,
         )
         .unwrap(),
     );
@@ -135,17 +139,17 @@ fn criterion_benchmark(c: &mut Criterion) {
     const INITIAL_KEY_COUNT: usize = 10_000; // 10 million = approximately 0.2 GB of keys
     println!("In cirterion benchmark");
     {
-        let storage_path = create_tmp_dir();
+        let storage_path = create_tmp_storage_dir();
         let storage = setup_storage(&storage_path, INITIAL_KEY_COUNT);
         c.bench_function("snapshot_read_get", |b| b.iter(|| bench_snapshot_read_get(storage.clone(), Keyspace)));
     }
     // {
-    //     let storage_path = create_tmp_dir();
+    //     let storage_path = create_tmp_storage_dir();
     //     let storage = setup_storage(&storage_path, INITIAL_KEY_COUNT);
     //     c.bench_function("snapshot_write_put", |b| b.iter(|| bench_snapshot_write_put(&storage, Keyspace, 100)));
     // }
     // {
-    //     let storage_path = create_tmp_dir();
+    //     let storage_path = create_tmp_storage_dir();
     //     let storage = setup_storage(&storage_path, INITIAL_KEY_COUNT);
     //     c.bench_function("snapshot_read_iterate", |b| b.iter(|| bench_snapshot_read_iterate::<1>(&storage, Keyspace)));
     // }

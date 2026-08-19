@@ -6,7 +6,7 @@
 
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use answer::Type;
@@ -14,75 +14,132 @@ use compiler::executable::pipeline::ExecutablePipeline;
 use concept::thing::statistics::Statistics;
 use ir::{
     pipeline::{fetch::FetchObject, function::Function},
-    translation::pipeline::TranslatedStage,
+    translation::pipeline::{TranslatedGiven, TranslatedPipeline, TranslatedStage},
 };
 use moka::sync::{Cache, CacheBuilder};
 use resource::{
-    constants::database::{QUERY_PLAN_CACHE_FLUSH_ANY_STATISTIC_CHANGE_FRACTION, QUERY_PLAN_CACHE_SIZE},
+    constants::database::{
+        QUERY_PARSE_CACHE_SIZE, QUERY_PLAN_CACHE_FLUSH_ANY_STATISTIC_CHANGE_FRACTION,
+        QUERY_PLAN_CACHE_FLUSH_STATIC_SMOOTH_THRESHOLD, QUERY_PLAN_CACHE_SIZE, QUERY_TRANSLATION_CACHE_SIZE,
+    },
     perf_counters::QUERY_CACHE_FLUSH,
 };
+use storage::sequence_number::SequenceNumber;
 use structural_equality::StructuralEquality;
+use typeql::query::{Pipeline, SchemaQuery};
+
+#[derive(Debug)]
+struct ValidityRequirements {
+    latest_statistics: Option<Arc<Statistics>>,
+    latest_schema_commit: Option<SequenceNumber>,
+}
 
 #[derive(Debug)]
 pub struct QueryCache {
-    cache: Cache<IRQuery, ExecutablePipeline>,
+    parse_cache: Cache<String, Arc<Pipeline>>,
+    translation_cache: Cache<String, TranslatedPipeline>,
+    executable_cache: Cache<IRQuery, ExecutablePipeline>,
+    validity_requirements: RwLock<ValidityRequirements>,
+}
+
+#[derive(Debug)]
+pub enum ParsedQuery {
+    Schema(SchemaQuery),
+    Pipeline(Arc<Pipeline>),
 }
 
 impl QueryCache {
     pub fn new() -> Self {
-        let cache = CacheBuilder::new(QUERY_PLAN_CACHE_SIZE).support_invalidation_closures().build();
-        QueryCache { cache }
+        let parse_cache = CacheBuilder::new(QUERY_PARSE_CACHE_SIZE).build();
+        let translation_cache = CacheBuilder::new(QUERY_TRANSLATION_CACHE_SIZE).build();
+        let executable_cache = CacheBuilder::new(QUERY_PLAN_CACHE_SIZE).support_invalidation_closures().build();
+        let validity_requirements =
+            RwLock::new(ValidityRequirements { latest_statistics: None, latest_schema_commit: None });
+        QueryCache { parse_cache, translation_cache, executable_cache, validity_requirements }
     }
 
-    pub(crate) fn get(
+    pub fn get_parsed(&self, query: &str) -> Option<Arc<Pipeline>> {
+        self.parse_cache.get(query)
+    }
+
+    pub(crate) fn insert_parsed(&self, source_query: &str, pipeline: Arc<Pipeline>) {
+        self.parse_cache.insert(source_query.to_owned(), pipeline);
+    }
+
+    pub fn get_translated(&self, query: &str) -> Option<TranslatedPipeline> {
+        self.translation_cache.get(query)
+    }
+
+    pub(crate) fn may_insert_translated(
+        &self,
+        statistics_sequence_number: SequenceNumber,
+        source_query: &str,
+        translated: TranslatedPipeline,
+    ) {
+        let read_lock = self.validity_requirements.read().unwrap();
+        let may_insert = read_lock
+            .latest_schema_commit
+            .map_or(true, |latest_schema_commit_number| statistics_sequence_number >= latest_schema_commit_number);
+        if may_insert {
+            self.translation_cache.insert(source_query.to_owned(), translated);
+        }
+        drop(read_lock);
+    }
+
+    pub(crate) fn get_executable(
         &self,
         preamble: Arc<Vec<Function>>,
+        given: Arc<Option<TranslatedGiven>>,
         stages: Arc<Vec<TranslatedStage>>,
         fetch: Arc<Option<FetchObject>>,
     ) -> Option<ExecutablePipeline> {
-        let key = IRQuery::new(preamble, stages, fetch);
-        self.cache.get(&key)
+        let key = IRQuery::new(preamble.clone(), given, stages, fetch);
+        self.executable_cache.get(&key).map(|mut found| {
+            let replacement = preamble.iter().map(|func| Arc::new(func.parameters.clone())).enumerate();
+            found.executable_functions.replace_preamble_parameters(replacement);
+            found
+        })
     }
 
-    pub(crate) fn insert(
+    pub(crate) fn may_insert_executable(
         &self,
+        statistics_sequence_number: SequenceNumber,
         preamble: Arc<Vec<Function>>,
+        given: Arc<Option<TranslatedGiven>>,
         stages: Arc<Vec<TranslatedStage>>,
         fetch: Arc<Option<FetchObject>>,
         pipeline: ExecutablePipeline,
     ) {
-        let key = IRQuery::new(preamble, stages, fetch);
-        self.cache.insert(key, pipeline);
+        let key = IRQuery::new(preamble, given, stages, fetch);
+        let read_lock = self.validity_requirements.read().unwrap();
+        let ValidityRequirements { latest_schema_commit, latest_statistics } = &*read_lock;
+        let may_insert = latest_schema_commit
+            .map_or(true, |latest_schema_commit_number| statistics_sequence_number >= latest_schema_commit_number)
+            && latest_statistics
+                .as_ref()
+                .map_or(true, |stats| !is_pipeline_type_populations_outdated(&stats, &pipeline));
+        if may_insert {
+            self.executable_cache.insert(key, pipeline);
+        }
+        drop(read_lock);
     }
 
-    pub fn may_evict(&self, new_statistics: &Statistics) {
-        let new_statistics = new_statistics.clone(); // it's either this or clone the entire cache
+    pub fn set_statistics_and_invalidate_outdated(&self, new_statistics: Arc<Statistics>) {
+        let mut write_lock = self.validity_requirements.write().unwrap();
+        (*write_lock).latest_statistics = Some(new_statistics.clone());
+        drop(write_lock);
         let _predicate_id = self
-            .cache
-            .invalidate_entries_if(move |_, pipeline| {
-                let mut total_increase = 1.0;
-                let mut total_decrease = 1.0;
-                for (&ty, &pop) in &pipeline.type_populations {
-                    let type_count = match ty {
-                        Type::Entity(ty) => new_statistics.entity_counts.get(&ty).copied().unwrap_or_default(),
-                        Type::Relation(ty) => new_statistics.relation_counts.get(&ty).copied().unwrap_or_default(),
-                        Type::Attribute(ty) => new_statistics.attribute_counts.get(&ty).copied().unwrap_or_default(),
-                        Type::RoleType(ty) => new_statistics.role_counts.get(&ty).copied().unwrap_or_default(),
-                    };
-                    match u64::max(type_count, 1) as f64 / u64::max(pop, 1) as f64 {
-                        increase @ 1.0.. => total_increase *= increase,
-                        decrease @ ..1.0 => total_decrease /= decrease,
-                        _ => panic!("NaN?!"),
-                    }
-                }
-                total_increase >= QUERY_PLAN_CACHE_FLUSH_ANY_STATISTIC_CHANGE_FRACTION
-                    || total_decrease >= QUERY_PLAN_CACHE_FLUSH_ANY_STATISTIC_CHANGE_FRACTION
-            })
+            .executable_cache
+            .invalidate_entries_if(move |_, pipeline| is_pipeline_type_populations_outdated(&*new_statistics, pipeline))
             .unwrap();
     }
 
-    pub fn force_reset(&self, _statistics: &Statistics) {
-        self.cache.invalidate_all();
+    pub fn force_reset(&self, statistics: &Statistics) {
+        let mut write_lock = self.validity_requirements.write().unwrap();
+        (*write_lock).latest_schema_commit = Some(statistics.sequence_number);
+        drop(write_lock);
+        self.translation_cache.invalidate_all();
+        self.executable_cache.invalidate_all();
         QUERY_CACHE_FLUSH.increment();
     }
 }
@@ -93,16 +150,49 @@ impl Default for QueryCache {
     }
 }
 
+fn is_pipeline_type_populations_outdated(statistics: &Statistics, pipeline: &ExecutablePipeline) -> bool {
+    let mut total_increase = 1.0;
+    let mut total_decrease = 1.0;
+    for (&ty, &pop) in &pipeline.type_populations {
+        let type_count = match ty {
+            Type::Entity(ty) => statistics.entity_counts.get(&ty).copied().unwrap_or_default(),
+            Type::Relation(ty) => statistics.relation_counts.get(&ty).copied().unwrap_or_default(),
+            Type::Attribute(ty) => statistics.attribute_counts.get(&ty).copied().unwrap_or_default(),
+            Type::RoleType(ty) => statistics.role_counts.get(&ty).copied().unwrap_or_default(),
+        };
+        let smoothing = smoothstep(type_count, 1, QUERY_PLAN_CACHE_FLUSH_STATIC_SMOOTH_THRESHOLD);
+        match u64::max(type_count, 1) as f64 / u64::max(pop, 1) as f64 {
+            increase @ 1.0.. => total_increase *= increase.powf(smoothing),
+            decrease @ ..1.0 => total_decrease /= decrease.powf(smoothing),
+            _ => panic!("NaN?!"),
+        }
+    }
+    total_increase >= QUERY_PLAN_CACHE_FLUSH_ANY_STATISTIC_CHANGE_FRACTION
+        || total_decrease >= QUERY_PLAN_CACHE_FLUSH_ANY_STATISTIC_CHANGE_FRACTION
+}
+
+fn smoothstep(pop: u64, min: u64, max: u64) -> f64 {
+    debug_assert!(max > min);
+    let x = (pop.clamp(min, max) - min) as f64 / (max - min) as f64;
+    (3.0 - 2.0 * x) * x * x
+}
+
 #[derive(Debug)]
 struct IRQuery {
-    preamable: Arc<Vec<Function>>,
+    preamble: Arc<Vec<Function>>,
+    given: Arc<Option<TranslatedGiven>>,
     stages: Arc<Vec<TranslatedStage>>,
     fetch: Arc<Option<FetchObject>>,
 }
 
 impl IRQuery {
-    fn new(preamable: Arc<Vec<Function>>, stages: Arc<Vec<TranslatedStage>>, fetch: Arc<Option<FetchObject>>) -> Self {
-        Self { preamable, stages, fetch }
+    fn new(
+        preamble: Arc<Vec<Function>>,
+        given: Arc<Option<TranslatedGiven>>,
+        stages: Arc<Vec<TranslatedStage>>,
+        fetch: Arc<Option<FetchObject>>,
+    ) -> Self {
+        Self { preamble: preamble, given, stages, fetch }
     }
 }
 
@@ -123,13 +213,17 @@ impl Eq for IRQuery {}
 impl StructuralEquality for IRQuery {
     fn hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
-        self.preamable.hash_into(&mut hasher);
+        self.preamble.hash_into(&mut hasher);
+        self.given.hash_into(&mut hasher);
         self.stages.hash_into(&mut hasher);
         self.fetch.hash_into(&mut hasher);
         hasher.finish()
     }
 
     fn equals(&self, other: &Self) -> bool {
-        self.preamable.equals(&other.preamable) && self.stages.equals(&other.stages) && self.fetch.equals(&other.fetch)
+        self.preamble.equals(&other.preamble)
+            && self.given.equals(&other.given)
+            && self.stages.equals(&other.stages)
+            && self.fetch.equals(&other.fetch)
     }
 }

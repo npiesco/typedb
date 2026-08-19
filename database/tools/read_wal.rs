@@ -8,10 +8,11 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use concept::thing::statistics::Statistics;
-use durability::{wal::WAL, DurabilitySequenceNumber, RawRecord};
+use diagnostics::metrics::FsyncMetrics;
+use durability::{DurabilitySequenceNumber, RawRecord, wal::WAL};
 use storage::{
     durability_client::{DurabilityClient, DurabilityRecord, WALClient},
-    isolation_manager::{CommitRecord, StatusRecord},
+    record::{CommitRecord, LegacyCommitRecordV1, StatusRecord},
 };
 
 #[derive(Parser)]
@@ -63,6 +64,10 @@ fn deserialise_record<Record: DurabilityRecord>(raw_bytes: &[u8]) -> Record {
 
 fn print_record(record: RawRecord<'_>) {
     match record.record_type {
+        LegacyCommitRecordV1::RECORD_TYPE => {
+            let legacy: LegacyCommitRecordV1 = deserialise_record(&record.bytes);
+            print_commit(record.sequence_number, CommitRecord::from(legacy));
+        }
         CommitRecord::RECORD_TYPE => print_commit(record.sequence_number, deserialise_record(&record.bytes)),
         StatusRecord::RECORD_TYPE => print_status(record.sequence_number, deserialise_record(&record.bytes)),
         Statistics::RECORD_TYPE => print_statistics(record.sequence_number, deserialise_record(&record.bytes)),
@@ -103,10 +108,11 @@ fn print_raw_record(record: RawRecord<'_>) {
 }
 
 fn print_range(path: PathBuf, from: u64, to: Option<u64>) {
-    let wal = WAL::load(path).unwrap();
+    let wal = WAL::load(path, FsyncMetrics::disabled()).unwrap();
 
     let mut wal = WALClient::new(wal);
     wal.register_record_type::<Statistics>();
+    wal.register_record_type::<LegacyCommitRecordV1>();
     wal.register_record_type::<CommitRecord>();
     wal.register_record_type::<StatusRecord>();
 
@@ -122,10 +128,11 @@ fn print_range(path: PathBuf, from: u64, to: Option<u64>) {
 }
 
 fn print_at(path: PathBuf, sequence_number: Option<u64>) {
-    let wal = WAL::load(path).unwrap();
+    let wal = WAL::load(path, FsyncMetrics::disabled()).unwrap();
 
     let mut wal = WALClient::new(wal);
     wal.register_record_type::<Statistics>();
+    wal.register_record_type::<LegacyCommitRecordV1>();
     wal.register_record_type::<CommitRecord>();
     wal.register_record_type::<StatusRecord>();
 

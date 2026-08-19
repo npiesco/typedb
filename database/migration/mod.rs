@@ -6,6 +6,7 @@
 
 use std::{fmt, fmt::Formatter};
 
+pub mod database_import_handler;
 pub mod database_importer;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,6 +33,9 @@ impl Default for Checksums {
 impl fmt::Display for Checksums {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let Self { entity_count, attribute_count, relation_count, role_count, ownership_count } = self;
-        write!(f, "[{entity_count} entities, {attribute_count} attributes, {relation_count} relations, {role_count} roles, {ownership_count} ownerships]")
+        write!(
+            f,
+            "[{entity_count} entities, {attribute_count} attributes, {relation_count} relations, {role_count} roles, {ownership_count} ownerships]"
+        )
     }
 }

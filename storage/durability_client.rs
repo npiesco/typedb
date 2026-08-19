@@ -6,10 +6,10 @@
 
 use std::{
     io::{self, Read, Write},
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
 };
 
-use durability::{wal::WAL, DurabilityRecordType, DurabilityService, DurabilityServiceError, RawRecord};
+use durability::{DurabilityRecordType, DurabilityService, DurabilityServiceError, RawRecord, wal::WAL};
 use error::typedb_error;
 use itertools::Itertools;
 use resource::constants::storage::COMMIT_WAIT_FOR_FSYNC;
@@ -94,6 +94,8 @@ pub trait DurabilityClient {
     fn find_last_unsequenced_type<Record: UnsequencedDurabilityRecord>(
         &self,
     ) -> Result<Option<Record>, DurabilityClientError>;
+
+    fn truncate_from(&self, sequence_number: SequenceNumber) -> Result<(), DurabilityClientError>;
 
     fn delete_durability(self) -> Result<(), DurabilityClientError>;
 
@@ -199,6 +201,10 @@ impl DurabilityClient for WALClient {
             Ok(None) => Ok(None),
             Err(err) => Err(DurabilityClientError::ServiceError { source: err }),
         }
+    }
+
+    fn truncate_from(&self, sequence_number: SequenceNumber) -> Result<(), DurabilityClientError> {
+        self.wal.truncate_from(sequence_number).map_err(|err| DurabilityClientError::ServiceError { source: err })
     }
 
     fn delete_durability(self) -> Result<(), DurabilityClientError> {

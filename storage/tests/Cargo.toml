@@ -6,36 +6,33 @@ features = {}
 
 [package]
 	name = "test_utils_storage"
-	edition = "2021"
+	edition = "2024"
 	version = "0.0.0"
 
 [lib]
 	path = "test_utils_storage/lib.rs"
+	crate-type = ["lib"]
 
 [dependencies]
 
+	[dependencies.diagnostics]
+		workspace = true
+
 	[dependencies.resource]
-		path = "../../resource"
-		features = []
-		default-features = false
+		workspace = true
 
 	[dependencies.bytes]
-		path = "../../common/bytes"
-		features = []
-		default-features = false
+		workspace = true
 
 	[dependencies.logger]
-		path = "../../common/logger"
-		features = []
-		default-features = false
+		workspace = true
 
 	[dependencies.durability]
-		path = "../../durability"
-		features = []
-		default-features = false
+		workspace = true
+
+	[dependencies.options]
+		workspace = true
 
 	[dependencies.storage]
-		path = "../../storage"
-		features = []
-		default-features = false
+		workspace = true
 

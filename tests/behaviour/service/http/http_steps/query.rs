@@ -3,34 +3,37 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
 
 use cucumber::gherkin::Step;
 use futures::future::join_all;
 use itertools::{Either, Itertools};
 use macro_rules_attribute::apply;
-use params::{self, check_boolean, ContainsOrDoesnt};
+use params::{self, ContainsOrDoesnt, check_boolean};
 use server::service::{
+    AnswerType,
     http::message::{
         analyze::{
             annotations::bdd::{
                 encode_fetch_annotations_as_functor, encode_function_annotations_as_functor,
-                encode_pipeline_annotations_as_functor,
+                encode_pipeline_annotations_as_functor, encode_pipeline_given_annotations_as_functor,
             },
-            structure::bdd::{encode_function_structure_as_functor, encode_pipeline_structure_as_functor},
+            structure::bdd::{
+                encode_function_structure_as_functor, encode_pipeline_given_as_functor,
+                encode_pipeline_structure_as_functor,
+            },
         },
-        query::{QueryAnswerResponse, QueryOptionsPayload},
+        query::{GivenEntryPayload, GivenRowsPayload, QueryAnswerResponse, TaggedEntryPayload, concept::ValueResponse},
     },
-    AnswerType,
 };
 
 use crate::{
-    generic_step,
-    message::{query, transactions_analyze, transactions_query, ConceptResponse},
-    params::{ConceptKind, IsByVarIndex, IsOrNot, QueryAnswerType, TokenMode, Var, WithCommit},
+    Context, HttpBehaviourTestError, generic_step,
+    message::{ConceptResponse, query, transactions_analyze, transactions_query},
+    params::{
+        ConceptKind, IsByVarIndex, IsOrNot, QueryAnswerType, TokenMode, Var, VariableList, WithCommit, WithGiven,
+    },
     util::{iter_table, list_contains_json, parse_json},
-    Context, HttpBehaviourTestError,
 };
 
 fn get_answers_column_names(answer: &serde_json::Value) -> Vec<String> {
@@ -152,24 +155,113 @@ fn check_is_value(
     is_or_not.compare(expected_value.into_typedb(actual_value_type_converted), actual_value_converted);
 }
 
+#[cucumber::given(expr = "set answers of typeql read query as given rows with order: {variable_list}")]
+#[cucumber::when(expr = "set answers of typeql read query as given rows with order: {variable_list}")]
+#[cucumber::given(expr = "set answers of typeql read query as given rows dictionary with variables: {variable_list}")]
+#[cucumber::when(expr = "set answers of typeql read query as given rows dictionary with variables: {variable_list}")]
+async fn set_answers_of_typeql_read_query_as_given_rows(context: &mut Context, var_list: VariableList, step: &Step) {
+    let result = (transactions_query(
+        context.http_client(),
+        context.auth_token(),
+        context.transaction(),
+        &context.query_options,
+        None,
+        step.docstring().unwrap(),
+    )
+    .await);
+    let rows = result.unwrap().answers.unwrap();
+    let mut given_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let data = row.get("data").expect("Expected to have 'data' key");
+        let given_row = var_list
+            .0
+            .iter()
+            .filter_map(|var| {
+                data.get(var).and_then(|value| {
+                    if value == &serde_json::Value::Null {
+                        None
+                    } else {
+                        Some((var.clone(), Some(serde_json::from_value(value.clone()).unwrap())))
+                    }
+                })
+            })
+            .collect::<BTreeMap<String, Option<GivenEntryPayload>>>();
+        given_rows.push(given_row);
+    }
+
+    context.given_rows = Some(GivenRowsPayload(given_rows))
+}
+
+#[cucumber::given("set query given rows")]
+#[cucumber::when("set query given rows")]
+async fn set_query_given_rows(context: &mut Context, step: &Step) {
+    let table = step.table().expect("Expected a data table for 'set query given rows'");
+    let variables: Vec<String> =
+        table.rows[0].iter().map(|cell| cell.split(':').next().unwrap().trim().to_owned()).collect();
+    let mut given_rows = Vec::with_capacity(table.rows.len().saturating_sub(1));
+    for row in &table.rows[1..] {
+        let entry = variables
+            .iter()
+            .cloned()
+            .zip(row.iter().map(|cell| parse_literal_given_entry(cell.trim())))
+            .collect::<BTreeMap<String, Option<GivenEntryPayload>>>();
+        given_rows.push(entry);
+    }
+    context.given_rows = Some(GivenRowsPayload(given_rows));
+}
+
+fn parse_literal_given_entry(cell: &str) -> Option<GivenEntryPayload> {
+    if cell == "none" {
+        return None;
+    }
+    let mut parts = cell.splitn(3, ':');
+    let encoding = parts.next().unwrap();
+    let value_type = parts.next().expect("expected <encoding>:<type>:<value>");
+    let value = parts.next().expect("expected <encoding>:<type>:<value>");
+    Some(match encoding {
+        "raw" => match value_type {
+            "boolean" => GivenEntryPayload::RawBool(value.parse().unwrap()),
+            "integer" => GivenEntryPayload::RawNumber(value.parse::<i64>().unwrap().into()),
+            "double" => GivenEntryPayload::RawNumber(serde_json::Number::from_f64(value.parse().unwrap()).unwrap()),
+            _ => GivenEntryPayload::RawString(value.to_owned()),
+        },
+        "value" => {
+            let json_value = match value_type {
+                "boolean" => serde_json::Value::Bool(value.parse().unwrap()),
+                "integer" => serde_json::json!(value.parse::<i64>().unwrap()),
+                "double" => serde_json::json!(value.parse::<f64>().unwrap()),
+                _ => serde_json::Value::String(value.to_owned()),
+            };
+            GivenEntryPayload::Concept(TaggedEntryPayload::Value(ValueResponse {
+                value: json_value,
+                value_type: value_type.to_owned(),
+            }))
+        }
+        other => panic!("Unknown given-entry encoding '{other}', expected 'raw', 'value', or 'none'"),
+    })
+}
+
 #[apply(generic_step)]
-#[step(expr = "{token_mode}typeql schema query{typeql_may_error}")]
-#[step(expr = "{token_mode}typeql write query{typeql_may_error}")]
-#[step(expr = "{token_mode}typeql read query{typeql_may_error}")]
+#[step(expr = "{token_mode}typeql schema query{with_given}{typeql_may_error}")]
+#[step(expr = "{token_mode}typeql write query{with_given}{typeql_may_error}")]
+#[step(expr = "{token_mode}typeql read query{with_given}{typeql_may_error}")]
 pub async fn typeql_query(
     context: &mut Context,
     token_mode: TokenMode,
+    with_given: WithGiven,
     may_error: params::TypeQLMayError,
     step: &Step,
 ) {
     context.randomize_auth_token_if_needed(token_mode);
     context.cleanup_answers().await;
+    let given_rows = if with_given == WithGiven::True { context.given_rows.take() } else { None };
     may_error.check(
         transactions_query(
             context.http_client(),
             context.auth_token_by_mode(token_mode),
             context.transaction(),
             &context.query_options,
+            given_rows,
             step.docstring().unwrap(),
         )
         .await,
@@ -213,11 +305,12 @@ pub async fn one_shot_query_typeql_query(
 }
 
 #[apply(generic_step)]
-#[step("get answers of typeql schema query")]
-#[step(expr = "get answers of typeql write query")]
-#[step(expr = "get answers of typeql read query")]
-pub async fn get_answers_of_typeql_query(context: &mut Context, step: &Step) {
+#[step(expr = "get answers of typeql schema query{with_given}")]
+#[step(expr = "get answers of typeql write query{with_given}")]
+#[step(expr = "get answers of typeql read query{with_given}")]
+pub async fn get_answers_of_typeql_query(context: &mut Context, with_given: WithGiven, step: &Step) {
     context.cleanup_answers().await;
+    let given_rows = if with_given == WithGiven::True { context.given_rows.take() } else { None };
     context
         .set_answer(
             transactions_query(
@@ -225,6 +318,7 @@ pub async fn get_answers_of_typeql_query(context: &mut Context, step: &Step) {
                 context.auth_token(),
                 context.transaction(),
                 &context.query_options,
+                given_rows,
                 step.docstring().unwrap(),
             )
             .await,
@@ -281,6 +375,7 @@ pub async fn concurrently_get_answers_of_typeql_query_times(context: &mut Contex
             context.auth_token(),
             context.transaction(),
             &context.query_options,
+            None,
             query,
         )
     }))
@@ -307,7 +402,7 @@ pub async fn set_query_option_answer_count_limit(context: &mut Context, value: u
 }
 
 #[cucumber::given(expr = "set query option include_query_structure to: {boolean}")]
-async fn set_query_option_include_query_structure(context: &mut Context, set_to: params::Boolean, step: &Step) {
+async fn set_query_option_include_query_structure(context: &mut Context, set_to: params::Boolean) {
     context.init_query_options_if_needed();
     context.query_options.as_mut().unwrap().include_query_structure = Some(set_to.to_bool());
 }
@@ -417,10 +512,10 @@ pub async fn answer_query_type_is(context: &mut Context, is_or_not: IsOrNot, que
 #[apply(generic_step)]
 #[step(expr = r"answer get row\({int}\) query type {is_or_not}: {query_type}")]
 pub async fn answer_get_row_query_type_is(
-    context: &mut Context,
-    index: usize,
-    is_or_not: IsOrNot,
-    query_type: crate::params::QueryType,
+    _context: &mut Context,
+    _index: usize,
+    _is_or_not: IsOrNot,
+    _query_type: crate::params::QueryType,
 ) {
     // no-op
 }
@@ -455,7 +550,7 @@ pub async fn answer_get_row_get_variable_is_empty(
     if matches!(is_by_var_index, IsByVarIndex::Is) {
         return; // http does not have indices
     }
-    is_or_not.compare(get_answer_rows_var(context, index, var), None);
+    is_or_not.compare(get_answer_rows_var(context, index, var), Some(&serde_json::Value::Null));
 }
 
 #[apply(generic_step)]
@@ -813,7 +908,7 @@ pub async fn answer_get_row_get_variable_try_get_specific_value_is_none(
     var_kind: ConceptKind,
     is_by_var_index: IsByVarIndex,
     var: Var,
-    value_type: params::ValueType,
+    _value_type: params::ValueType,
     is_or_not: IsOrNot,
 ) {
     if matches!(is_by_var_index, IsByVarIndex::Is) {
@@ -1020,7 +1115,7 @@ pub async fn answer_get_row_get_variable_is_struct(
     var_kind: ConceptKind,
     is_by_var_index: IsByVarIndex,
     var: Var,
-    is_struct: params::Boolean,
+    _is_struct: params::Boolean,
 ) {
     if matches!(is_by_var_index, IsByVarIndex::Is) {
         return; // http does not have indices
@@ -1087,6 +1182,15 @@ async fn typeql_analyze_may_error(context: &mut Context, may_error: params::Type
     may_error.check_logic(result);
 }
 
+#[cucumber::then("analyzed query given structure is:")]
+async fn analyzed_query_given_is(context: &mut Context, step: &Step) {
+    let expected_functor = step.docstring().unwrap();
+    let analyzed = context.analyzed.as_ref().unwrap();
+    let actual_functor = encode_pipeline_given_as_functor(&analyzed.query, &analyzed.given.as_ref().unwrap());
+
+    assert_eq!(normalize_functor_for_compare(&actual_functor), normalize_functor_for_compare(&expected_functor));
+}
+
 #[cucumber::then("analyzed query pipeline structure is:")]
 async fn analyzed_query_pipeline_is(context: &mut Context, step: &Step) {
     let expected_functor = step.docstring().unwrap();
@@ -1113,6 +1217,16 @@ async fn analyzed_query_preamble_contains(context: &mut Context, step: &Step) {
         expected_functor,
         preamble_functors.iter().join("\n\t")
     );
+}
+
+#[cucumber::then("analyzed query given annotations are:")]
+async fn analyzed_query_given_annotations_is(context: &mut Context, step: &Step) {
+    let expected_functor = step.docstring().unwrap();
+    let analyzed = context.analyzed.as_ref().unwrap();
+    let actual_functor =
+        encode_pipeline_given_annotations_as_functor(&analyzed.query, analyzed.given.as_ref().unwrap());
+
+    assert_eq!(normalize_functor_for_compare(&actual_functor), normalize_functor_for_compare(expected_functor));
 }
 
 #[cucumber::then("analyzed query pipeline annotations are:")]

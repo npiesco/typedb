@@ -6,30 +6,32 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use answer::{variable::Variable, Type};
+use answer::{Type, variable::Variable};
 use encoding::graph::type_::Kind;
 use ir::{
     pattern::{
+        ParameterID, Vertex,
         constraint::{Comparator, Constraint},
         expression::Expression,
         nested_pattern::NestedPattern,
-        ParameterID, Vertex,
     },
-    pipeline::{block::Block, VariableRegistry},
+    pipeline::{VariableRegistry, block::Block},
 };
 use itertools::Itertools;
 use typeql::common::Span;
 
 use crate::{
+    VariablePosition,
     annotation::type_annotations::{BlockAnnotations, TypeAnnotations},
     executable::{
+        WriteCompilationError,
         insert::{
-            instructions::{ConceptInstruction, ConnectionInstruction, Has, Links, PutAttribute, PutObject},
             ThingPosition, TypeSource, ValueSource, VariableSource,
+            instructions::{ConceptInstruction, ConnectionInstruction, Has, Links, PutAttribute, PutObject},
         },
-        next_executable_id, WriteCompilationError,
+        next_executable_id,
     },
-    filter_variants, VariablePosition,
+    filter_variants,
 };
 
 #[derive(Debug)]
@@ -61,13 +63,15 @@ pub fn compile(
     desired_output_variable_positions: Option<HashMap<Variable, VariablePosition>>,
     source_span: Option<Span>,
 ) -> Result<InsertExecutable, Box<WriteCompilationError>> {
-    debug_assert!(desired_output_variable_positions
-        .as_ref()
-        .map(|positions| { input_variables.iter().all(|(k, v)| positions.get(k).unwrap() == v) })
-        .unwrap_or(true));
+    debug_assert!(
+        desired_output_variable_positions
+            .as_ref()
+            .map(|positions| { input_variables.iter().all(|(k, v)| positions.get(k).unwrap() == v) })
+            .unwrap_or(true)
+    );
     let mut variable_positions = desired_output_variable_positions.unwrap_or_else(|| input_variables.clone());
 
-    let concept_instructions = add_inserted_concepts(
+    let concept_instructions_map = add_inserted_concepts(
         block.conjunction(),
         block_annotations,
         variable_registry,
@@ -84,6 +88,23 @@ pub fn compile(
         input_variables,
     )?;
 
+    let unsafely_used_optional_variable = block
+        .conjunction()
+        .constraints()
+        .iter()
+        .flat_map(|constraint| constraint.ids())
+        .find(|var| variable_registry.is_variable_optional(*var));
+
+    if let Some(var) = unsafely_used_optional_variable {
+        let variable = variable_registry.get_variable_name_or_unnamed(var).to_owned();
+        return Err(Box::new(WriteCompilationError::OptionalVariableUsedOutsideTry { source_span, variable }));
+    }
+
+    let input_variables_for_nested = input_variables
+        .iter()
+        .map(|(&v, &p)| (v, p))
+        .chain(concept_instructions_map.iter().map(|(&var, instr)| (var, instr.inserted_position().0)))
+        .collect::<HashMap<Variable, VariablePosition>>();
     let mut optional_inserts = Vec::with_capacity(block.conjunction().nested_patterns().len());
     for nested_pattern in block.conjunction().nested_patterns() {
         let NestedPattern::Optional(optional) = nested_pattern else {
@@ -94,11 +115,12 @@ pub fn compile(
             block_annotations,
             &mut variable_positions,
             variable_registry,
-            input_variables,
+            &input_variables_for_nested,
             source_span,
         )?);
     }
 
+    let concept_instructions = concept_instructions_map_to_vec(concept_instructions_map);
     Ok(InsertExecutable {
         executable_id: next_executable_id(),
         concept_instructions,
@@ -124,7 +146,7 @@ impl OptionalInsert {
         input_variables: &HashMap<Variable, VariablePosition>,
         stage_source_span: Option<Span>,
     ) -> Result<Self, Box<WriteCompilationError>> {
-        let concept_instructions = add_inserted_concepts(
+        let concept_instructions_map = add_inserted_concepts(
             optional.conjunction(),
             block_annotations,
             variable_registry,
@@ -149,6 +171,7 @@ impl OptionalInsert {
             .filter_map(|id| input_variables.get(&id).copied())
             .collect();
 
+        let concept_instructions = concept_instructions_map_to_vec(concept_instructions_map);
         Ok(Self { concept_instructions, connection_instructions, required_input_variables })
     }
 }
@@ -160,7 +183,7 @@ pub(crate) fn add_inserted_concepts(
     input_variables: &HashMap<Variable, VariablePosition>,
     output_variables: &mut HashMap<Variable, VariablePosition>,
     stage_source_span: Option<Span>,
-) -> Result<Vec<ConceptInstruction>, Box<WriteCompilationError>> {
+) -> Result<HashMap<Variable, ConceptInstruction>, Box<WriteCompilationError>> {
     let constraints = conjunction.constraints();
     let type_annotations =
         block_annotations.type_annotations_of(conjunction).expect("insert conjunction must have type annotations");
@@ -189,7 +212,7 @@ pub(crate) fn add_inserted_concepts(
                     return Err(Box::new(WriteCompilationError::InsertVariableUnknownType {
                         variable: variable_registry.get_variable_name_or_unnamed(thing).to_owned(),
                         source_span: isa.source_span(),
-                    }))
+                    }));
                 }
             }
         };
@@ -239,9 +262,9 @@ pub(crate) fn add_inserted_concepts(
                 stage_source_span,
             )?;
             let value = if let Some(constant) = value_bindings.get(&value_variable) {
-                debug_assert!(!value_variable
-                    .as_variable()
-                    .is_some_and(|variable| input_variables.contains_key(&variable)));
+                debug_assert!(
+                    !value_variable.as_variable().is_some_and(|variable| input_variables.contains_key(&variable))
+                );
                 ValueSource::Parameter(constant.clone())
             } else if let &Vertex::Variable(variable) = value_variable {
                 if let Some(&position) = input_variables.get(&variable) {
@@ -277,9 +300,7 @@ pub(crate) fn add_inserted_concepts(
             }
         };
     }
-    let concept_instructions_vec =
-        concept_instructions.into_values().sorted_by_key(ConceptInstruction::inserted_position).collect();
-    Ok(concept_instructions_vec)
+    Ok(concept_instructions)
 }
 
 fn add_connections(
@@ -515,4 +536,10 @@ pub(crate) fn resolve_links_roles(
             }
         })
         .collect()
+}
+
+pub(crate) fn concept_instructions_map_to_vec(
+    as_map: HashMap<Variable, ConceptInstruction>,
+) -> Vec<ConceptInstruction> {
+    as_map.into_values().sorted_by_key(ConceptInstruction::inserted_position).collect()
 }

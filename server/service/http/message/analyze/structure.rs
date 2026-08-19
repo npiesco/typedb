@@ -11,27 +11,27 @@ use bytes::util::HexBytesFormatter;
 use compiler::{
     annotation::type_inference::get_type_annotation_from_label,
     query_structure::{
-        ConjunctionAnnotations, FunctionReturnStructure, ParametrisedPipelineStructure, PipelineStructure,
-        PipelineStructureAnnotations, QueryStructureConjunction, QueryStructureConjunctionID,
-        QueryStructureNestedPattern, QueryStructureStage, StructureVariableId,
+        ConjunctionAnnotations, FunctionReturnStructure, GivenStructureAnnotations, ParametrisedPipelineStructure,
+        PipelineStructure, PipelineStructureAnnotations, QueryStructureConjunction, QueryStructureConjunctionID,
+        QueryStructureGiven, QueryStructureNestedPattern, QueryStructureStage, StructureVariableId,
     },
 };
 use concept::{error::ConceptReadError, type_::type_manager::TypeManager};
 use encoding::value::{label::Label, value::Value};
 use ir::pattern::{
-    constraint::{Constraint, IsaKind, SubKind},
     ParameterID, Vertex,
+    constraint::{Constraint, IsaKind, SubKind},
 };
 use serde::{Deserialize, Serialize};
 use storage::snapshot::ReadableSnapshot;
 use typeql::common::Span;
 
 use super::annotations::{
-    encode_variable_type_annotations_and_modifiers, ConjunctionAnnotationsResponse, FunctionReturnAnnotationsResponse,
-    VariableAnnotationsResponse,
+    ConjunctionAnnotationsResponse, FunctionReturnAnnotationsResponse, VariableAnnotationsResponse,
+    encode_variable_type_annotations_and_modifiers,
 };
 use crate::service::http::message::query::concept::{
-    encode_type_concept, encode_value, EntityTypeResponse, ValueResponse,
+    EntityTypeResponse, ValueResponse, encode_type_concept, encode_value,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,6 +51,13 @@ pub struct AnalyzedPipelineResponse {
     pub(super) stages: Vec<QueryStructureStage>,
     pub(super) variables: HashMap<StructureVariableId, StructureVariableInfo>,
     pub(super) outputs: Vec<StructureVariableId>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyzedGivenResponse {
+    pub variables: Vec<StructureVariableId>,
+    pub variable_annotations: HashMap<StructureVariableId, VariableAnnotationsResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -190,7 +197,7 @@ impl StructureConstraint {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", tag = "tag")]
-pub(super) enum StructureVertex {
+pub enum StructureVertex {
     Variable { id: StructureVariableId },
     Label { r#type: serde_json::Value },
     Value(ValueResponse),
@@ -275,6 +282,19 @@ pub fn encode_analyzed_pipeline(
     record_reducer_variables(&mut context);
     let outputs = structure.parametrised_structure.output_variables.clone();
     Ok(AnalyzedPipelineResponse { conjunctions: encoded_conjunctions, outputs, variables, stages: stages.clone() })
+}
+
+pub fn encode_analyzed_given(
+    snapshot: &impl ReadableSnapshot,
+    type_manager: &TypeManager,
+    given: &QueryStructureGiven,
+    annotations: &GivenStructureAnnotations,
+) -> Result<AnalyzedGivenResponse, Box<ConceptReadError>> {
+    let variable_annotations = annotations
+        .iter()
+        .map(|(id, ann)| Ok((*id, encode_variable_type_annotations_and_modifiers(snapshot, type_manager, ann)?)))
+        .collect::<Result<HashMap<_, _>, Box<ConceptReadError>>>()?;
+    Ok(AnalyzedGivenResponse { variables: given.variables.clone(), variable_annotations })
 }
 
 fn record_reducer_variables<'a>(context: &mut PipelineStructureContext<'a, impl ReadableSnapshot>) {
@@ -508,15 +528,21 @@ pub mod bdd {
 
     use crate::service::http::message::analyze::{
         bdd::{
-            functor_macros,
+            FunctorContext, FunctorEncoded, functor_macros,
             functor_macros::{encode_functor_impl, impl_functor_for, impl_functor_for_impl, impl_functor_for_multi},
-            FunctorContext, FunctorEncoded,
         },
         structure::{
-            AnalyzedFunctionResponse, AnalyzedPipelineResponse, StructureConstraint, StructureConstraintWithSpan,
-            StructureVertex,
+            AnalyzedFunctionResponse, AnalyzedGivenResponse, AnalyzedPipelineResponse, StructureConstraint,
+            StructureConstraintWithSpan, StructureVertex,
         },
     };
+
+    pub fn encode_pipeline_given_as_functor(
+        pipeline: &AnalyzedPipelineResponse,
+        given: &AnalyzedGivenResponse,
+    ) -> String {
+        given.encode_as_functor(&FunctorContext { pipeline })
+    }
 
     pub fn encode_pipeline_structure_as_functor(pipeline: &AnalyzedPipelineResponse) -> String {
         pipeline.encode_as_functor(&FunctorContext { pipeline })
@@ -531,6 +557,7 @@ pub mod bdd {
     impl_functor_for!(struct StructureReduceAssign { assigned, reducer,  } named ReduceAssign);
     impl_functor_for!(struct StructureReducer { reducer, arguments, } named Reducer);
 
+    impl_functor_for!(struct AnalyzedGivenResponse { variables, } named Given);
     impl_functor_for!(enum QueryStructureStage [
         Match { block, } |
         Insert { block, } |

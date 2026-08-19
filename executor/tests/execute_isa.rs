@@ -5,20 +5,23 @@
  */
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use answer::variable::Variable;
 use compiler::{
-    self,
-    annotation::{function::EmptyAnnotatedFunctionSignatures, match_inference::infer_types},
+    self, ExecutorVariable, VariablePosition,
+    annotation::{
+        PipelineAnnotationContext, function::EmptyAnnotatedFunctionSignatures,
+        inference::match_inference::infer_types_for_test_only,
+    },
     executable::{
         function::ExecutableFunctionRegistry,
         match_::{
             instructions::{
-                thing::{IsaInstruction, IsaReverseInstruction},
                 ConstraintInstruction, Inputs,
+                thing::{IsaInstruction, IsaReverseInstruction},
             },
             planner::{
                 conjunction_executable::{ConjunctionExecutable, ExecutionStep, IntersectionStep},
@@ -27,21 +30,20 @@ use compiler::{
         },
         next_executable_id,
     },
-    ExecutorVariable, VariablePosition,
 };
 use encoding::value::label::Label;
 use executor::{
-    error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext, row::MaybeOwnedRow,
-    ExecutionInterrupt,
+    ExecutionInterrupt, error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext,
+    row::MaybeOwnedRow,
 };
 use ir::{
-    pattern::{constraint::IsaKind, Vertex},
-    pipeline::{block::Block, ParameterRegistry},
+    pattern::{Vertex, constraint::IsaKind},
+    pipeline::{ParameterRegistry, block::Block},
     translation::PipelineTranslationContext,
 };
 use lending_iterator::LendingIterator;
 use resource::profile::{CommitProfile, QueryProfile, StorageCounters};
-use storage::{durability_client::WALClient, snapshot::CommittableSnapshot, MVCCStorage};
+use storage::{MVCCStorage, durability_client::WALClient, snapshot::CommittableSnapshot};
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;
 
@@ -121,18 +123,14 @@ fn traverse_isa_unbounded_sorted_thing() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_dog, var_dog_type], []);
@@ -161,7 +159,7 @@ fn traverse_isa_unbounded_sorted_thing() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -199,18 +197,14 @@ fn traverse_isa_unbounded_sorted_type() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_dog, var_dog_type], []);
@@ -241,7 +235,7 @@ fn traverse_isa_unbounded_sorted_type() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -281,18 +275,14 @@ fn traverse_isa_bounded_thing() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) =
@@ -335,7 +325,7 @@ fn traverse_isa_bounded_thing() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -377,18 +367,14 @@ fn traverse_isa_reverse_unbounded_sorted_thing() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_dog, var_dog_type], []);
@@ -417,7 +403,7 @@ fn traverse_isa_reverse_unbounded_sorted_thing() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -455,18 +441,14 @@ fn traverse_isa_reverse_unbounded_sorted_type() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_dog, var_dog_type], []);
@@ -497,7 +479,7 @@ fn traverse_isa_reverse_unbounded_sorted_type() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -537,18 +519,14 @@ fn traverse_isa_reverse_bounded_type_exact() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) =
@@ -591,7 +569,7 @@ fn traverse_isa_reverse_bounded_type_exact() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -635,18 +613,14 @@ fn traverse_isa_reverse_bounded_type_subtype() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) =
@@ -689,7 +663,7 @@ fn traverse_isa_reverse_bounded_type_subtype() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -733,18 +707,14 @@ fn traverse_isa_reverse_fixed_type_exact() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_thing], []);
@@ -772,7 +742,7 @@ fn traverse_isa_reverse_fixed_type_exact() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =
@@ -812,18 +782,14 @@ fn traverse_isa_reverse_fixed_type_subtype() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_thing], []);
@@ -852,7 +818,7 @@ fn traverse_isa_reverse_fixed_type_subtype() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> =

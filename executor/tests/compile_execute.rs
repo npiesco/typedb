@@ -11,8 +11,8 @@ use std::{
 
 use compiler::{
     annotation::{
-        expression::block_compiler::compile_expressions, function::EmptyAnnotatedFunctionSignatures,
-        match_inference::infer_types,
+        PipelineAnnotationContext, expression::block_compiler::compile_expressions,
+        function::EmptyAnnotatedFunctionSignatures, inference::match_inference::infer_types_for_test_only,
     },
     executable::{
         function::ExecutableFunctionRegistry, match_::planner::conjunction_executable::ConjunctionExecutable,
@@ -24,23 +24,23 @@ use concept::{
 };
 use encoding::graph::definition::definition_key_generator::DefinitionKeyGenerator;
 use executor::{
-    match_executor::MatchExecutor, pipeline::stage::ExecutionContext, row::MaybeOwnedRow, ExecutionInterrupt,
+    ExecutionInterrupt, match_executor::MatchExecutor, pipeline::stage::ExecutionContext, row::MaybeOwnedRow,
 };
 use function::function_manager::FunctionManager;
 use ir::{
     pattern::Pattern,
-    pipeline::{function_signature::HashMapFunctionSignatureIndex, ParameterRegistry},
-    translation::{match_::translate_match, PipelineTranslationContext},
+    pipeline::{ParameterRegistry, function_signature::HashMapFunctionSignatureIndex},
+    translation::{PipelineTranslationContext, match_::translate_match},
 };
 use itertools::Itertools;
 use lending_iterator::LendingIterator;
-use query::query_manager::QueryManager;
+use query::{given_rows::GivenRowsSimple, query_manager::QueryManager};
 use resource::profile::{CommitProfile, QueryProfile};
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     sequence_number::SequenceNumber,
     snapshot::{CommittableSnapshot, ReadableSnapshot},
-    MVCCStorage,
 };
 use test_utils::assert_matches;
 use test_utils_concept::{load_managers, setup_concept_storage};
@@ -66,7 +66,7 @@ fn setup(
     let mut snapshot = storage.clone().open_snapshot_schema();
     let define = typeql::parse_query(schema).unwrap().into_structure().into_schema();
     query_manager
-        .execute_schema(&mut snapshot, &type_manager, &thing_manager, &function_manager, define, schema)
+        .execute_schema(&mut snapshot, &type_manager, &thing_manager, &function_manager, &define, schema)
         .unwrap();
     snapshot.commit(&mut CommitProfile::DISABLED).unwrap();
 
@@ -77,8 +77,9 @@ fn setup(
             snapshot,
             &type_manager,
             thing_manager.clone(),
-            &FunctionManager::default(),
+            Arc::default(),
             &query,
+            None::<GivenRowsSimple>,
             data,
         )
         .unwrap();
@@ -128,22 +129,20 @@ fn test_has_planning_traversal() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -161,7 +160,7 @@ fn test_has_planning_traversal() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -218,16 +217,14 @@ fn test_expression_planning_traversal() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let compiled_expressions = compile_expressions(
         &*snapshot,
@@ -244,7 +241,7 @@ fn test_expression_planning_traversal() {
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &compiled_expressions,
@@ -262,7 +259,7 @@ fn test_expression_planning_traversal() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::new(value_parameters));
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::new(value_parameters));
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -318,22 +315,20 @@ fn test_links_planning_traversal() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -351,7 +346,7 @@ fn test_links_planning_traversal() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -414,22 +409,20 @@ fn test_links_intersection() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -447,7 +440,7 @@ fn test_links_intersection() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -501,22 +494,20 @@ fn test_negation_planning_traversal() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -534,7 +525,7 @@ fn test_negation_planning_traversal() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -609,22 +600,20 @@ fn test_forall_planning_traversal() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -643,7 +632,7 @@ fn test_forall_planning_traversal() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -704,22 +693,20 @@ fn test_named_var_select() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -737,7 +724,7 @@ fn test_named_var_select() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -798,22 +785,20 @@ fn test_disjunction_planning_traversal() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -831,7 +816,7 @@ fn test_disjunction_planning_traversal() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -896,22 +881,20 @@ fn test_disjunction_planning_nested_negations() {
     let snapshot = Arc::new(storage.clone().open_snapshot_read());
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
 
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &*snapshot,
-        &block,
-        &translation_context.variable_registry,
         &type_manager,
-        &BTreeMap::new(),
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let conjunction_executable = compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),
@@ -929,7 +912,7 @@ fn test_disjunction_planning_nested_negations() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows = iterator
@@ -987,7 +970,7 @@ fn test_mismatched_input_types() {
             &QueryProfile::new(false),
         )
         .unwrap();
-        let context = ExecutionContext::new(snapshot, thing_manager.clone(), Arc::default());
+        let context = ExecutionContext::new(snapshot, thing_manager.clone(), Arc::default(), Arc::default());
         let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
         let rows = iterator
             .map_static(|row| row.map(|row| row.into_owned()).map_err(|err| err.clone()))
@@ -1022,7 +1005,7 @@ fn test_mismatched_input_types() {
             &QueryProfile::new(false),
         )
         .unwrap();
-        let context = ExecutionContext::new(snapshot, thing_manager.clone(), Arc::default());
+        let context = ExecutionContext::new(snapshot, thing_manager.clone(), Arc::default(), Arc::default());
         let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
         let rows = iterator
             .map_static(|row| row.map(|row| row.into_owned()).map_err(|err| err.clone()))
@@ -1059,22 +1042,20 @@ fn compile_query(
     let block = builder.finish().unwrap();
 
     // Executor
-    let entry_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         snapshot,
-        &block,
-        &translation_context.variable_registry,
-        &type_manager,
-        &BTreeMap::new(),
+        type_manager,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let entry_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     compiler::executable::match_::planner::compile(
         &block,
         &BTreeMap::new(),
         &HashMap::new(),
-        block.conjunction().named_visible_binding_variables(block.block_context()).collect(),
+        block.conjunction().named_visible_referenced_variables().collect(),
         &entry_annotations,
         &translation_context.variable_registry,
         &HashMap::new(),

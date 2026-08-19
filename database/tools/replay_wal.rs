@@ -8,10 +8,11 @@ use std::{fs::create_dir_all, io, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
 use concept::thing::statistics::Statistics;
-use durability::{wal::WAL, DurabilitySequenceNumber};
+use diagnostics::metrics::FsyncMetrics;
+use durability::{DurabilitySequenceNumber, wal::WAL};
 use storage::{
     durability_client::{DurabilityClient, DurabilityRecord, WALClient},
-    isolation_manager::{CommitRecord, StatusRecord},
+    record::{CommitRecord, LegacyCommitRecordV1, StatusRecord},
 };
 
 #[derive(Parser)]
@@ -41,6 +42,7 @@ struct Cli {
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
 enum RecordKind {
     CommitRecord,
+    LegacyCommitRecordV1,
     CommitStatus,
     Statistics,
 }
@@ -48,10 +50,11 @@ enum RecordKind {
 fn main() {
     let cli = Cli::parse();
 
-    let source_wal = WAL::load(cli.source_directory).unwrap();
+    let source_wal = WAL::load(cli.source_directory, FsyncMetrics::disabled()).unwrap();
 
     let mut source_wal = WALClient::new(source_wal);
     source_wal.register_record_type::<Statistics>();
+    source_wal.register_record_type::<LegacyCommitRecordV1>();
     source_wal.register_record_type::<CommitRecord>();
     source_wal.register_record_type::<StatusRecord>();
 
@@ -61,8 +64,9 @@ fn main() {
         err @ Err(_) => dbg!(err).unwrap(),
     }
 
-    let mut target_wal = WALClient::new(WAL::load(cli.target_directory).unwrap());
+    let mut target_wal = WALClient::new(WAL::load(cli.target_directory, FsyncMetrics::disabled()).unwrap());
     target_wal.register_record_type::<Statistics>();
+    target_wal.register_record_type::<LegacyCommitRecordV1>();
     target_wal.register_record_type::<CommitRecord>();
     target_wal.register_record_type::<StatusRecord>();
 
@@ -74,6 +78,11 @@ fn main() {
             break;
         }
         match record.record_type {
+            LegacyCommitRecordV1::RECORD_TYPE
+                if cli.kind.is_empty() || cli.kind.contains(&RecordKind::LegacyCommitRecordV1) =>
+            {
+                _ = target_wal.sequenced_write::<LegacyCommitRecordV1>(&deserialise_record(&record.bytes)).unwrap()
+            }
             CommitRecord::RECORD_TYPE if cli.kind.is_empty() || cli.kind.contains(&RecordKind::CommitRecord) => {
                 _ = target_wal.sequenced_write::<CommitRecord>(&deserialise_record(&record.bytes)).unwrap()
             }
@@ -83,7 +92,10 @@ fn main() {
             Statistics::RECORD_TYPE if cli.kind.is_empty() || cli.kind.contains(&RecordKind::Statistics) => {
                 target_wal.unsequenced_write::<Statistics>(&deserialise_record(&record.bytes)).unwrap()
             }
-            CommitRecord::RECORD_TYPE | StatusRecord::RECORD_TYPE | Statistics::RECORD_TYPE => (), // filtered out
+            LegacyCommitRecordV1::RECORD_TYPE
+            | CommitRecord::RECORD_TYPE
+            | StatusRecord::RECORD_TYPE
+            | Statistics::RECORD_TYPE => (), // filtered out
             unrecognized => panic!("Unrecognized record type: {unrecognized}"),
         }
     }

@@ -10,17 +10,17 @@ use encoding::{
 };
 use ir::{
     pattern::{
+        AssignedVariable,
         constraint::IsaKind,
         variable_category::{VariableCategory, VariableOptionality},
     },
     pipeline::{
+        ParameterRegistry,
         block::Block,
         function_signature::{FunctionID, FunctionSignature, HashMapFunctionSignatureIndex},
-        ParameterRegistry,
     },
-    translation::{pipeline::translate_pipeline, PipelineTranslationContext},
+    translation::{PipelineTranslationContext, pipeline::translate_pipeline},
 };
-
 // TODO: if we re-instante modifiers/stream operators as part of blocks, then we can bring this test back
 // #[test]
 // fn build_modifiers() {
@@ -51,12 +51,11 @@ fn build_with_functions() {
     let mut value_parameters = ParameterRegistry::new();
     let mut builder = Block::builder(context.new_block_builder_context(&mut value_parameters));
     let mut conjunction = builder.conjunction_mut();
-
     let var_person = conjunction.constraints_mut().get_or_declare_variable("person", None).unwrap();
     let var_person_type = conjunction.constraints_mut().get_or_declare_variable("person_type", None).unwrap();
 
     let var_count = conjunction.constraints_mut().get_or_declare_variable("count", None).unwrap();
-    let var_mean = conjunction.constraints_mut().get_or_declare_variable("sum", None).unwrap();
+    let var_mean = conjunction.constraints_mut().get_or_declare_variable("mean", None).unwrap();
 
     conjunction.constraints_mut().add_isa(IsaKind::Subtype, var_person, var_person_type.into(), None).unwrap();
 
@@ -66,14 +65,15 @@ fn build_with_functions() {
         (VariableCategory::Value, VariableOptionality::Optional),
     ];
     let function_signature = FunctionSignature::new(
-        FunctionID::Schema(DefinitionKey::build(Prefix::DefinitionStruct, DefinitionID::build(1000))),
+        FunctionID::Schema(DefinitionKey::new(Prefix::DefinitionStruct, DefinitionID::new(1000))),
         function_argument_categories,
         function_return_categories,
         false,
     );
+    let assigned = vec![AssignedVariable::new_required(var_count), AssignedVariable::new_optional(var_mean)];
     conjunction
         .constraints_mut()
-        .add_function_binding(vec![var_count, var_mean], &function_signature, vec![var_person], "test_fn", None)
+        .add_function_binding(assigned, &function_signature, vec![var_person], "test_fn", None)
         .unwrap();
     let block = builder.finish().unwrap();
     println!("{}", block.conjunction());

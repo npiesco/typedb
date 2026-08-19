@@ -15,7 +15,7 @@ use typeql::{common::Span, statement::InIterable, token, value::StringLiteral};
 
 use crate::{
     pattern::{expression::ExpressionRepresentationError, variable_category::VariableCategory},
-    pipeline::{FunctionReadError, FunctionRepresentationError},
+    pipeline::{FunctionReadError, FunctionRepresentationError, block::UnplannableConstraints},
     translation::fetch::FetchRepresentationError,
 };
 
@@ -25,13 +25,6 @@ pub mod translation;
 
 typedb_error! {
     pub RepresentationError(component = "Representation", prefix = "REP") {
-        LocallyBoundVariableReuse(
-            0,
-            "Locally-scoped variable '{name}' cannot be re-used elsewhere as a locally-scoped variable. \
-            Variables are not local if bound in a conjunction constraint, a parent scope, or bound in every branch of a disjunction.",
-            name: String,
-            source_span: Option<Span>,
-        ),
         VariableCategoryMismatch(
             1,
             "The variable '{variable_name}' cannot be declared as both a '{category_1}' and as a '{category_2}'.",
@@ -182,7 +175,7 @@ typedb_error! {
         ),
         UnboundVariable(
             25,
-            "Invalid query containing unbound concept variable {variable}.",
+            "Invalid query containing unbound concept variable '{variable}'.",
             variable: String,
             source_span: Option<Span>,
         ),
@@ -201,6 +194,12 @@ typedb_error! {
             rhs_category: VariableCategory,
             source_span: Option<Span>,
         ),
+        GroupByVariableNotAvailable(
+            29,
+            "The variable '{variable}' was not available for use in the groupby clause.",
+            variable: String,
+            source_span: Option<Span>,
+        ),
         LabelWithLabel(
             30,
             "Specifying a label constraint on a label is not allowed.",
@@ -210,6 +209,29 @@ typedb_error! {
             31,
             "Specifying a scoped label constraint on a label is not allowed.",
             source_span: Option<Span>,
+        ),
+        UnmarkedOptionalAssignment(
+            32,
+            "The variable '{variable}' is assigned an optional value but not marked with a '?'",
+            variable: String,
+            source_span: Option<Span>,
+        ),
+        WronglyMarkedOptionalAssignment(
+            33,
+            "The variable '{variable}' was marked with a '?' but the assigned value is not optional",
+            variable: String,
+            source_span: Option<Span>,
+        ),
+        OptionalFunctionReturnReferenced(
+            34,
+            "The variable '{variable}' is optionally assigned by a function return, and may not be referenced elsewhere in the same stage.",
+            variable: String,
+            source_span: Option<Span>,
+        ),
+       VariableCategoryValueAttributeMismatch(
+            35,
+            "The variable '{variable_name}' cannot be declared as both a 'Value' and as a 'Attribute'. Consider using '==' for a value-only comparison instead.",
+            variable_name: String,
         ),
         UpdateVariableUnavailable(
             39,
@@ -241,10 +263,10 @@ typedb_error! {
         ),
         UnboundRequiredVariable(
             44,
-            "The variable '{variable}' is required to be bound to a value before it's used.",
+            "The variable '{variable}' must be bound to a value before it's used.",
             variable: String,
             source_span: Option<Span>,
-            _rest: Vec<Option<Span>>,
+            _all_spans: Vec<Span>,
         ),
         IllegalStatementForInsert(
             45,
@@ -260,6 +282,13 @@ typedb_error! {
             47,
             "Illegal nested pattern provided for an update stage. Only 'try {{}}' blocks are allowed.",
             source_span: Option<Span>,
+        ),
+        ReduceAssignsToExistingVariable(
+            48,
+            "The reduce stage assigns to an existing variable '{variable}'.",
+            variable: String,
+            source_span: Option<Span>,
+            existing_span: Option<Span>,
         ),
         RegexExpectedStringLiteral(
             50,
@@ -282,7 +311,18 @@ typedb_error! {
         OptionalInNegation(
             53,
             "Optionals are not allowed in negations as this can never return a meaningful result.",
+            // source_span: Option<Span>,
+        ),
+        NonInitialGiven(
+            54,
+            "Given clauses must be the first clause in a query pipeline.",
             source_span: Option<Span>,
+        ),
+        UnplannableConjunction(
+            55,
+            "The required input variables for the following constraints could not be satisfied (there may be a circular dependency):\n{unplannable_constraints}",
+            unplannable_constraints: UnplannableConstraints,
+            span: Option<Span>,
         ),
         InternalNotAValueBuiltin(
             100,
@@ -308,16 +348,15 @@ typedb_error! {
             offset: String,
             source_span: Option<Span>,
         ),
+        UnimplementedExpressionsInWrite(
+            253,
+            "Expressions are currently not supported in write stages. Please move it to a preceding match stage.",
+            source_span: Option<Span>,
+        ),
         UnimplementedLanguageFeature(
             254,
             "The language feature is not yet implemented: {feature}.",
             feature: error::UnimplementedFeature,
-        ),
-        UnimplementedOptionalType(
-            255,
-            "Optional types are not yet implemented.",
-            source_span: Option<Span>,
-            feature: error::UnimplementedFeature
         ),
         UnimplementedListType(
             256,

@@ -7,14 +7,16 @@
 use std::{fs::File, io::Read, path::Path, sync::Arc, time::Instant};
 
 use database::{
-    database_manager::DatabaseManager,
-    transaction::{TransactionRead, TransactionSchema, TransactionWrite},
     Database,
+    database_manager::{DatabaseManager, ImportOwnership},
+    transaction::{CommitIntent, TransactionRead, TransactionSchema, TransactionWrite},
 };
-use executor::{batch::Batch, pipeline::stage::StageIterator, ExecutionInterrupt};
-use options::TransactionOptions;
+use diagnostics::diagnostics_manager::DiagnosticsManager;
+use executor::{ExecutionInterrupt, batch::Batch, pipeline::stage::StageIterator};
+use options::{TransactionOptions, byte_size::ByteSize};
+use query::given_rows::GivenRowsSimple;
 use storage::durability_client::WALClient;
-use test_utils::create_tmp_dir;
+use test_utils::create_tmp_storage_dir;
 
 const DB_NAME: &str = "benchmark-iam";
 const RESOURCE_PATH: &str = "tests/benchmarks/iam";
@@ -24,7 +26,7 @@ const DATA_FILENAME: &str = "data.tql";
 
 fn load_schema_tql(database: Arc<Database<WALClient>>, schema_tql: &Path) {
     let mut contents = Vec::new();
-    File::open(schema_tql).unwrap().read_to_end(&mut contents);
+    File::open(schema_tql).unwrap().read_to_end(&mut contents).unwrap();
     let schema_str = String::from_utf8(contents).unwrap();
     let schema_query = typeql::parse_query(schema_str.as_str()).unwrap().into_structure().into_schema();
 
@@ -47,7 +49,7 @@ fn load_schema_tql(database: Arc<Database<WALClient>>, schema_tql: &Path) {
             &type_manager,
             &thing_manager,
             &function_manager,
-            schema_query,
+            &schema_query,
             &schema_str,
         )
         .unwrap();
@@ -61,13 +63,14 @@ fn load_schema_tql(database: Arc<Database<WALClient>>, schema_tql: &Path) {
         transaction_options,
         profile,
     );
-    tx.commit().1.unwrap();
+    let (mut profile, intent) = tx.finalise();
+    intent.unwrap().commit(profile.commit_profile()).unwrap();
 }
 
 fn load_data_tql(database: Arc<Database<WALClient>>, data_tql: &Path) {
     let mut contents = Vec::new();
 
-    File::open(data_tql).unwrap().read_to_end(&mut contents);
+    File::open(data_tql).unwrap().read_to_end(&mut contents).unwrap();
     let data_str = String::from_utf8(contents).unwrap();
     let data_query = typeql::parse_query(data_str.as_str()).unwrap().into_structure().into_pipeline();
     let tx = TransactionWrite::open(database.clone(), TransactionOptions::default()).unwrap();
@@ -86,8 +89,9 @@ fn load_data_tql(database: Arc<Database<WALClient>>, data_tql: &Path) {
             Arc::try_unwrap(snapshot).unwrap_or_else(|_| panic!("Expected unique ownership of snapshot")),
             &type_manager,
             thing_manager.clone(),
-            &function_manager,
+            function_manager.clone(),
             &data_query,
+            None::<GivenRowsSimple>,
             &data_str,
         )
         .unwrap();
@@ -102,13 +106,21 @@ fn load_data_tql(database: Arc<Database<WALClient>>, data_tql: &Path) {
         transaction_options,
         profile,
     );
-    tx.commit().1.unwrap();
+    let (mut profile, intent) = tx.finalise();
+    intent.unwrap().commit(profile.commit_profile()).unwrap();
 }
 
 fn setup() -> Arc<Database<WALClient>> {
-    let tmp_dir = create_tmp_dir();
+    let tmp_dir = create_tmp_storage_dir();
     {
-        let dbm = DatabaseManager::new(&tmp_dir).unwrap();
+        let dbm = DatabaseManager::new(
+            &tmp_dir,
+            Arc::new(DiagnosticsManager::new_disabled()),
+            ByteSize::mb(64),
+            ByteSize::mb(64),
+            ImportOwnership::Exclusive,
+        )
+        .unwrap();
         dbm.put_database(DB_NAME).unwrap();
         let database = dbm.database(DB_NAME).unwrap();
         let schema_path = Path::new(RESOURCE_PATH).join(Path::new(SCHEMA_FILENAME));
@@ -119,7 +131,14 @@ fn setup() -> Arc<Database<WALClient>> {
         load_schema_tql(database.clone(), &functions_path);
         load_data_tql(database.clone(), &data_path);
     }
-    let dbm = DatabaseManager::new(&tmp_dir).unwrap();
+    let dbm = DatabaseManager::new(
+        &tmp_dir,
+        Arc::new(DiagnosticsManager::new_disabled()),
+        ByteSize::mb(64),
+        ByteSize::mb(64),
+        ImportOwnership::Exclusive,
+    )
+    .unwrap();
     dbm.put_database(DB_NAME).unwrap();
 
     dbm.database(DB_NAME).unwrap()
@@ -134,12 +153,13 @@ fn run_query(database: Arc<Database<WALClient>>, query_str: &str) -> Batch {
             snapshot.clone(),
             type_manager,
             thing_manager.clone(),
-            function_manager,
+            function_manager.clone(),
             &query,
+            None::<GivenRowsSimple>,
             query_str,
         )
         .unwrap();
-    let (rows, context) = pipeline.into_rows_iterator(ExecutionInterrupt::new_uninterruptible()).unwrap();
+    let (rows, _context) = pipeline.into_rows_iterator(ExecutionInterrupt::new_uninterruptible()).unwrap();
 
     rows.collect_owned().unwrap()
 }

@@ -7,24 +7,25 @@
 use answer::variable::Variable;
 use error::UnimplementedFeature;
 use typeql::{
+    Expression, Statement,
     common::Spanned,
     query::stage::{
-        delete::{Deletable, DeletableKind},
         Put,
+        delete::{Deletable, DeletableKind},
     },
     statement::thing::{Constraint, HasValue, Head, RolePlayer},
-    Expression, Statement,
 };
 
 use crate::{
-    pattern::conjunction::ConjunctionBuilder,
-    pipeline::{block::Block, function_signature::HashMapFunctionSignatureIndex, ParameterRegistry},
+    RepresentationError,
+    pattern::conjunction::ConjunctionBuilderWithContext,
+    pipeline::{ParameterRegistry, block::Block, function_signature::HashMapFunctionSignatureIndex},
     translation::{
+        PipelineTranslationContext,
         constraints::{add_typeql_relation, register_typeql_var},
         match_::add_patterns,
-        verify_variable_available, PipelineTranslationContext,
+        verify_variable_available,
     },
-    RepresentationError,
 };
 
 pub fn translate_insert(
@@ -35,7 +36,8 @@ pub fn translate_insert(
     validate_insert_patterns(&insert.patterns)?;
     let mut builder = Block::builder(context.new_block_builder_context(value_parameters));
     let function_index = HashMapFunctionSignatureIndex::empty();
-    add_patterns(&function_index, &mut builder.conjunction_mut(), &insert.patterns)?;
+    let mut conjunction = builder.conjunction_mut();
+    add_patterns(&function_index, &mut conjunction, &insert.patterns)?;
     builder.finish()
 }
 
@@ -61,7 +63,7 @@ fn validate_insert_pattern(pattern: &typeql::Pattern) -> Result<(), Box<Represen
         typeql::Pattern::Conjunction(typeql::pattern::Conjunction { span, .. })
         | typeql::Pattern::Disjunction(typeql::pattern::Disjunction { span, .. })
         | typeql::Pattern::Negation(typeql::pattern::Negation { span, .. }) => {
-            return Err(Box::new(RepresentationError::IllegalNestedPatternForInsert { source_span: *span }))
+            return Err(Box::new(RepresentationError::IllegalNestedPatternForInsert { source_span: *span }));
         }
         typeql::Pattern::Statement(Statement::Thing(thing_stmt)) => {
             for constraint in &thing_stmt.constraints {
@@ -69,14 +71,14 @@ fn validate_insert_pattern(pattern: &typeql::Pattern) -> Result<(), Box<Represen
                     Constraint::Iid(_) => {
                         return Err(Box::new(RepresentationError::IllegalStatementForInsert {
                             source_span: thing_stmt.span(),
-                        }))
+                        }));
                     }
                     Constraint::Isa(_) | Constraint::Has(_) | Constraint::Links(_) => (),
                 }
             }
         }
         typeql::Pattern::Statement(stmt) => {
-            return Err(Box::new(RepresentationError::IllegalStatementForInsert { source_span: stmt.span() }))
+            return Err(Box::new(RepresentationError::IllegalStatementForInsert { source_span: stmt.span() }));
         }
     }
     Ok(())
@@ -90,7 +92,8 @@ pub fn translate_update(
     validate_update_patterns(context, &update.patterns)?;
     let mut builder = Block::builder(context.new_block_builder_context(value_parameters));
     let function_index = HashMapFunctionSignatureIndex::empty();
-    add_patterns(&function_index, &mut builder.conjunction_mut(), &update.patterns)?;
+    let mut conjunction = builder.conjunction_mut();
+    add_patterns(&function_index, &mut conjunction, &update.patterns)?;
     builder.finish()
 }
 
@@ -102,7 +105,8 @@ pub fn translate_put(
     validate_insert_patterns(&put.patterns)?;
     let mut builder = Block::builder(context.new_block_builder_context(value_parameters));
     let function_index = HashMapFunctionSignatureIndex::empty();
-    add_patterns(&function_index, &mut builder.conjunction_mut(), &put.patterns)?;
+    let mut conjunction = builder.conjunction_mut();
+    add_patterns(&function_index, &mut conjunction, &put.patterns)?;
     let block = builder.finish()?;
     for constraint in block.conjunction().constraints() {
         match constraint {
@@ -117,7 +121,7 @@ pub fn translate_put(
                 return Err(Box::new(RepresentationError::IllegalStatementForPut {
                     constraint_type: constraint.name().to_owned(),
                     source_span: constraint.source_span(),
-                }))
+                }));
             }
         }
     }
@@ -133,7 +137,8 @@ pub fn translate_delete(
     validate_deleted_variables_availability(context, delete)?;
     let mut builder = Block::builder(context.new_block_builder_context(value_parameters));
     let mut deleted_concepts = Vec::new();
-    add_deletables(&delete.deletables, builder.conjunction_mut(), &mut deleted_concepts)?;
+    let mut conjunction = builder.conjunction_mut();
+    add_deletables(&delete.deletables, &mut conjunction, &mut deleted_concepts)?;
     let block = builder.finish()?;
     context.last_stage_visible_variables.retain(|name, var| !deleted_concepts.contains(var));
     Ok((block, deleted_concepts))
@@ -154,7 +159,7 @@ fn validate_delete(delete: &typeql::query::stage::Delete) -> Result<(), Box<Repr
 
 fn add_deletables(
     deletables: &[Deletable],
-    mut conjunction: ConjunctionBuilder<'_, '_>,
+    conjunction: &mut ConjunctionBuilderWithContext<'_, '_>,
     deleted_concepts: &mut Vec<Variable>,
 ) -> Result<(), Box<RepresentationError>> {
     for deletable in deletables {
@@ -178,8 +183,8 @@ fn add_deletables(
             }
             DeletableKind::Optional { deletables } => {
                 debug_assert!(deletables.iter().all(|d| !matches!(d.kind, DeletableKind::Optional { .. })));
-                let optional_builder = conjunction.add_optional(deletable.span())?;
-                add_deletables(deletables, optional_builder, deleted_concepts)?;
+                let mut optional_builder = conjunction.add_optional(deletable.span())?;
+                add_deletables(deletables, &mut optional_builder, deleted_concepts)?;
             }
         }
     }
@@ -214,7 +219,7 @@ fn validate_update_pattern(
         typeql::Pattern::Conjunction(typeql::pattern::Conjunction { span, .. })
         | typeql::Pattern::Disjunction(typeql::pattern::Disjunction { span, .. })
         | typeql::Pattern::Negation(typeql::pattern::Negation { span, .. }) => {
-            return Err(Box::new(RepresentationError::IllegalNestedPatternForUpdate { source_span: *span }))
+            return Err(Box::new(RepresentationError::IllegalNestedPatternForUpdate { source_span: *span }));
         }
         typeql::Pattern::Statement(statement) => {
             if let Statement::Thing(thing_statement) = statement {
@@ -225,7 +230,7 @@ fn validate_update_pattern(
                     Head::Relation(_, relation) => {
                         return Err(Box::new(RepresentationError::IllegalStatementForUpdate {
                             source_span: relation.span,
-                        }))
+                        }));
                     }
                 }
 
@@ -251,12 +256,12 @@ fn validate_update_pattern(
                         Constraint::Isa(isa) => {
                             return Err(Box::new(RepresentationError::IllegalStatementForUpdate {
                                 source_span: isa.span,
-                            }))
+                            }));
                         }
                         Constraint::Iid(iid) => {
                             return Err(Box::new(RepresentationError::IllegalStatementForUpdate {
                                 source_span: iid.span,
-                            }))
+                            }));
                         }
                     }
                 }
@@ -303,6 +308,8 @@ fn validate_update_expression_variables_availability(
             validate_update_expression_variables_availability(context, &list_index_range.from)?;
             validate_update_expression_variables_availability(context, &list_index_range.to)
         }
+        Expression::ScopedLabel(_) => Ok(()),
+        Expression::Label(_) => Ok(()),
     }
 }
 

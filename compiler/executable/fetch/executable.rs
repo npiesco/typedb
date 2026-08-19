@@ -6,23 +6,23 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use answer::variable::Variable;
+use answer::{Type, variable::Variable};
 use concept::{thing::statistics::Statistics, type_::attribute_type::AttributeType};
 use error::typedb_error;
 use ir::{pattern::ParameterID, pipeline::VariableRegistry};
 
 use crate::{
+    VariablePosition,
     annotation::fetch::{AnnotatedFetch, AnnotatedFetchListSubFetch, AnnotatedFetchObject, AnnotatedFetchSome},
     executable::{
+        ExecutableCompilationError,
         function::{
-            executable::{compile_single_untabled_function, ExecutableFunction},
             ExecutableFunctionRegistry,
+            executable::{ExecutableFunction, compile_single_untabled_function},
         },
         next_executable_id,
-        pipeline::{compile_stages_and_fetch, ExecutableStage, TypePopulations},
-        ExecutableCompilationError,
+        pipeline::{ExecutableStage, TypePopulations, compile_stages_and_fetch},
     },
-    VariablePosition,
 };
 
 #[derive(Debug)]
@@ -42,6 +42,8 @@ pub enum FetchSomeInstruction {
     SingleVar(VariablePosition),
     SingleAttribute(VariablePosition, AttributeType),
     SingleFunction(ExecutableFunction, HashMap<Variable, VariablePosition>),
+
+    Label(Type),
 
     Object(Box<FetchObjectInstruction>),
 
@@ -126,6 +128,7 @@ fn compile_some(
                 .map_err(|err| FetchCompilationError::AnonymousFunctionCompilation { typedb_source: Box::new(err) })?;
             Ok((FetchSomeInstruction::SingleFunction(compiled, variable_positions.clone()), TypePopulations::default()))
         }
+        AnnotatedFetchSome::Label(ty) => Ok((FetchSomeInstruction::Label(ty), TypePopulations::default())),
         AnnotatedFetchSome::Object(object) => {
             let (compiled, type_populations) =
                 compile_object(statistics, available_functions, *object, variable_positions)?;
@@ -144,7 +147,7 @@ fn compile_some(
                 available_functions,
                 &stages,
                 Some(fetch),
-                &input_variables,
+                &input_variables.iter().cloned().collect::<Vec<_>>(),
             )
             .map_err(|err| FetchCompilationError::SubFetchCompilation { typedb_source: Box::new(err) })?;
             let input_position_remapping = input_variables

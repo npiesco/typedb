@@ -7,19 +7,21 @@
 use std::{collections::HashSet, fmt, sync::Arc};
 
 use encoding::{
+    Prefixed,
     error::{EncodingError, EncodingError::UnexpectedPrefix},
     graph::{
-        type_::{
-            vertex::{PrefixedTypeVertexEncoding, TypeID, TypeVertex, TypeVertexEncoding},
-            Kind,
-        },
         Typed,
+        type_::{
+            Kind,
+            vertex::{PrefixedTypeVertexEncoding, TypeID, TypeVertex, TypeVertexEncoding},
+        },
     },
     layout::prefix::{Prefix, Prefix::VertexEntityType},
     value::label::Label,
-    Prefixed,
 };
+use itertools::Itertools;
 use lending_iterator::higher_order::Hkt;
+use macro_rules_attribute::derive;
 use primitive::maybe_owns::MaybeOwns;
 use resource::{constants::snapshot::BUFFER_KEY_INLINE, profile::StorageCounters};
 use storage::{
@@ -28,21 +30,24 @@ use storage::{
 };
 
 use crate::{
-    concept_iterator,
+    ConceptAPI, concept_iterator,
     error::{ConceptReadError, ConceptWriteError},
     thing::{entity::Entity, thing_manager::ThingManager},
     type_::{
-        annotation::{Annotation, AnnotationAbstract, AnnotationCategory, AnnotationError, DefaultFrom},
+        Capability, KindAPI, ObjectTypeAPI, Ordering, OwnerAPI, PlayerAPI, ThingTypeAPI, TypeAPI,
+        annotation::{
+            Annotation, AnnotationAbstract, AnnotationCategory, AnnotationDoc, AnnotationError, AnnotationMeta,
+            FromAnnotation, HasAnnotationCategory, HasAnnotationCategoryDerive,
+        },
         attribute_type::AttributeType,
         constraint::{CapabilityConstraint, TypeConstraint},
         object_type::ObjectType,
         owns::Owns,
         plays::Plays,
         role_type::RoleType,
+        sub::Sub,
         type_manager::TypeManager,
-        Capability, KindAPI, ObjectTypeAPI, Ordering, OwnerAPI, PlayerAPI, ThingTypeAPI, TypeAPI,
     },
-    ConceptAPI,
 };
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -209,6 +214,27 @@ impl KindAPI for EntityType {
         self.plays_syntax(f, snapshot, type_manager)?;
         Ok(())
     }
+
+    fn sub_syntax(
+        &self,
+        f: &mut impl std::fmt::Write,
+        snapshot: &impl ReadableSnapshot,
+        type_manager: &TypeManager,
+    ) -> Result<(), Box<ConceptReadError>> {
+        if let Some(supertype) = self.get_supertype(snapshot, type_manager)? {
+            let supertype_label = supertype.get_label(snapshot, type_manager)?;
+            write!(f, ",\n  {} {}", typeql::token::Keyword::Sub, supertype_label.name.as_str())
+                .map_err(|err| Box::new(err.into()))?;
+            for annotation in Sub::<Self>::new(*self, supertype)
+                .get_annotations_declared(snapshot, type_manager)?
+                .iter()
+                .sorted_by_key(|annotation| annotation.category())
+            {
+                write!(f, " {}", annotation).map_err(|err| Box::new(err.into()))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ThingTypeAPI for EntityType {
@@ -256,7 +282,9 @@ impl EntityType {
             EntityTypeAnnotation::Abstract(_) => {
                 type_manager.set_entity_type_annotation_abstract(snapshot, thing_manager, *self, storage_counters)?
             }
-        };
+            EntityTypeAnnotation::Doc(doc) => type_manager.set_entity_type_annotation_doc(snapshot, *self, doc)?,
+            EntityTypeAnnotation::Meta(meta) => type_manager.set_entity_type_annotation_meta(snapshot, *self, meta)?,
+        }
         Ok(())
     }
 
@@ -266,10 +294,16 @@ impl EntityType {
         type_manager: &TypeManager,
         annotation_category: AnnotationCategory,
     ) -> Result<(), Box<ConceptWriteError>> {
-        let entity_annotation = EntityTypeAnnotation::try_getting_default(annotation_category)
+        let entity_annotation = EntityTypeAnnotationCategory::try_from(annotation_category)
             .map_err(|typedb_source| ConceptWriteError::Annotation { typedb_source })?;
         match entity_annotation {
-            EntityTypeAnnotation::Abstract(_) => type_manager.unset_entity_type_annotation_abstract(snapshot, *self)?,
+            EntityTypeAnnotationCategory::Abstract => {
+                type_manager.unset_entity_type_annotation_abstract(snapshot, *self)?
+            }
+            EntityTypeAnnotationCategory::Doc => type_manager.unset_entity_type_annotation_doc(snapshot, *self)?,
+            EntityTypeAnnotationCategory::Meta(meta) => {
+                type_manager.unset_entity_type_annotation_meta(snapshot, *self, meta)?
+            }
         }
 
         Ok(())
@@ -493,38 +527,11 @@ impl fmt::Display for EntityType {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, FromAnnotation!, HasAnnotationCategoryDerive!)]
 pub enum EntityTypeAnnotation {
     Abstract(AnnotationAbstract),
-}
-
-impl TryFrom<Annotation> for EntityTypeAnnotation {
-    type Error = AnnotationError;
-    fn try_from(annotation: Annotation) -> Result<EntityTypeAnnotation, AnnotationError> {
-        match annotation {
-            Annotation::Abstract(annotation) => Ok(EntityTypeAnnotation::Abstract(annotation)),
-
-            | Annotation::Distinct(_)
-            | Annotation::Independent(_)
-            | Annotation::Unique(_)
-            | Annotation::Key(_)
-            | Annotation::Cardinality(_)
-            | Annotation::Regex(_)
-            | Annotation::Cascade(_)
-            | Annotation::Range(_)
-            | Annotation::Values(_) => {
-                Err(AnnotationError::UnsupportedAnnotationForEntityType { category: annotation.category() })
-            }
-        }
-    }
-}
-
-impl From<EntityTypeAnnotation> for Annotation {
-    fn from(val: EntityTypeAnnotation) -> Self {
-        match val {
-            EntityTypeAnnotation::Abstract(annotation) => Annotation::Abstract(annotation),
-        }
-    }
+    Doc(AnnotationDoc),
+    Meta(AnnotationMeta),
 }
 
 // TODO: can we inline this into the macro invocation?

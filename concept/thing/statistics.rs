@@ -14,16 +14,16 @@ use std::{
 };
 
 use bytes::Bytes;
-use durability::{DurabilityRecordType, DurabilitySequenceNumber};
+use durability::DurabilityRecordType;
 use encoding::graph::{
+    Typed,
     thing::{
+        ThingVertex,
         edge::{ThingEdgeHas, ThingEdgeIndexedRelation, ThingEdgeLinks},
         vertex_attribute::AttributeVertex,
         vertex_object::ObjectVertex,
-        ThingVertex,
     },
     type_::vertex::{PrefixedTypeVertexEncoding, TypeID, TypeIDUInt, TypeVertexEncoding},
-    Typed,
 };
 use error::typedb_error;
 use resource::{
@@ -35,23 +35,23 @@ use resource::{
 };
 use serde::{Deserialize, Serialize};
 use storage::{
+    MVCCStorage,
     durability_client::{DurabilityClient, DurabilityClientError, DurabilityRecord, UnsequencedDurabilityRecord},
-    isolation_manager::CommitType,
     iterator::MVCCReadError,
     key_value::{StorageKeyArray, StorageKeyReference},
     keyspace::IteratorPool,
-    recovery::commit_recovery::{load_commit_data_from, RecoveryCommitStatus, StorageRecoveryError},
+    record::CommitType,
+    recovery::commit_recovery::{RecoveryCommitStatus, StorageRecoveryError, load_commit_data_from_with_context},
     sequence_number::SequenceNumber,
     snapshot::{buffer::OperationsBuffer, write::Write},
-    MVCCStorage,
 };
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 use crate::{
-    thing::{attribute::Attribute, entity::Entity, object::Object, relation::Relation, ThingAPI},
+    thing::{ThingAPI, attribute::Attribute, entity::Entity, object::Object, relation::Relation},
     type_::{
-        attribute_type::AttributeType, entity_type::EntityType, object_type::ObjectType, relation_type::RelationType,
-        role_type::RoleType, TypeAPI,
+        TypeAPI, attribute_type::AttributeType, entity_type::EntityType, object_type::ObjectType,
+        relation_type::RelationType, role_type::RoleType,
     },
 };
 
@@ -97,6 +97,7 @@ pub struct Statistics {
 impl Statistics {
     const ENCODING_VERSION: StatisticsEncodingVersion = 0;
     const COMMIT_CONTEXT_SIZE: u64 = 8;
+    const COMMIT_CONTEXT_MEMORY_LIMIT: usize = 1 << 30; // 1 GiB
 
     pub fn new(sequence_number: SequenceNumber) -> Self {
         Statistics {
@@ -136,15 +137,19 @@ impl Statistics {
 
         let start = Instant::now();
 
-        // make it a little more likely that we capture concurrent commits
-        let load_start = DurabilitySequenceNumber::new(
-            self.sequence_number.number().saturating_sub(Self::COMMIT_CONTEXT_SIZE).max(1),
-        );
-
         let mut data_commits = BTreeMap::new();
-        for (seq, status) in load_commit_data_from(load_start, storage.durability(), usize::MAX)
-            .map_err(|err| ReloadCommitData { typedb_source: err })?
-        {
+
+        let wal_commit_records = load_commit_data_from_with_context(
+            self.sequence_number,
+            Self::COMMIT_CONTEXT_SIZE,
+            storage.durability(),
+            Self::COMMIT_CONTEXT_MEMORY_LIMIT,
+        )
+        .map_err(|err| ReloadCommitData { typedb_source: err })?;
+
+        let mut last_included = None;
+
+        for (seq, status) in wal_commit_records {
             match status {
                 RecoveryCommitStatus::Pending(_) => {
                     // there's a gap/incomplete data in the log that means we can't apply beyond this sequence number
@@ -172,9 +177,12 @@ impl Statistics {
                             }
                             data_commits.clear();
                         }
-                    }
+                    };
+                    last_included = Some(seq);
                 }
-                RecoveryCommitStatus::Rejected => {}
+                RecoveryCommitStatus::Rejected => {
+                    last_included = Some(seq);
+                }
             }
         }
 
@@ -189,6 +197,10 @@ impl Statistics {
             || sequence_numbers_since_last_durable_write > STATISTICS_DURABLE_WRITE_SEQ_NUMBERS
         {
             self.durably_write(storage.durability())?;
+        }
+
+        if let Some(last_included) = last_included {
+            self.sequence_number = last_included;
         }
 
         let millis = Instant::now().duration_since(start).as_millis();
@@ -231,6 +243,8 @@ impl Statistics {
         storage: &MVCCStorage<D>,
     ) -> Result<i64, MVCCReadError> {
         let mut total_delta = 0;
+        let mut deferred_type_cleanups: Vec<Box<dyn FnOnce(&mut Self)>> = Vec::new();
+
         for (key, write) in writes.operations.iterate_writes() {
             let delta =
                 write_to_delta(&key, &write, writes.open_sequence_number, commit_sequence_number, commits, storage)?;
@@ -264,48 +278,60 @@ impl Statistics {
                 self.update_indexed_player(Object::new(edge.from()).type_(), Object::new(edge.to()).type_(), delta);
                 // note: don't update total count based on index
             } else if EntityType::is_decodable_from_key(&key) {
-                let type_ = EntityType::read_from(Bytes::Reference(key.bytes()).into_owned());
                 if matches!(write, Write::Delete) {
-                    self.entity_counts.remove(&type_);
-                    self.clear_object_type(ObjectType::Entity(type_));
+                    let type_ = EntityType::read_from(Bytes::Reference(key.bytes()).into_owned());
+                    deferred_type_cleanups.push(Box::new(move |this: &mut Self| {
+                        this.entity_counts.remove(&type_);
+                        this.clear_object_type(ObjectType::Entity(type_));
+                    }));
                 }
                 // note: don't update total count based on type updates
             } else if RelationType::is_decodable_from_key(&key) {
-                let type_ = RelationType::read_from(Bytes::Reference(key.bytes()).into_owned());
                 if matches!(write, Write::Delete) {
-                    self.relation_counts.remove(&type_);
-                    self.relation_role_counts.remove(&type_);
-                    let as_object_type = ObjectType::Relation(type_);
-                    self.clear_object_type(as_object_type);
+                    let type_ = RelationType::read_from(Bytes::Reference(key.bytes()).into_owned());
+                    deferred_type_cleanups.push(Box::new(move |this: &mut Self| {
+                        this.relation_counts.remove(&type_);
+                        this.relation_role_counts.remove(&type_);
+                        this.clear_object_type(ObjectType::Relation(type_));
+                    }));
                 }
                 // note: don't update total count based on type updates
             } else if AttributeType::is_decodable_from_key(&key) {
-                let type_ = AttributeType::read_from(Bytes::Reference(key.bytes()).into_owned());
                 if matches!(write, Write::Delete) {
-                    self.attribute_counts.remove(&type_);
-                    self.attribute_owner_counts.remove(&type_);
-                    for map in self.has_attribute_counts.values_mut() {
-                        map.remove(&type_);
-                    }
-                    self.has_attribute_counts.retain(|_, map| !map.is_empty());
+                    let type_ = AttributeType::read_from(Bytes::Reference(key.bytes()).into_owned());
+                    deferred_type_cleanups.push(Box::new(move |this: &mut Self| {
+                        this.attribute_counts.remove(&type_);
+                        this.attribute_owner_counts.remove(&type_);
+                        for map in this.has_attribute_counts.values_mut() {
+                            map.remove(&type_);
+                        }
+                        this.has_attribute_counts.retain(|_, map| !map.is_empty());
+                    }));
                 }
                 // note: don't update total count based on type updates
             } else if RoleType::is_decodable_from_key(&key) {
-                let type_ = RoleType::read_from(Bytes::Reference(key.bytes()).into_owned());
                 if matches!(write, Write::Delete) {
-                    self.role_counts.remove(&type_);
-                    for map in self.role_player_counts.values_mut() {
-                        map.remove(&type_);
-                    }
-                    self.role_player_counts.retain(|_, map| !map.is_empty());
-                    for map in self.relation_role_counts.values_mut() {
-                        map.remove(&type_);
-                    }
-                    self.relation_role_counts.retain(|_, map| !map.is_empty());
+                    let type_ = RoleType::read_from(Bytes::Reference(key.bytes()).into_owned());
+                    deferred_type_cleanups.push(Box::new(move |this: &mut Self| {
+                        this.role_counts.remove(&type_);
+                        for map in this.role_player_counts.values_mut() {
+                            map.remove(&type_);
+                        }
+                        this.role_player_counts.retain(|_, map| !map.is_empty());
+                        for map in this.relation_role_counts.values_mut() {
+                            map.remove(&type_);
+                        }
+                        this.relation_role_counts.retain(|_, map| !map.is_empty());
+                    }));
                 }
                 // note: don't update total count based on type updates
             }
         }
+
+        for cleanup in deferred_type_cleanups {
+            cleanup(self);
+        }
+
         Ok(total_delta)
     }
 
@@ -325,34 +351,49 @@ impl Statistics {
         self.links_index_counts.retain(|_, map| !map.is_empty());
     }
 
+    fn saturating_add(count: &mut u64, delta: i64, label: &str) {
+        match count.checked_add_signed(delta) {
+            Some(value) => *count = value,
+            None => {
+                diagnostics::error_with_report!(
+                    "Unexpected underflow in statistics {} count: {} + {}",
+                    label,
+                    *count,
+                    delta
+                );
+                *count = 0;
+            }
+        }
+    }
+
     fn update_entities(&mut self, entity_type: EntityType, delta: i64) {
         let count = self.entity_counts.entry(entity_type).or_default();
-        *count = count.checked_add_signed(delta).unwrap();
-        self.total_entity_count = self.total_entity_count.checked_add_signed(delta).unwrap();
-        self.total_thing_count = self.total_thing_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(count, delta, "entity");
+        Self::saturating_add(&mut self.total_entity_count, delta, "total_entity");
+        Self::saturating_add(&mut self.total_thing_count, delta, "total_thing");
     }
 
     fn update_relations(&mut self, relation_type: RelationType, delta: i64) {
         let count = self.relation_counts.entry(relation_type).or_default();
-        *count = count.checked_add_signed(delta).unwrap();
-        self.total_relation_count = self.total_relation_count.checked_add_signed(delta).unwrap();
-        self.total_thing_count = self.total_thing_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(count, delta, "relation");
+        Self::saturating_add(&mut self.total_relation_count, delta, "total_relation");
+        Self::saturating_add(&mut self.total_thing_count, delta, "total_thing");
     }
 
     fn update_attributes(&mut self, attribute_type: AttributeType, delta: i64) {
         let count = self.attribute_counts.entry(attribute_type).or_default();
-        *count = count.checked_add_signed(delta).unwrap();
-        self.total_attribute_count = self.total_attribute_count.checked_add_signed(delta).unwrap();
-        self.total_thing_count = self.total_thing_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(count, delta, "attribute");
+        Self::saturating_add(&mut self.total_attribute_count, delta, "total_attribute");
+        Self::saturating_add(&mut self.total_thing_count, delta, "total_thing");
     }
 
     fn update_has(&mut self, owner_type: ObjectType, attribute_type: AttributeType, delta: i64) {
         let attribute_count =
             self.has_attribute_counts.entry(owner_type).or_default().entry(attribute_type).or_default();
-        *attribute_count = attribute_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(attribute_count, delta, "has_attribute");
         let owner_count = self.attribute_owner_counts.entry(attribute_type).or_default().entry(owner_type).or_default();
-        *owner_count = owner_count.checked_add_signed(delta).unwrap();
-        self.total_has_count = self.total_has_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(owner_count, delta, "attribute_owner");
+        Self::saturating_add(&mut self.total_has_count, delta, "total_has");
     }
 
     fn update_role_player(
@@ -363,13 +404,13 @@ impl Statistics {
         delta: i64,
     ) {
         let role_count = self.role_counts.entry(role_type).or_default();
-        *role_count = role_count.checked_add_signed(delta).unwrap();
-        self.total_role_count = self.total_role_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(role_count, delta, "role");
+        Self::saturating_add(&mut self.total_role_count, delta, "total_role");
         let role_player_count = self.role_player_counts.entry(player_type).or_default().entry(role_type).or_default();
-        *role_player_count = role_player_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(role_player_count, delta, "role_player");
         let relation_role_count =
             self.relation_role_counts.entry(relation_type).or_default().entry(role_type).or_default();
-        *relation_role_count = relation_role_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(relation_role_count, delta, "relation_role");
         let relation_role_player_count = self
             .relation_role_player_counts
             .entry(relation_type)
@@ -378,7 +419,7 @@ impl Statistics {
             .or_default()
             .entry(player_type)
             .or_default();
-        *relation_role_player_count = relation_role_player_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(relation_role_player_count, delta, "relation_role_player");
         let player_role_relation_count = self
             .player_role_relation_counts
             .entry(player_type)
@@ -387,29 +428,17 @@ impl Statistics {
             .or_default()
             .entry(relation_type)
             .or_default();
-        *player_role_relation_count = player_role_relation_count.checked_add_signed(delta).unwrap();
+        Self::saturating_add(player_role_relation_count, delta, "player_role_relation");
     }
 
     fn update_indexed_player(&mut self, player_1_type: ObjectType, player_2_type: ObjectType, delta: i64) {
         let player_1_to_2_index_count =
             self.links_index_counts.entry(player_1_type).or_default().entry(player_2_type).or_default();
-        *player_1_to_2_index_count = match player_1_to_2_index_count.checked_add_signed(delta) {
-            None => panic!(
-                "Error with unsigned add player_1_to_2_index_count + delta: {} + {}",
-                player_1_to_2_index_count, delta
-            ),
-            Some(value) => value,
-        };
+        Self::saturating_add(player_1_to_2_index_count, delta, "player_1_to_2_index");
         if player_1_type != player_2_type {
             let player_2_to_1_index_count =
                 self.links_index_counts.entry(player_2_type).or_default().entry(player_1_type).or_default();
-            *player_2_to_1_index_count = match player_2_to_1_index_count.checked_add_signed(delta) {
-                None => panic!(
-                    "Error with unsigned add player_2_to_1_index_count: {} + {}",
-                    player_2_to_1_index_count, delta
-                ),
-                Some(value) => value,
-            };
+            Self::saturating_add(player_2_to_1_index_count, delta, "player_2_to_1_index");
         }
     }
 
@@ -566,11 +595,7 @@ fn write_to_delta<D>(
                 }
             } else {
                 // no concurrent commit could have occurred - fall back to the flag
-                if reinsert.load(std::sync::atomic::Ordering::Relaxed) {
-                    Ok(1)
-                } else {
-                    Ok(0)
-                }
+                if reinsert.load(std::sync::atomic::Ordering::Relaxed) { Ok(1) } else { Ok(0) }
             }
         }
     }
@@ -762,10 +787,9 @@ mod serialise {
     use std::{collections::HashMap, fmt};
 
     use serde::{
-        de,
+        Deserialize, Deserializer, Serialize, Serializer, de,
         de::{MapAccess, SeqAccess, Visitor},
         ser::SerializeStruct,
-        Deserialize, Deserializer, Serialize, Serializer,
     };
 
     use crate::{

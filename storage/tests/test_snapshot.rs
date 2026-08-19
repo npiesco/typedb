@@ -14,22 +14,53 @@ use resource::{
     profile::{CommitProfile, StorageCounters},
 };
 use storage::{
-    key_range::KeyRange,
+    key_range::{KeyRange, RangeEnd, RangeStart},
     key_value::{StorageKey, StorageKeyArray},
-    snapshot::{CommittableSnapshot, ReadableSnapshot, WritableSnapshot},
+    keyspace::KeyspaceSet,
+    snapshot::{CommittableSnapshot, PreloadedRangesSnapshot, ReadableSnapshot, WritableSnapshot},
 };
-use test_utils::{create_tmp_dir, init_logging};
+use test_utils::{create_tmp_storage_dir, init_logging};
 use test_utils_storage::{create_storage, test_keyspace_set};
 
-use self::TestKeyspaceSet::Keyspace;
+use self::TestKeyspaceSet::{Keyspace, Keyspace2};
 
 test_keyspace_set! {
     Keyspace => 0: "keyspace",
+    Keyspace2 => 1: "keyspace2",
 }
+
+#[test]
+fn snapshot_generated_new_id() {
+    init_logging();
+    let mut profile = CommitProfile::DISABLED;
+    let storage_path = create_tmp_storage_dir();
+    let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
+
+    let mut snapshot1 = storage.clone().open_snapshot_write();
+    let mut snapshot2 = storage.clone().open_snapshot_write();
+    assert_eq!(snapshot1.open_sequence_number(), snapshot2.open_sequence_number());
+    assert_ne!(snapshot1.id(), snapshot2.id());
+
+    let snapshot1_open_seq_num = snapshot1.open_sequence_number();
+    let snapshot2_id = snapshot2.id();
+    snapshot1.put(StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x0, 0x0, 0x1])));
+    let seqnum1 = snapshot1.commit(&mut profile).unwrap().unwrap();
+
+    let snapshot3 = storage.clone().open_snapshot_write();
+    assert_ne!(snapshot3.open_sequence_number(), snapshot1_open_seq_num);
+    assert_ne!(snapshot3.open_sequence_number(), snapshot2.open_sequence_number());
+    assert_eq!(snapshot3.open_sequence_number(), seqnum1);
+    assert_ne!(snapshot3.id(), snapshot2_id);
+
+    let snapshot4 = storage.clone().open_snapshot_schema();
+    assert_eq!(snapshot4.open_sequence_number(), seqnum1);
+    assert_ne!(snapshot4.id(), snapshot3.id());
+}
+
 #[test]
 fn snapshot_buffered_put_get() {
     init_logging();
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
     let mut snapshot = storage.open_snapshot_write();
@@ -60,7 +91,7 @@ fn snapshot_buffered_put_get() {
 #[test]
 fn snapshot_buffered_put_iterate() {
     init_logging();
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
     let mut snapshot = storage.open_snapshot_write();
@@ -84,7 +115,7 @@ fn snapshot_buffered_put_iterate() {
 #[test]
 fn snapshot_buffered_delete() {
     init_logging();
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
     let mut snapshot = storage.open_snapshot_write();
@@ -113,7 +144,7 @@ fn snapshot_buffered_delete() {
 #[test]
 fn snapshot_read_through() {
     init_logging();
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
     let key_1 = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x0, 0x0, 0x1]));
@@ -160,7 +191,7 @@ fn snapshot_read_through() {
 #[test]
 fn snapshot_read_buffered_delete_of_persisted_key() {
     init_logging();
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
     let key_1 = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x0, 0x0]));
@@ -174,14 +205,18 @@ fn snapshot_read_buffered_delete_of_persisted_key() {
 
     {
         let mut snapshot = storage.clone().open_snapshot_write();
-        assert!(snapshot
-            .get::<48>(StorageKey::Array(key_1.clone()).as_reference(), StorageCounters::DISABLED)
-            .unwrap()
-            .is_some());
-        assert!(snapshot
-            .get::<48>(StorageKey::Array(key_2.clone()).as_reference(), StorageCounters::DISABLED)
-            .unwrap()
-            .is_some());
+        assert!(
+            snapshot
+                .get::<48>(StorageKey::Array(key_1.clone()).as_reference(), StorageCounters::DISABLED)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            snapshot
+                .get::<48>(StorageKey::Array(key_2.clone()).as_reference(), StorageCounters::DISABLED)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             2,
             snapshot
@@ -195,10 +230,12 @@ fn snapshot_read_buffered_delete_of_persisted_key() {
                 .count()
         );
         snapshot.delete(key_2.clone());
-        assert!(snapshot
-            .get::<48>(StorageKey::Array(key_2.clone()).as_reference(), StorageCounters::DISABLED)
-            .unwrap()
-            .is_none());
+        assert!(
+            snapshot
+                .get::<48>(StorageKey::Array(key_2.clone()).as_reference(), StorageCounters::DISABLED)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             1,
             snapshot
@@ -218,7 +255,7 @@ fn snapshot_read_buffered_delete_of_persisted_key() {
 #[test]
 fn snapshot_delete_reinserted() {
     init_logging();
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
     let key_1 = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x0, 0x0, 0x1]));
@@ -241,4 +278,186 @@ fn snapshot_delete_reinserted() {
             .unwrap(),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// PreloadedRangesSnapshot
+// ---------------------------------------------------------------------------
+
+fn collect_range<S: ReadableSnapshot>(
+    snapshot: &S,
+    range: &KeyRange<StorageKey<'_, BUFFER_KEY_INLINE>>,
+) -> Vec<(StorageKeyArray<BUFFER_KEY_INLINE>, ByteArray<BUFFER_VALUE_INLINE>)> {
+    snapshot
+        .iterate_range(range, StorageCounters::DISABLED)
+        .collect_cloned_vec(|k, v| (StorageKeyArray::from(k), ByteArray::from(v)))
+        .unwrap()
+}
+
+#[test]
+fn preloaded_snapshot_matches_source_over_mixed_writes() {
+    init_logging();
+    let storage_path = create_tmp_storage_dir();
+    let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
+
+    let committed_key = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x10, 0xAA]));
+    let committed_then_deleted = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x10, 0xBB]));
+    let val_committed = ByteArray::copy(&[1, 1]);
+    {
+        let mut snapshot = storage.clone().open_snapshot_write();
+        snapshot.put_val(committed_key.clone(), val_committed.clone());
+        snapshot.put_val(committed_then_deleted.clone(), ByteArray::copy(&[9, 9]));
+        snapshot.commit(&mut CommitProfile::DISABLED).unwrap();
+    }
+
+    let buffered_put = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x10, 0xCC]));
+    let buffered_insert = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x11, 0x00]));
+    let out_of_range_key = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x20, 0xDD]));
+    let val_buffered = ByteArray::copy(&[2, 2]);
+
+    let mut source = storage.clone().open_snapshot_write();
+    source.put_val(buffered_put.clone(), val_buffered.clone());
+    source.insert_val(buffered_insert.clone(), ByteArray::copy(&[3, 3]));
+    source.delete(committed_then_deleted.clone());
+    source.put(out_of_range_key.clone());
+
+    // Materialise the keyspace, limiting the leading byte to {0x10, 0x11}. Keys at
+    // 0x20 should be excluded by the load-time scan.
+    let preloaded = PreloadedRangesSnapshot::load_from(&source, vec![(Keyspace.id(), vec![0x10..=0x11])]).unwrap();
+
+    // get: present keys hit, tombstoned + out-of-range miss.
+    assert_eq!(
+        preloaded
+            .get::<BUFFER_VALUE_INLINE>(
+                StorageKey::Array(committed_key.clone()).as_reference(),
+                StorageCounters::DISABLED
+            )
+            .unwrap(),
+        Some(val_committed.clone())
+    );
+    assert_eq!(
+        preloaded
+            .get::<BUFFER_VALUE_INLINE>(
+                StorageKey::Array(buffered_put.clone()).as_reference(),
+                StorageCounters::DISABLED
+            )
+            .unwrap(),
+        Some(val_buffered.clone())
+    );
+    assert_eq!(
+        preloaded
+            .get::<BUFFER_VALUE_INLINE>(
+                StorageKey::Array(committed_then_deleted.clone()).as_reference(),
+                StorageCounters::DISABLED,
+            )
+            .unwrap(),
+        None,
+    );
+
+    // iterate_range over [0x10..=0x11] inclusive matches the source's view of the
+    // same range, minus the tombstoned committed_then_deleted.
+    let range_start = StorageKey::Array(StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x10])));
+    let range_end = StorageKey::Array(StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x11])));
+    let key_range = KeyRange::new_variable_width(
+        RangeStart::Inclusive(range_start.clone()),
+        RangeEnd::EndPrefixInclusive(range_end),
+    );
+    let source_view = collect_range(&source, &key_range);
+    let preloaded_view = collect_range(&preloaded, &key_range);
+    assert_eq!(source_view, preloaded_view);
+    assert_eq!(
+        preloaded_view,
+        vec![(committed_key, val_committed), (buffered_put, val_buffered), (buffered_insert, ByteArray::copy(&[3, 3])),],
+    );
+
+    // any_in_range over a range fully covered by the preloaded set.
+    assert!(preloaded.any_in_range(&key_range, false));
+
+    // any_in_range over an empty sub-range: no keys live between 0x10..0x10/0x00
+    // exclusive of 0x10/0xAA, so the buffered-only iterator should report none.
+    let empty_range = KeyRange::new_variable_width(
+        RangeStart::Inclusive(StorageKey::Array(StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x10, 0x00])))),
+        RangeEnd::EndPrefixExclusive(StorageKey::Array(StorageKeyArray::<BUFFER_KEY_INLINE>::from((
+            Keyspace,
+            [0x10, 0xAA],
+        )))),
+    );
+    assert!(!preloaded.any_in_range(&empty_range, false));
+}
+
+#[test]
+fn preloaded_snapshot_multi_keyspace() {
+    init_logging();
+    let storage_path = create_tmp_storage_dir();
+    let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
+
+    let k1_a = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x05, 0x01]));
+    let k1_b = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x05, 0x02]));
+    let k2_a = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace2, [0x05, 0x01]));
+    let k2_b = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace2, [0x05, 0x02]));
+
+    let mut source = storage.clone().open_snapshot_write();
+    source.put_val(k1_a.clone(), ByteArray::copy(&[1]));
+    source.put_val(k1_b.clone(), ByteArray::copy(&[2]));
+    source.put_val(k2_a.clone(), ByteArray::copy(&[3]));
+    source.put_val(k2_b.clone(), ByteArray::copy(&[4]));
+
+    let preloaded = PreloadedRangesSnapshot::load_from(
+        &source,
+        vec![(Keyspace.id(), vec![0x05..=0x05]), (Keyspace2.id(), vec![0x05..=0x05])],
+    )
+    .unwrap();
+
+    let range_for = |ks: TestKeyspaceSet| {
+        KeyRange::new_within(StorageKey::Array(StorageKeyArray::<BUFFER_KEY_INLINE>::from((ks, [0x05]))), false)
+    };
+    assert_eq!(
+        collect_range(&preloaded, &range_for(Keyspace)),
+        vec![(k1_a.clone(), ByteArray::copy(&[1])), (k1_b.clone(), ByteArray::copy(&[2]))],
+    );
+    assert_eq!(
+        collect_range(&preloaded, &range_for(Keyspace2)),
+        vec![(k2_a.clone(), ByteArray::copy(&[3])), (k2_b.clone(), ByteArray::copy(&[4]))],
+    );
+
+    assert_eq!(
+        preloaded
+            .get::<BUFFER_VALUE_INLINE>(StorageKey::Array(k1_a).as_reference(), StorageCounters::DISABLED)
+            .unwrap(),
+        Some(ByteArray::copy(&[1]))
+    );
+    assert_eq!(
+        preloaded
+            .get::<BUFFER_VALUE_INLINE>(StorageKey::Array(k2_a).as_reference(), StorageCounters::DISABLED)
+            .unwrap(),
+        Some(ByteArray::copy(&[3]))
+    );
+}
+
+#[test]
+fn preloaded_snapshot_load_from_at_sequence_number() {
+    init_logging();
+    let storage_path = create_tmp_storage_dir();
+    let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
+
+    let key_at_t0 = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x07, 0x01]));
+    let key_at_t1 = StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x07, 0x02]));
+
+    let mut snap_t0 = storage.clone().open_snapshot_write();
+    snap_t0.put_val(key_at_t0.clone(), ByteArray::copy(&[0]));
+    let seq_t0 = snap_t0.commit(&mut CommitProfile::DISABLED).unwrap().unwrap();
+
+    let mut snap_t1 = storage.clone().open_snapshot_write();
+    snap_t1.put_val(key_at_t1.clone(), ByteArray::copy(&[1]));
+    snap_t1.commit(&mut CommitProfile::DISABLED).unwrap();
+
+    let preloaded = PreloadedRangesSnapshot::load_from(
+        &storage.clone().open_snapshot_read_at(seq_t0),
+        vec![(Keyspace.id(), vec![0x07..=0x07])],
+    )
+    .unwrap();
+
+    let key_range =
+        KeyRange::new_within(StorageKey::Array(StorageKeyArray::<BUFFER_KEY_INLINE>::from((Keyspace, [0x07]))), false);
+    assert_eq!(collect_range(&preloaded, &key_range), vec![(key_at_t0, ByteArray::copy(&[0]))]);
 }

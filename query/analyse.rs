@@ -9,32 +9,34 @@ use std::{
     sync::Arc,
 };
 
-use answer::variable::Variable;
+use answer::{Type, variable::Variable};
 use compiler::{
     annotation::{
+        expression::compiled_expression::ExpressionValueType,
         fetch::{AnnotatedFetchObject, AnnotatedFetchSome},
         function::{AnnotatedFunctionSignature, FunctionParameterAnnotation},
-        pipeline::{AnnotatedPipeline, AnnotatedStage},
+        pipeline::{AnnotatedGiven, AnnotatedPipeline, AnnotatedStage},
         type_annotations::{BlockAnnotations, TypeAnnotations},
     },
     query_structure::{
-        ConjunctionAnnotations, PipelineStructure, PipelineStructureAnnotations, PipelineVariableAnnotation,
-        PipelineVariableAnnotationAndModifier, QueryStructure, StageIndex, StructureVariableId,
+        ConjunctionAnnotations, GivenStructureAnnotations, PipelineStructure, PipelineStructureAnnotations,
+        PipelineVariableAnnotation, PipelineVariableAnnotationAndModifier, QueryStructure, StageIndex,
+        StructureVariableId,
     },
 };
 use concept::{
     error::ConceptReadError,
-    type_::{attribute_type::AttributeType, type_manager::TypeManager, OwnerAPI, TypeAPI},
+    type_::{OwnerAPI, TypeAPI, attribute_type::AttributeType, type_manager::TypeManager},
 };
 use encoding::value::value_type::ValueType;
 use ir::{
     pattern::{
-        conjunction::Conjunction, nested_pattern::NestedPattern, ParameterID, Pattern, Scope, VariableBindingMode,
-        Vertex,
+        ParameterID, Scope, Vertex, conjunction::Conjunction, nested_pattern::NestedPattern,
+        variable_category::VariableOptionality,
     },
     pipeline::{ParameterRegistry, VariableRegistry},
 };
-use itertools::chain;
+use itertools::{Either, chain};
 use storage::snapshot::ReadableSnapshot;
 
 #[derive(Debug)]
@@ -47,6 +49,7 @@ pub struct AnalysedQuery {
 #[derive(Debug)]
 pub struct QueryStructureAnnotations {
     pub preamble: Vec<FunctionStructureAnnotations>,
+    pub given: Option<GivenStructureAnnotations>,
     pub query: PipelineStructureAnnotations,
     pub fetch: Option<FetchStructureAnnotationsFields>,
 }
@@ -61,10 +64,12 @@ impl QueryStructureAnnotations {
         annotated_pipeline: &AnnotatedPipeline,
         query_structure: &QueryStructure,
     ) -> Result<Self, Box<ConceptReadError>> {
-        let AnnotatedPipeline { annotated_stages, annotated_fetch, annotated_preamble } = &annotated_pipeline;
+        let AnnotatedPipeline { annotated_stages, annotated_given, annotated_fetch, annotated_preamble } =
+            &annotated_pipeline;
+        let given = annotated_given.as_ref().map(build_given_annotations);
         let pipeline =
             build_pipeline_annotations(variable_registry, annotated_stages.as_slice(), &query_structure.query);
-        let last_stage_annotations = get_last_stage_annotations(annotated_stages.as_slice());
+        let last_stage_annotations = LastStageAnnotations(annotated_stages.as_slice());
         let fetch = annotated_fetch
             .as_ref()
             .map(|fetch| {
@@ -73,7 +78,7 @@ impl QueryStructureAnnotations {
                     type_manager,
                     parameters.clone(),
                     source_query,
-                    last_stage_annotations,
+                    &last_stage_annotations,
                     &fetch.object,
                 )
             })
@@ -92,7 +97,7 @@ impl QueryStructureAnnotations {
             })
             .collect();
 
-        Ok(Self { preamble, query: pipeline, fetch })
+        Ok(Self { preamble, given, query: pipeline, fetch })
     }
 }
 
@@ -109,6 +114,28 @@ pub enum FetchStructureAnnotations {
 pub struct FunctionStructureAnnotations {
     pub signature: AnnotatedFunctionSignature,
     pub body: PipelineStructureAnnotations,
+}
+
+fn build_given_annotations(given: &AnnotatedGiven) -> GivenStructureAnnotations {
+    given
+        .variables
+        .iter()
+        .zip(given.expected_types.iter().zip(given.optionality.iter()))
+        .map(|(variable, (annotation, optionality))| {
+            let is_optional = *optionality == VariableOptionality::Optional;
+            let annotations = match annotation {
+                FunctionParameterAnnotation::AnyConcept => {
+                    debug_assert!(false, "This should be unreachable");
+                    PipelineVariableAnnotation::Instance(vec![])
+                }
+                FunctionParameterAnnotation::Concept(types) => {
+                    PipelineVariableAnnotation::Instance(types.iter().copied().collect())
+                }
+                FunctionParameterAnnotation::Value(value_type) => PipelineVariableAnnotation::Value(value_type.clone()),
+            };
+            (StructureVariableId::from(variable), PipelineVariableAnnotationAndModifier { is_optional, annotations })
+        })
+        .collect()
 }
 
 pub fn build_pipeline_annotations(
@@ -176,7 +203,7 @@ fn insert_pipeline_annotations_recursive(
     let block_id = structure.parametrised_structure.resolve_conjunction_id(stage_index, conjunction.scope_id());
     let variable_annotations =
         variable_annotations_for_block(variable_registry, block_annotations.type_annotations_of(conjunction).unwrap());
-    pipeline_annotations[block_id.0 as usize] = enrich_annotations(conjunction, variable_annotations);
+    pipeline_annotations[block_id.0 as usize] = enrich_annotations(variable_registry, variable_annotations);
 
     conjunction.nested_patterns().iter().for_each(|nested| match nested {
         NestedPattern::Disjunction(branches) => branches.conjunctions().iter().for_each(|inner| {
@@ -213,17 +240,12 @@ fn insert_pipeline_annotations_recursive(
 }
 
 fn enrich_annotations(
-    conjunction: &Conjunction,
+    variable_registry: &VariableRegistry,
     variable_annotations: impl Iterator<Item = (Variable, PipelineVariableAnnotation)>,
 ) -> ConjunctionAnnotations {
     variable_annotations
         .map(|(variable, annotations)| {
-            // TODO: We don't always have the info here :/
-            let is_optional = conjunction
-                .variable_binding_modes()
-                .get(&variable)
-                .map(VariableBindingMode::is_optionally_binding)
-                .unwrap_or(false);
+            let is_optional = variable_registry.is_variable_optional(variable);
             (StructureVariableId::from(variable), PipelineVariableAnnotationAndModifier { is_optional, annotations })
         })
         .collect()
@@ -234,7 +256,7 @@ pub fn build_fetch_annotations(
     type_manager: &TypeManager,
     parameters: Arc<ParameterRegistry>,
     source_query: &str,
-    last_stage_annotations: &TypeAnnotations,
+    last_stage_annotations: &LastStageAnnotations<'_>,
     object: &AnnotatedFetchObject,
 ) -> Result<FetchStructureAnnotationsFields, Box<ConceptReadError>> {
     match object {
@@ -255,13 +277,14 @@ pub fn build_fetch_annotations(
 fn build_fetch_attributes_annotations(
     snapshot: &impl ReadableSnapshot,
     type_manager: &TypeManager,
-    last_stage_annotations: &TypeAnnotations,
+    last_stage_annotations: &LastStageAnnotations<'_>,
     variable: Variable,
 ) -> Result<FetchStructureAnnotationsFields, Box<ConceptReadError>> {
     let mut fetch_value_types = HashMap::new();
     let owner_types = last_stage_annotations
-        .vertex_annotations_of(&Vertex::Variable(variable))
-        .expect("Expected annotations to be available");
+        .get(&Vertex::Variable(variable))
+        .expect("Expected annotations to be available")
+        .expect_left("Expected concept annotations");
     owner_types.iter().filter(|owner_type| owner_type.is_entity_type() || owner_type.is_relation_type()).try_for_each(
         |owner_type| {
             let attribute_types = owner_type.as_object_type().get_owned_attribute_types(snapshot, type_manager)?;
@@ -284,83 +307,107 @@ fn build_fetch_entries_annotations<Snapshot: ReadableSnapshot>(
     type_manager: &TypeManager,
     parameters: Arc<ParameterRegistry>,
     source_query: &str,
-    last_stage_annotations: &TypeAnnotations,
+    last_stage_annotations: &LastStageAnnotations<'_>,
     entries: &HashMap<ParameterID, AnnotatedFetchSome>,
 ) -> Result<FetchStructureAnnotationsFields, Box<ConceptReadError>> {
-    entries.iter().map(|(parameter_id, fetch_object)| {
-        let key = parameters.fetch_key(parameter_id).expect("Expected fetch key to be present").to_owned();
-        let fetch_object_annotations_maybe_list = match fetch_object {
-            AnnotatedFetchSome::SingleVar(var) => {
-                let as_vertex = Vertex::Variable(*var);
-                if let Some(annotations) = last_stage_annotations.vertex_annotations_of(&as_vertex) {
-                    let attribute_types = annotations.iter().filter(|&attribute_type| attribute_type.is_attribute_type()).map(|attribute_type| attribute_type.as_attribute_type());
-                    let leaf_annotations = build_leaf_annotations(snapshot, type_manager, attribute_types)?;
-                    FetchStructureAnnotations::Leaf(leaf_annotations)
-                } else if let Some(value_type) = last_stage_annotations.value_type_annotations_of(&as_vertex) {
-                    FetchStructureAnnotations::Leaf(BTreeSet::from([value_type.value_type().clone()]))
-                } else {
-                    unreachable!("Expected either type annotations or value annotations to be present");
-                }
-            }
-            AnnotatedFetchSome::ListAttributesAsList(_var, attribute_type) // TODO: Verify these can use the same code as SingleAttribute
-            | AnnotatedFetchSome::ListAttributesFromList(_var, attribute_type) // TODO: Verify these can use the same code as SingleAttribute
-            | AnnotatedFetchSome::SingleAttribute(_var, attribute_type) => {
-                // TODO: Refine based on owner?
-                let subtypes = attribute_type.get_subtypes(snapshot, type_manager)?;
-                let attribute_types = chain!([*attribute_type].into_iter(), subtypes.iter().copied());
-                FetchStructureAnnotations::Leaf(build_leaf_annotations(snapshot, type_manager, attribute_types)?)
-            }
-            AnnotatedFetchSome::Object(inner) => {
-                FetchStructureAnnotations::Object(build_fetch_annotations(snapshot, type_manager, parameters.clone(), source_query, last_stage_annotations, inner)?)
-            }
-            AnnotatedFetchSome::ListSubFetch(sub_fetch) => {
-                let last_stage_annotations = get_last_stage_annotations(sub_fetch.stages.as_slice());
-                let fetch = build_fetch_annotations(snapshot, type_manager, parameters.clone(), source_query, last_stage_annotations, &sub_fetch.fetch.object)?;
-                FetchStructureAnnotations::Object(fetch)
-            }
-            AnnotatedFetchSome::ListFunction(function)
-            | AnnotatedFetchSome::SingleFunction(function) => {
-                debug_assert!(function.annotated_signature.returns.len() == 1);
-                match &function.annotated_signature.returns[0] {
-                    FunctionParameterAnnotation::AnyConcept => {
-                        FetchStructureAnnotations::Leaf(
-                            build_leaf_annotations(
-                                snapshot,
-                                type_manager,
-                                type_manager.get_attribute_types(snapshot)?.into_iter()
-                            )?
-                        )
-                    }
-                    FunctionParameterAnnotation::Concept(types) => {
-                        debug_assert!(types.iter().all(|type_| type_.is_attribute_type()));
-                        FetchStructureAnnotations::Leaf(
-                            build_leaf_annotations(
-                                snapshot,
-                                type_manager,
-                                types.iter().copied().filter(|type_| type_.is_attribute_type()).map(|type_| type_.as_attribute_type())
-                            )?
-                        )
-                    }
-                    FunctionParameterAnnotation::Value(value_type) => {
-                        FetchStructureAnnotations::Leaf(BTreeSet::from([value_type.clone()]))
+    entries
+        .iter()
+        .map(|(parameter_id, fetch_object)| {
+            let key = parameters.fetch_key(parameter_id).expect("Expected fetch key to be present").to_owned();
+            let fetch_object_annotations_maybe_list = match fetch_object {
+                AnnotatedFetchSome::SingleVar(var) => {
+                    let as_vertex = Vertex::Variable(*var);
+                    let latest_annotations = last_stage_annotations
+                        .get(&as_vertex)
+                        .expect("Expected either type annotations or value annotations to be present");
+                    match latest_annotations {
+                        Either::Left(annotations) => {
+                            let attribute_types = annotations
+                                .iter()
+                                .filter(|&attribute_type| attribute_type.is_attribute_type())
+                                .map(|attribute_type| attribute_type.as_attribute_type());
+                            let leaf_annotations = build_leaf_annotations(snapshot, type_manager, attribute_types)?;
+                            FetchStructureAnnotations::Leaf(leaf_annotations)
+                        }
+                        Either::Right(value_type) => {
+                            FetchStructureAnnotations::Leaf(BTreeSet::from([value_type.value_type().clone()]))
+                        }
                     }
                 }
-            }
-        };
-        let fetch_object_annotations = match fetch_object {
-            AnnotatedFetchSome::SingleVar(_)
-            | AnnotatedFetchSome::SingleAttribute(_, _)
-            | AnnotatedFetchSome::SingleFunction(_)
-            | AnnotatedFetchSome::Object(_) => fetch_object_annotations_maybe_list,
-            AnnotatedFetchSome::ListFunction(_)
-            | AnnotatedFetchSome::ListSubFetch(_)
-            | AnnotatedFetchSome::ListAttributesAsList(_, _)
-            | AnnotatedFetchSome::ListAttributesFromList(_, _) => {
-                FetchStructureAnnotations::List(Box::new(fetch_object_annotations_maybe_list))
-            }
-        };
-        Ok((key, fetch_object_annotations))
-    }).collect::<Result<HashMap<_, _>, _>>()
+                AnnotatedFetchSome::ListAttributesAsList(_var, attribute_type)
+                | AnnotatedFetchSome::ListAttributesFromList(_var, attribute_type)
+                | AnnotatedFetchSome::SingleAttribute(_var, attribute_type) => {
+                    // TODO: Verify lists can use the same code as SingleAttribute
+                    // TODO: Refine based on owner?
+                    let subtypes = attribute_type.get_subtypes(snapshot, type_manager)?;
+                    let attribute_types = chain!([*attribute_type].into_iter(), subtypes.iter().copied());
+                    FetchStructureAnnotations::Leaf(build_leaf_annotations(snapshot, type_manager, attribute_types)?)
+                }
+                AnnotatedFetchSome::Label(_ty) => FetchStructureAnnotations::Leaf(BTreeSet::default()),
+                AnnotatedFetchSome::Object(inner) => FetchStructureAnnotations::Object(build_fetch_annotations(
+                    snapshot,
+                    type_manager,
+                    parameters.clone(),
+                    source_query,
+                    last_stage_annotations,
+                    inner,
+                )?),
+                AnnotatedFetchSome::ListSubFetch(sub_fetch) => {
+                    let last_stage_annotations = LastStageAnnotations(sub_fetch.stages.as_slice());
+                    let fetch = build_fetch_annotations(
+                        snapshot,
+                        type_manager,
+                        parameters.clone(),
+                        source_query,
+                        &last_stage_annotations,
+                        &sub_fetch.fetch.object,
+                    )?;
+                    FetchStructureAnnotations::Object(fetch)
+                }
+                AnnotatedFetchSome::ListFunction(function) | AnnotatedFetchSome::SingleFunction(function) => {
+                    debug_assert!(function.annotated_signature.returns.len() == 1);
+                    match &function.annotated_signature.returns[0] {
+                        FunctionParameterAnnotation::AnyConcept => {
+                            FetchStructureAnnotations::Leaf(build_leaf_annotations(
+                                snapshot,
+                                type_manager,
+                                type_manager.get_attribute_types(snapshot)?.into_iter(),
+                            )?)
+                        }
+                        FunctionParameterAnnotation::Concept(types) => {
+                            debug_assert!(types.iter().all(|type_| type_.is_attribute_type()));
+                            FetchStructureAnnotations::Leaf(build_leaf_annotations(
+                                snapshot,
+                                type_manager,
+                                types
+                                    .iter()
+                                    .copied()
+                                    .filter(|type_| type_.is_attribute_type())
+                                    .map(|type_| type_.as_attribute_type()),
+                            )?)
+                        }
+                        FunctionParameterAnnotation::Value(value_type) => {
+                            FetchStructureAnnotations::Leaf(BTreeSet::from([value_type.clone()]))
+                        }
+                    }
+                }
+            };
+            let fetch_object_annotations = match fetch_object {
+                AnnotatedFetchSome::SingleVar(_)
+                | AnnotatedFetchSome::SingleAttribute(_, _)
+                | AnnotatedFetchSome::SingleFunction(_)
+                | AnnotatedFetchSome::Label(_)
+                | AnnotatedFetchSome::Object(_) => fetch_object_annotations_maybe_list,
+                AnnotatedFetchSome::ListFunction(_)
+                | AnnotatedFetchSome::ListSubFetch(_)
+                | AnnotatedFetchSome::ListAttributesAsList(_, _)
+                | AnnotatedFetchSome::ListAttributesFromList(_, _) => {
+                    FetchStructureAnnotations::List(Box::new(fetch_object_annotations_maybe_list))
+                }
+            };
+            Ok((key, fetch_object_annotations))
+        })
+        .collect::<Result<HashMap<_, _>, _>>()
 }
 
 fn build_leaf_annotations(
@@ -378,17 +425,24 @@ fn build_leaf_annotations(
         .collect::<Result<BTreeSet<_>, _>>()
 }
 
-pub fn get_last_stage_annotations(stages: &[AnnotatedStage]) -> &TypeAnnotations {
-    stages
-        .iter()
-        .filter_map(|stage| match stage {
+struct LastStageAnnotations<'a>(&'a [AnnotatedStage]);
+impl<'a> LastStageAnnotations<'a> {
+    pub fn get(&self, vertex: &Vertex<Variable>) -> Option<Either<Arc<BTreeSet<Type>>, ExpressionValueType>> {
+        self.0.iter().rev().find_map(|stage| match stage {
             | AnnotatedStage::Match { block_annotations, block, .. }
             | AnnotatedStage::Put { match_annotations: block_annotations, block, .. }
             | AnnotatedStage::Insert { annotations: block_annotations, block, .. }
             | AnnotatedStage::Update { annotations: block_annotations, block, .. } => {
-                Some(block_annotations.type_annotations_of(block.conjunction()).unwrap())
+                let root_annotations = block_annotations.type_annotations_of(block.conjunction()).unwrap();
+                if let Some(annotations) = root_annotations.vertex_annotations_of(vertex) {
+                    Some(Either::Left(annotations.clone()))
+                } else if let Some(value_type) = root_annotations.value_type_annotations_of(vertex) {
+                    Some(Either::Right(value_type.clone()))
+                } else {
+                    None
+                }
             }
-            | AnnotatedStage::Delete { .. }
+            AnnotatedStage::Delete { .. }
             | AnnotatedStage::Select(_)
             | AnnotatedStage::Sort(_)
             | AnnotatedStage::Offset(_)
@@ -397,6 +451,5 @@ pub fn get_last_stage_annotations(stages: &[AnnotatedStage]) -> &TypeAnnotations
             | AnnotatedStage::Distinct(_)
             | AnnotatedStage::Reduce(_, _) => None,
         })
-        .last()
-        .expect("Expected pipeline to have a last stage")
+    }
 }

@@ -7,8 +7,10 @@ use std::sync::Arc;
 
 use cucumber::gherkin::Step;
 use database::{
-    transaction::{DataCommitError, SchemaCommitError, TransactionRead, TransactionSchema, TransactionWrite},
     Database,
+    transaction::{
+        CommitIntent, DataCommitError, SchemaCommitError, TransactionRead, TransactionSchema, TransactionWrite,
+    },
 };
 use error::TypeDBError;
 use futures::future::join_all;
@@ -16,18 +18,18 @@ use itertools::Either;
 use macro_rules_attribute::apply;
 use options::TransactionOptions;
 use params::{self, check_boolean};
-use server::Server;
+use server::state::ServerState;
 use storage::durability_client::WALClient;
 use test_utils::assert_matches;
 
-use crate::{connection::BehaviourConnectionTestExecutionError, generic_step, util, ActiveTransaction, Context};
+use crate::{ActiveTransaction, Context, connection::BehaviourConnectionTestExecutionError, generic_step, util};
 
 async fn server_open_transaction_for_database(
-    server: &'_ Server,
+    state: &'_ ServerState,
     tx_name: String,
     database_name: &'_ str,
 ) -> ActiveTransaction {
-    let database = server.database_manager().database(database_name).expect("Expected database");
+    let database = state.databases().get(database_name).await.unwrap().expect("Expected database");
     match tx_name.as_str() {
         "read" => ActiveTransaction::Read(
             TransactionRead::open(database, TransactionOptions::default()).expect("Read transaction"),
@@ -42,7 +44,7 @@ async fn server_open_transaction_for_database(
     }
 }
 
-fn transaction_type_matches(tx: &ActiveTransaction, tx_type: &str) {
+fn assert_transaction_type_matches(tx: &ActiveTransaction, tx_type: &str) {
     match tx_type {
         "read" => assert_matches!(tx, ActiveTransaction::Read(_)),
         "write" => assert_matches!(tx, ActiveTransaction::Write(_)),
@@ -55,32 +57,28 @@ fn transaction_type_matches(tx: &ActiveTransaction, tx_type: &str) {
 #[step(expr = "connection open {word} transaction for database: {word}")]
 pub async fn connection_open_transaction(context: &mut Context, tx_type: String, database_name: String) {
     assert!(context.transaction().is_none(), "Existing transaction must be closed first");
-    let server = context.server().expect("Expected server").lock().unwrap();
-    let tx = server_open_transaction_for_database(&server, tx_type, &database_name).await;
-    drop(server);
+    let tx = server_open_transaction_for_database(&context.server_state(), tx_type, &database_name).await;
     context.set_transaction(tx);
 }
 
 #[cucumber::when(expr = "connection open transaction(s) for database: {word}, of type:")]
 pub async fn connection_open_transactions(context: &mut Context, database_name: String, step: &Step) {
-    let server = context.server().expect("Expected server").lock().unwrap();
+    let state = context.server_state();
     let mut transactions = vec![];
     for tx_type in util::iter_table(step) {
-        transactions.push(server_open_transaction_for_database(&server, tx_type.into(), &database_name).await);
+        transactions.push(server_open_transaction_for_database(&state, tx_type.into(), &database_name).await);
     }
-    drop(server);
     context.set_concurrent_transactions(transactions);
 }
 
 #[cucumber::when(expr = "connection open transaction(s) in parallel for database: {word}, of type:")]
 pub async fn connection_open_transactions_in_parallel(context: &mut Context, database_name: String, step: &Step) {
-    let server = context.server().expect("Expected server").lock().unwrap();
+    let state = context.server_state();
     let transactions: Vec<ActiveTransaction> = join_all(
         util::iter_table(step)
-            .map(|tx_type| server_open_transaction_for_database(&server, tx_type.into(), &database_name)),
+            .map(|tx_type| server_open_transaction_for_database(&state, tx_type.into(), &database_name)),
     )
     .await;
-    drop(server);
     context.set_concurrent_transactions(transactions);
 }
 
@@ -96,14 +94,14 @@ pub async fn transactions_in_parallel_are_open(context: &mut Context, are_open: 
 
 #[cucumber::then(expr = "transaction has type: {word}")]
 pub async fn transaction_has_type(context: &mut Context, tx_type: String) {
-    transaction_type_matches(context.transaction().unwrap(), &tx_type)
+    assert_transaction_type_matches(context.transaction().expect("Expected an active transaction"), &tx_type)
 }
 
 #[cucumber::then(expr = "transactions( in parallel) have type:")]
 pub async fn transactions_in_parallel_have_type(context: &mut Context, step: &Step) {
     let mut active_transaction_iter = context.get_concurrent_transactions().iter();
     for tx_type in util::iter_table(step) {
-        transaction_type_matches(active_transaction_iter.next().unwrap(), tx_type)
+        assert_transaction_type_matches(active_transaction_iter.next().unwrap(), tx_type)
     }
     assert!(active_transaction_iter.next().is_none(), "Opened more transactions than tested!")
 }
@@ -111,14 +109,15 @@ pub async fn transactions_in_parallel_have_type(context: &mut Context, step: &St
 #[apply(generic_step)]
 #[step(expr = "transaction commits{may_error}")]
 pub async fn transaction_commits(context: &mut Context, may_error: params::MayError) {
-    match context.take_transaction().unwrap() {
+    match context.take_transaction() {
         ActiveTransaction::Read(_) => {
             may_error.check::<(), BehaviourConnectionTestExecutionError>(Err(
                 BehaviourConnectionTestExecutionError::CannotCommitReadTransaction,
             ));
         }
         ActiveTransaction::Write(tx) => {
-            let (_profile, result) = tx.commit();
+            let (mut profile, result) = tx.finalise();
+            let result = result.and_then(|intent| intent.commit(profile.commit_profile()));
             if let Either::Right(error) = may_error.check(result) {
                 match error {
                     DataCommitError::ConceptWriteErrors { write_errors: errors, .. } => {
@@ -137,7 +136,8 @@ pub async fn transaction_commits(context: &mut Context, may_error: params::MayEr
         }
         ActiveTransaction::Schema(tx) => {
             let types_syntax = tx.type_manager.get_types_syntax(tx.snapshot.as_ref()).unwrap();
-            let (_profile, result) = tx.commit();
+            let (mut profile, result) = tx.finalise();
+            let result = result.and_then(|intent| intent.commit(profile.commit_profile()));
             if let Either::Right(error) = may_error.check(result) {
                 match error {
                     SchemaCommitError::ConceptWriteErrors { write_errors: errors, .. } => {
@@ -157,34 +157,30 @@ pub async fn transaction_commits(context: &mut Context, may_error: params::MayEr
                 }
             } else {
                 // after each successful schema trasaction, we re-test the schema export/import
-                test_schema_export(context, &types_syntax);
+                test_schema_export(context, &types_syntax).await;
             }
         }
     }
 }
 
-fn test_schema_export(context: &mut Context, types_syntax: &str) {
+async fn test_schema_export(context: &mut Context, types_syntax: &str) {
     // export, re-import, and export schema and verify that's equal!
-    let guard = context.server.as_ref().unwrap().lock().unwrap();
-    let database_manager = guard.database_manager();
+    let state = context.server_state();
     if !types_syntax.trim().is_empty() {
         const REIMPORT_DB: &str = "schema_reimport_from_test_tmp";
-        database_manager.put_database(REIMPORT_DB).unwrap();
-        let reimport = database_manager.database(REIMPORT_DB).unwrap();
+        state.databases().create(REIMPORT_DB).await.unwrap();
+        let reimport = state.databases().get(REIMPORT_DB).await.unwrap().unwrap();
         match execute_schema_transaction(reimport.clone(), types_syntax) {
             Ok(_) => {
                 let re_exported_syntax = get_types_syntax(reimport.clone());
                 assert_eq!(re_exported_syntax, types_syntax);
                 drop(reimport);
-                let result = database_manager.delete_database(REIMPORT_DB);
-                result.unwrap();
+                state.databases().delete(REIMPORT_DB).await.unwrap();
             }
             Err(err) => {
                 drop(reimport);
-                let result = database_manager.delete_database(REIMPORT_DB);
-                drop(guard); // release the lock to avoid lock poisoning, which would crash
-                result.unwrap();
-                assert!(false, "Failed to execute schema re-import: {}", err);
+                state.databases().delete(REIMPORT_DB).await.unwrap();
+                panic!("Failed to execute schema re-import: {}", err);
             }
         }
     }
@@ -204,14 +200,17 @@ fn execute_schema_transaction(
             &transaction.type_manager,
             &transaction.thing_manager,
             &transaction.function_manager,
-            typeql::parse_query(&schema_define)
+            &typeql::parse_query(&schema_define)
                 .map_err(|err| Box::new(err) as Box<dyn TypeDBError>)?
                 .into_structure()
                 .into_schema(),
             &schema_define,
         )
         .map_err(|err| Box::new(err) as Box<dyn TypeDBError>)?;
-    transaction.commit().1.map_err(|err| Box::new(err) as Box<dyn TypeDBError>)?;
+    let (mut profile, result) = transaction.finalise();
+    result
+        .and_then(|intent| intent.commit(profile.commit_profile()))
+        .map_err(|err| Box::new(err) as Box<dyn TypeDBError>)?;
     Ok(())
 }
 
@@ -223,7 +222,7 @@ fn get_types_syntax(database: Arc<Database<WALClient>>) -> String {
 #[apply(generic_step)]
 #[step(expr = "transaction rollbacks{may_error}")]
 pub async fn transaction_rollbacks(context: &mut Context, may_error: params::MayError) {
-    match context.take_transaction().unwrap() {
+    match context.take_transaction() {
         ActiveTransaction::Read(_) => {
             may_error.check::<(), BehaviourConnectionTestExecutionError>(Err(
                 BehaviourConnectionTestExecutionError::CannotRollbackReadTransaction,

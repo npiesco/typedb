@@ -6,12 +6,13 @@
 
 use std::{fmt, sync::Arc};
 
+use bytes::util::HexBytesFormatter;
 use encoding::{
     error::EncodingError,
     value::{label::Label, value_type::ValueType},
 };
 use error::typedb_error;
-use storage::snapshot::{iterator::SnapshotIteratorError, SnapshotGetError};
+use storage::snapshot::{SnapshotError, SnapshotGetError, iterator::SnapshotIteratorError};
 
 use crate::{
     thing::thing_manager::validation::DataValidationError,
@@ -74,18 +75,26 @@ typedb_error! {
         CannotGetRelatesDoesntExist(19, "Cannot get 'relates': relationship does not exist.", type_: Label, relates: Label),
         Annotation(20, "Annotation error.", typedb_source: AnnotationError),
         Constraint(21, "Constraint error.", typedb_source: Box<ConstraintError>),
-        ValueTypeMismatchWithAttributeType(22, "Attribute type '{attribute_type}' has value type '{expected:?}' and cannot be used with '{provided}'.", attribute_type: AttributeType, expected: Option<ValueType>, provided: ValueType),
+        ValueTypeMismatchWithAttributeType(
+            22,
+            "Attribute type '{attribute_type}' has value type '{expected:?}' and cannot be used with '{provided}'.",
+            attribute_type: AttributeType,
+            expected: Option<ValueType>,
+            provided: ValueType,
+        ),
         RelationIndexNotAvailable(23, "Relation index not available for relations of type '{relation_label}'.", relation_label: Label),
         UnimplementedFunctionality(24, "Unimplemented functionality encountered: {functionality}.", functionality: error::UnimplementedFeature),
         InternalIncomparableTypes(25, "Internal error: incomparable types."),
         Format(26, "Formatting error.", source: fmt::Error),
         IidRepresentsWrongInstanceKind(27, "Could not read a concept of the expected kind by IID."),
+        FunctionNotFound(28, "Function named '{function_name}' not found.", function_name: String),
+        LoadSchemaSnapshot(29, "Failed to load schema keyspace into cached read snapshot.", typedb_source: SnapshotError),
     }
 }
 
-impl Into<ConceptReadError> for fmt::Error {
-    fn into(self) -> ConceptReadError {
-        ConceptReadError::Format { source: self }
+impl From<fmt::Error> for ConceptReadError {
+    fn from(source: fmt::Error) -> Self {
+        ConceptReadError::Format { source }
     }
 }
 
@@ -99,5 +108,8 @@ typedb_error! {
         MissingDatetimeTzTimezone(6, "Invalid format of 'datetime_tz': missing the 'timezone' part."),
         InvalidDatetimeTzName(7, "Invalid format of 'datetime_tz': timezone provided has name '{name}', which is not an officially recognized timezone.", name: String),
         InvalidDatetimeTzOffset(8, "Invalid format of 'datetime_tz': timezone provided has numerical offset '{offset_seconds}', which is not recognised as a valid value for offset in seconds.", offset_seconds: i32),
+        CouldNotDecodeIIDAsEntity(9, "The iid '{iid}' could not be decoded to an entity", iid: HexBytesFormatter<'static>),
+        CouldNotDecodeIIDAsRelation(10, "The iid '{iid}' could not be decoded to a relation", iid: HexBytesFormatter<'static>),
+        CouldNotDecodeIIDAsAttribute(11, "The iid '{iid}' could not be decoded to an attribute", iid: HexBytesFormatter<'static>),
     }
 }

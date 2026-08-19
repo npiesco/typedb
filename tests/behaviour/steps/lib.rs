@@ -16,16 +16,23 @@ use std::{
 };
 
 use ::concept::thing::{attribute::Attribute, object::Object};
-use ::query::error::QueryError;
-use cucumber::{gherkin::Feature, StatsWriter, World};
+use ::query::{error::QueryError, given_rows::GivenRowsSimple};
+use cucumber::{StatsWriter, World, gherkin::Feature};
 use database::Database;
 use futures::{
     future::Either,
     stream::{self, StreamExt},
 };
 use itertools::Itertools;
-use server::{service::http::message::analyze::AnalysedQueryResponse, Server};
+use resource::distribution_info::DistributionInfo;
+use server::{
+    Server, ServerBuilder,
+    parameters::config::{ConfigBuilder, DiagnosticsConfig},
+    service::http::message::analyze::AnalysedQueryResponse,
+    state::ServerState,
+};
 use storage::durability_client::WALClient;
+use test_utils::{TempDir, create_tmp_storage_dir};
 use thing_util::ObjectWithKey;
 use transaction_context::ActiveTransaction;
 
@@ -101,9 +108,49 @@ impl<I: AsRef<Path>> cucumber::Parser<I> for SingletonParser {
     }
 }
 
+#[derive(Debug)]
+struct ServerInstance {
+    pub(crate) server: Arc<Mutex<Server>>,
+    server_dir: TempDir,
+}
+
+impl ServerInstance {
+    const ADDRESS: &str = "0.0.0.0:1729";
+    const DISTRIBUTION_INFO: DistributionInfo =
+        DistributionInfo { logo: "logo", distribution: "TypeDB CE TEST", version: "0.0.0" };
+
+    fn config_path() -> PathBuf {
+        return std::env::current_dir().unwrap().join("server/config.yml");
+    }
+
+    async fn new() -> Self {
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(());
+        let shutdown_sender_clone = shutdown_sender.clone();
+        let server_dir = create_tmp_storage_dir();
+        let config = ConfigBuilder::from_file(Self::config_path())
+            .expect("Failed to load config file")
+            .server_listen_address(Self::ADDRESS)
+            .admin_enabled(false)
+            .data_directory(server_dir.as_ref())
+            .development_mode(true)
+            .diagnostics(DiagnosticsConfig::disabled())
+            .build()
+            .unwrap();
+        let server = ServerBuilder::new()
+            .distribution_info(Self::DISTRIBUTION_INFO)
+            .shutdown_channel((shutdown_sender_clone, shutdown_receiver))
+            .build(config)
+            .await
+            .expect("Failed to start TypeDB server");
+        Self { server_dir, server: Arc::new(Mutex::new(server)) }
+    }
+}
+
 #[derive(Debug, Default, World)]
 pub struct Context {
-    server: Option<Arc<Mutex<Server>>>,
+    server_instance: Option<Arc<Mutex<Server>>>, // Instantiation of server which may not be "started"
+
+    server: Option<Arc<Mutex<Server>>>, // Some if server is started
     active_transaction: Option<ActiveTransaction>,
     active_concurrent_transactions: Vec<ActiveTransaction>,
 
@@ -113,6 +160,7 @@ pub struct Context {
     attributes: HashMap<String, Option<Attribute>>,
     attribute_lists: HashMap<String, Vec<Attribute>>,
 
+    given_rows: Option<GivenRowsSimple>,
     analyzed: Option<AnalysedQueryResponse>,
 }
 
@@ -123,12 +171,16 @@ impl Context {
             let relative_log_dir: PathBuf = "typedb-logs".into();
             logger::initialise_logging_global(&std::env::current_dir().unwrap().join(relative_log_dir));
         });
+
+        let server_instance = ServerInstance::new().await;
+
         !Self::cucumber::<I>()
             .with_parser(SingletonParser::default())
             .repeat_failed()
             .fail_on_skipped()
             .with_default_cli()
-            .before(move |_, _, _, _| {
+            .before(move |_, _, _, context| {
+                context.server_instance = Some(server_instance.server.clone());
                 // cucumber removes the default hook before each scenario and restores it after!
                 std::panic::set_hook(Box::new(move |info| println!("{}", info)));
                 Box::pin(async move {})
@@ -159,9 +211,9 @@ impl Context {
         self.close_active_concurrent_transactions();
 
         if clean_databases {
-            let database_names = self.server().unwrap().lock().unwrap().database_manager().database_names();
-            for database_name in database_names {
-                self.server().unwrap().lock().unwrap().database_manager().delete_database(&database_name).unwrap();
+            let state = self.server_state();
+            for database_name in state.databases().all().await.unwrap() {
+                state.databases().delete(&database_name).await.unwrap();
             }
         }
 
@@ -169,9 +221,7 @@ impl Context {
     }
 
     pub fn close_active_transaction(&mut self) {
-        Self::close_transaction(
-            self.take_transaction().expect("Expected a transaction to close. No active transaction is found"),
-        )
+        Self::close_transaction(self.take_transaction())
     }
 
     pub fn close_transaction(tx: ActiveTransaction) {
@@ -186,8 +236,12 @@ impl Context {
         self.server.as_deref()
     }
 
+    pub fn server_state(&self) -> Arc<ServerState> {
+        self.server().unwrap().lock().unwrap().server_state()
+    }
+
     pub async fn database(&self, name: &str) -> Arc<Database<WALClient>> {
-        self.server().unwrap().lock().unwrap().database_manager().database(name).unwrap()
+        self.server_state().databases().get(name).await.unwrap().unwrap()
     }
 
     pub fn set_transaction(&mut self, tx: ActiveTransaction) {
@@ -207,8 +261,12 @@ impl Context {
         self.active_transaction.as_mut()
     }
 
-    pub fn take_transaction(&mut self) -> Option<ActiveTransaction> {
-        self.active_transaction.take()
+    pub fn take_transaction(&mut self) -> ActiveTransaction {
+        self.active_transaction.take().expect("Expected an active transaction")
+    }
+
+    pub fn take_given_rows(&mut self) -> Option<GivenRowsSimple> {
+        self.given_rows.take()
     }
 }
 

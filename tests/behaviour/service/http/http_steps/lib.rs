@@ -17,21 +17,25 @@ use std::{
     time::Instant,
 };
 
-use cucumber::{gherkin::Feature, StatsWriter, World};
+use cucumber::{StatsWriter, World, gherkin::Feature};
 use error::typedb_error;
 use futures::{
     future::Either,
     stream::{self, StreamExt},
 };
-use hyper::{client::HttpConnector, http, Client, StatusCode};
+use hyper::{Client, StatusCode, client::HttpConnector, http};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use itertools::Itertools;
 use serde_json::Value;
 use server::{
     error::ServerOpenError,
     service::{
-        http::message::{query::QueryAnswerResponse, transaction::TransactionResponse},
         AnswerType, QueryType,
+        http::message::{
+            analyze::AnalysedQueryResponse,
+            query::{GivenRowsPayload, QueryAnswerResponse, QueryOptionsPayload},
+            transaction::{TransactionOptionsPayload, TransactionResponse},
+        },
     },
 };
 use test_utils::TempDir;
@@ -40,7 +44,15 @@ use tokio::{task::JoinHandle, time::Duration};
 use crate::{
     connection::start_typedb,
     message::{check_health, databases, databases_delete, transactions_close, users, users_delete, users_update},
+    params::TokenMode,
+    util::random_uuid,
 };
+
+mod connection;
+mod message;
+mod params;
+mod query;
+mod util;
 
 macro_rules! in_background {
     ($context:ident, |$background:ident| $expr:expr) => {
@@ -51,17 +63,6 @@ macro_rules! in_background {
     };
 }
 pub(crate) use in_background;
-use server::service::http::message::{
-    analyze::AnalysedQueryResponse, query::QueryOptionsPayload, transaction::TransactionOptionsPayload,
-};
-
-use crate::{params::TokenMode, util::random_uuid};
-
-mod connection;
-mod message;
-mod params;
-mod query;
-mod util;
 
 const TEST_TOKEN_EXPIRATION: Duration = Duration::from_secs(25); // NOTICE: Long tests can fail!
 
@@ -136,6 +137,7 @@ pub struct Context {
     pub http_context: HttpContext,
     pub transaction_ids: VecDeque<String>,
     pub background_transaction_ids: VecDeque<String>,
+    pub given_rows: Option<GivenRowsPayload>,
     pub answer: Option<QueryAnswerResponse>,
     pub analyzed: Option<AnalysedQueryResponse>,
     pub concurrent_answers: Vec<QueryAnswerResponse>,
@@ -439,6 +441,7 @@ impl Default for Context {
             transaction_ids: VecDeque::new(),
             background_transaction_ids: VecDeque::new(),
             analyzed: None,
+            given_rows: None,
             answer: None,
             concurrent_answers: Vec::new(),
             concurrent_answers_last_consumed_index: 0,
@@ -454,7 +457,7 @@ fn create_http_client() -> Client<HttpConnector> {
 
 fn create_https_client() -> Client<HttpsConnector<HttpConnector>> {
     let https = HttpsConnectorBuilder::new()
-        .with_native_roots() // TODO: Use custom roots?
+        .with_native_roots()
         .expect("Expected native roots")
         .https_only()
         .enable_http1()

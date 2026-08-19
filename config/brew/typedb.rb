@@ -6,6 +6,7 @@
 class Typedb < Formula
   desc "The power of programming, in your database"
   homepage "https://typedb.com"
+  version "{version}"
 
   on_arm do
     url "https://repo.typedb.com/public/public-release/raw/names/typedb-all-mac-arm64/versions/{version}/typedb-all-mac-arm64-{version}.zip"
@@ -22,5 +23,10 @@ class Typedb < Formula
   def install
     libexec.install Dir["*"]
     bin.install_symlink libexec / "typedb"
+    mkdir_p var/"typedb/data"
+    inreplace libexec/"server/config.yml", "data-directory: \"data\"", "data-directory: \"#{var}/typedb/data\""
+    mkdir_p var/"typedb/logs"
+    inreplace libexec/"server/config.yml", "directory: \"logs\"", "directory: \"#{var}/typedb/logs\""
   end
+
 end

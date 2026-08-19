@@ -6,23 +6,25 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     ops::Bound,
     sync::Arc,
 };
 
 use answer::variable::Variable;
 use compiler::{
+    ExecutorVariable, VariablePosition,
     annotation::{
-        function::EmptyAnnotatedFunctionSignatures, match_inference::infer_types, type_annotations::TypeAnnotations,
+        PipelineAnnotationContext, function::EmptyAnnotatedFunctionSignatures,
+        inference::match_inference::infer_types_for_test_only, type_annotations::TypeAnnotations,
     },
     executable::{
         function::ExecutableFunctionRegistry,
         match_::{
             instructions::{
+                CheckInstruction, CheckVertex, ConstraintInstruction, Inputs,
                 thing::{HasInstruction, HasReverseInstruction, IsaReverseInstruction},
                 type_::TypeListInstruction,
-                CheckInstruction, CheckVertex, ConstraintInstruction, Inputs,
             },
             planner::{
                 conjunction_executable::{ConjunctionExecutable, ExecutionStep, IntersectionStep},
@@ -31,34 +33,33 @@ use compiler::{
         },
         next_executable_id,
     },
-    ExecutorVariable, VariablePosition,
 };
 use concept::{
     thing::{object::ObjectAPI, thing_manager::ThingManager},
     type_::{
-        annotation::AnnotationCardinality, object_type::ObjectType, owns::OwnsAnnotation, relates::RelatesAnnotation,
-        type_manager::TypeManager, Ordering, OwnerAPI, PlayerAPI,
+        Ordering, OwnerAPI, PlayerAPI, annotation::AnnotationCardinality, object_type::ObjectType,
+        owns::OwnsAnnotation, relates::RelatesAnnotation, type_manager::TypeManager,
     },
 };
 use encoding::value::{label::Label, value::Value, value_type::ValueType};
 use executor::{
-    error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext, row::MaybeOwnedRow,
-    ExecutionInterrupt,
+    ExecutionInterrupt, error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext,
+    row::MaybeOwnedRow,
 };
 use ir::{
     pattern::{
-        constraint::{Comparator, IsaKind},
         Vertex,
+        constraint::{Comparator, IsaKind},
     },
-    pipeline::{block::Block, ParameterRegistry},
+    pipeline::{ParameterRegistry, block::Block},
     translation::PipelineTranslationContext,
 };
 use lending_iterator::LendingIterator;
 use resource::profile::{CommitProfile, QueryProfile, StorageCounters};
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     snapshot::{CommittableSnapshot, ReadableSnapshot},
-    MVCCStorage,
 };
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;
@@ -222,7 +223,7 @@ fn setup_database(storage: &mut Arc<MVCCStorage<WALClient>>) {
            has name "abby",
            has name "bolton",
            has name "longy-mc-long-face-uninlineable"
-           has name "willa";
+           has name "willow";
 
          $person_3 isa person,
            has age 10,
@@ -275,7 +276,7 @@ fn setup_database(storage: &mut Arc<MVCCStorage<WALClient>>) {
     let name_uninlineable = thing_manager
         .create_attribute(&mut snapshot, name_type, Value::String(Cow::Borrowed(VALUE_STRING_LONG_UNINLINEABLE)))
         .unwrap();
-    let name_willa = thing_manager
+    let name_willow = thing_manager
         .create_attribute(&mut snapshot, name_type, Value::String(Cow::Borrowed(VALUE_STRING_WILLOW)))
         .unwrap();
 
@@ -291,7 +292,7 @@ fn setup_database(storage: &mut Arc<MVCCStorage<WALClient>>) {
     person_2.set_has_unordered(&mut snapshot, &thing_manager, &name_abby, StorageCounters::DISABLED).unwrap();
     person_2.set_has_unordered(&mut snapshot, &thing_manager, &name_bolton, StorageCounters::DISABLED).unwrap();
     person_2.set_has_unordered(&mut snapshot, &thing_manager, &name_uninlineable, StorageCounters::DISABLED).unwrap();
-    person_2.set_has_unordered(&mut snapshot, &thing_manager, &name_willa, StorageCounters::DISABLED).unwrap();
+    person_2.set_has_unordered(&mut snapshot, &thing_manager, &name_willow, StorageCounters::DISABLED).unwrap();
 
     let person_3 = thing_manager.create_entity(&mut snapshot, person_type).unwrap();
     person_3.set_has_unordered(&mut snapshot, &thing_manager, &age_10, StorageCounters::DISABLED).unwrap();
@@ -420,25 +421,20 @@ fn position_mapping<const N: usize, const M: usize>(
 }
 
 fn get_type_annotations(
-    translation_context: &PipelineTranslationContext,
+    translation_context: &mut PipelineTranslationContext,
     entry: &Block,
     snapshot: &impl ReadableSnapshot,
     type_manager: &Arc<TypeManager>,
+    value_parameters: &ParameterRegistry,
 ) -> TypeAnnotations {
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         snapshot,
-        entry,
-        &translation_context.variable_registry,
         type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap()
-    .type_annotations_of(entry.conjunction())
-    .unwrap()
-    .clone()
+        &mut translation_context.variable_registry,
+        value_parameters,
+    );
+    infer_types_for_test_only(&mut ctx, entry, false).unwrap().type_annotations_of(entry.conjunction()).unwrap().clone()
 }
 
 fn execute_steps(
@@ -470,7 +466,7 @@ fn execute_steps(
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager.clone(), value_parameters.clone());
+    let context = ExecutionContext::new(snapshot, thing_manager.clone(), Arc::default(), value_parameters.clone());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     iterator
@@ -510,7 +506,8 @@ fn value_int_equality_isa_reads() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_id_type, var_attr], []);
 
@@ -562,7 +559,8 @@ fn value_int_equality_isa_reads() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
     // 2 seeks: one for the attribute instance iterator, and one for the attribute-has-owner check
     assert_eq!(storage_counters.get_raw_seek().unwrap(), 2);
@@ -619,7 +617,8 @@ fn value_int_equality_has_reverse_reads() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping([var_person, var_gov_id], []);
 
@@ -655,7 +654,8 @@ fn value_int_equality_has_reverse_reads() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(0, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(0, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
     // 1 seek: skip directly to the correct attribute value, and find the only owner
     assert_eq!(storage_counters.get_raw_seek().unwrap(), 1);
@@ -712,7 +712,8 @@ fn value_int_equality_has_bound_owner() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) =
         position_mapping([var_person, var_person_type, var_gov_id], []);
@@ -760,7 +761,8 @@ fn value_int_equality_has_bound_owner() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
     // 6 seeks: for each person, we should skip directly to the person + owned ID
     assert_eq!(storage_counters.get_raw_seek().unwrap(), 6);
@@ -822,7 +824,8 @@ fn value_int_inequality_has_bound_owner() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) =
         position_mapping([var_person, var_person_type, var_gov_id], []);
@@ -877,7 +880,8 @@ fn value_int_inequality_has_bound_owner() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
     // 6 seeks: for each person, we should skip directly to the person + owned ID
     assert_eq!(storage_counters.get_raw_seek().unwrap(), 6);
@@ -932,7 +936,8 @@ fn value_inline_string_equality_has_bound_owner() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let entry_annotations = get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager);
+    let entry_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) =
         position_mapping([var_person, var_person_type, var_name], []);
@@ -980,7 +985,8 @@ fn value_inline_string_equality_has_bound_owner() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
     // 6 seeks: for each person, we should skip directly to the person + owned name
     assert_eq!(storage_counters.get_raw_seek().unwrap(), 6);
@@ -1037,7 +1043,8 @@ fn value_hashed_string_equality_has_bound_owner() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) =
         position_mapping([var_person, var_person_type, var_name], []);
@@ -1085,7 +1092,8 @@ fn value_hashed_string_equality_has_bound_owner() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
     // 6 seeks: for each person, we should skip directly to the person + owned name
     // 1 seek: for the unlined name, we have to get the value in order to filter it out
@@ -1152,7 +1160,8 @@ fn value_string_inequality_reduces_has_reads_bound_owner() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) =
         position_mapping([var_person, var_person_type, var_name], []);
@@ -1206,14 +1215,20 @@ fn value_string_inequality_reduces_has_reads_bound_owner() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
     // 6 seeks: for each person, we should skip directly to the person + owned name.
     // 2 seeks: each of the 2 comparison check filters get the value of the Attribute repeatedly...
     //      TODO: if we embed the Value cache into the AttributeVertex, this could be avoided? Note: only expensive for un-inlined values!
     assert_eq!(storage_counters.get_raw_seek().unwrap(), 8);
-    // 2 advance: the iterator matching person 1 will advance twice (once to find the second name, then to fail)
-    assert_eq!(storage_counters.get_raw_advance().unwrap(), 2)
+    // 3 advance: the iterator matching person 1 will advance three times:
+    // - once to find the second name "longy-etc",
+    // - once to find "willow", which has the same prefix as the upper bound so we continue
+    // - once to find the next prefix (end of `name`s in this case)
+    // Note that it is impossible in this case to have a match past "willow" but we do not have the information that we may
+    // stop the search.
+    assert_eq!(storage_counters.get_raw_advance().unwrap(), 3)
 }
 
 #[test]
@@ -1269,7 +1284,8 @@ fn intersection_seeks() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) =
         position_mapping([var_age, var_age_type, var_person, var_gov_id], []);
@@ -1338,7 +1354,8 @@ fn intersection_seeks() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
 
     // expected evaluation
@@ -1455,7 +1472,8 @@ fn intersections_seeks_with_extra_values() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let type_annotations = get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager);
+    let type_annotations =
+        get_type_annotations(&mut translation_context, &entry, &snapshot, &type_manager, value_parameters.as_ref());
 
     let (row_vars, variable_positions, mapping, named_variables) =
         position_mapping([var_age, var_age_type, var_person, var_gov_id], []);
@@ -1528,7 +1546,8 @@ fn intersections_seeks_with_extra_values() {
 
     let stage_profiles = query_profile.stage_profiles().read().unwrap();
     let (_, match_profile) = stage_profiles.iter().next().unwrap();
-    let intersection_step_profile = match_profile.extend_or_get(1, || String::new());
+    let pattern_profile = match_profile.create_or_get_pattern(|| String::new());
+    let intersection_step_profile = pattern_profile.extend_or_get_step(1, || String::new());
     let storage_counters = intersection_step_profile.storage_counters();
 
     // expected evaluation

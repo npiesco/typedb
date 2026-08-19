@@ -14,10 +14,10 @@ async fn test_database() {
     // @typedb_behaviour is stored in a directory that is a sibling to
     // the working directory.
     #[cfg(feature = "bazel")]
-    let path = "../typedb_behaviour/connection/database.feature";
+    let path = "../typedb_behaviour+/connection/database.feature";
 
     #[cfg(not(feature = "bazel"))]
-    let path = "bazel-typedb/external/typedb_behaviour/connection/database.feature";
+    let path = "bazel-typedb/external/typedb_behaviour+/connection/database.feature";
 
     assert!(Context::test(path, true).await);
 }

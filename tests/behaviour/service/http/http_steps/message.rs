@@ -6,9 +6,9 @@
 use std::sync::Arc;
 
 use hyper::{
+    Body, Client, Method, Request, Uri,
     client::HttpConnector,
     header::{AUTHORIZATION, CONTENT_TYPE},
-    Body, Client, Method, Request, Uri,
 };
 use serde_json::json;
 use server::service::http::message::{
@@ -16,14 +16,15 @@ use server::service::http::message::{
     authentication::TokenResponse,
     database::{DatabaseResponse, DatabasesResponse},
     query::{
+        GivenRowsPayload, QueryAnswerResponse, QueryOptionsPayload,
         concept::{
             AttributeResponse, AttributeTypeResponse, EntityResponse, EntityTypeResponse, RelationResponse,
             RelationTypeResponse, RoleTypeResponse, ValueResponse,
         },
-        QueryAnswerResponse, QueryOptionsPayload,
     },
     transaction::{TransactionOptionsPayload, TransactionResponse},
     user::{UserResponse, UsersResponse},
+    version::ServerVersionResponse,
 };
 use url::form_urlencoded;
 
@@ -132,6 +133,12 @@ pub async fn authenticate(
     });
     let response =
         send_request(http_client, None::<&str>, Method::POST, &url, Some(json_body.to_string().as_str())).await?;
+    Ok(serde_json::from_str(&response).expect("Expected a json body"))
+}
+
+pub async fn version(http_client: &Client<HttpConnector>) -> Result<ServerVersionResponse, HttpBehaviourTestError> {
+    let url = format!("{}/version", Context::default_versioned_endpoint());
+    let response = send_request(http_client, None::<&str>, Method::GET, &url, None).await?;
     Ok(serde_json::from_str(&response).expect("Expected a json body"))
 }
 
@@ -321,6 +328,7 @@ pub async fn transactions_query(
     auth_token: Option<impl AsRef<str>>,
     transaction_id: &str,
     query_options: &Option<QueryOptionsPayload>,
+    given_rows_payload: Option<GivenRowsPayload>,
     query: &str,
 ) -> Result<QueryAnswerResponse, HttpBehaviourTestError> {
     let url = format!("{}/transactions/{}/query", Context::default_versioned_endpoint(), transaction_id);
@@ -328,6 +336,9 @@ pub async fn transactions_query(
     json_map.insert("query".to_string(), json!(query));
     if let Some(query_options) = query_options {
         json_map.insert("queryOptions".to_string(), json!(query_options));
+    }
+    if let Some(given_rows_payload) = given_rows_payload {
+        json_map.insert("givenRows".to_string(), json!(given_rows_payload));
     }
     let response =
         send_request(http_client, auth_token, Method::POST, &url, Some(json!(json_map).to_string().as_str())).await?;
@@ -472,7 +483,7 @@ impl ConceptResponse {
         match self {
             ConceptResponse::Attribute(attribute) => Some(&attribute.value),
             ConceptResponse::Value(value) => Some(&value.value),
-            other => None,
+            _ => None,
         }
     }
 
@@ -481,7 +492,7 @@ impl ConceptResponse {
             // TODO: Maybe add attributes
             ConceptResponse::Entity(entity) => Some(&entity.iid),
             ConceptResponse::Relation(relation) => Some(&relation.iid),
-            other => None,
+            _ => None,
         }
     }
 }

@@ -6,44 +6,62 @@
 
 use std::{collections::HashMap, fmt::Write, iter, str::FromStr, sync::Arc};
 
-use answer::{variable_value::VariableValue, Thing};
+use answer::{Thing, variable_value::VariableValue};
 use compiler::VariablePosition;
 use concept::{
     error::ConceptReadError,
-    thing::{attribute::Attribute, object::ObjectAPI},
+    thing::{ThingAPI, attribute::Attribute, entity::Entity, object::ObjectAPI, relation::Relation},
     type_::TypeAPI,
 };
 use cucumber::gherkin::Step;
-use encoding::value::{label::Label, value_type::ValueType, ValueEncodable};
+use encoding::{
+    Prefixed,
+    graph::{
+        thing::{
+            ThingVertex,
+            vertex_attribute::{AttributeID, AttributeVertex},
+            vertex_object::{ObjectID, ObjectVertex},
+        },
+        type_::vertex::TypeID,
+    },
+    layout::prefix::Prefix,
+    value::{ValueEncodable, label::Label, value_type::ValueType},
+};
 use executor::{
+    ExecutionInterrupt,
     batch::Batch,
     pipeline::stage::{ExecutionContext, StageIterator},
-    ExecutionInterrupt,
 };
+use futures::StreamExt;
 use itertools::{Either, Itertools};
 use lending_iterator::LendingIterator;
 use macro_rules_attribute::apply;
-use query::{analyse::AnalysedQuery, error::QueryError};
+use query::{
+    analyse::AnalysedQuery,
+    error::QueryError,
+    given_rows::{GivenRowEntry, GivenRowsSimple},
+};
 use resource::profile::StorageCounters;
 use server::service::http::message::analyze::{
     annotations::bdd::{
         encode_fetch_annotations_as_functor, encode_function_annotations_as_functor,
-        encode_pipeline_annotations_as_functor,
+        encode_pipeline_annotations_as_functor, encode_pipeline_given_annotations_as_functor,
     },
     encode_analyzed_query,
-    structure::bdd::{encode_function_structure_as_functor, encode_pipeline_structure_as_functor},
+    structure::bdd::{
+        encode_function_structure_as_functor, encode_pipeline_given_as_functor, encode_pipeline_structure_as_functor,
+    },
 };
 use test_utils::assert_matches;
 
 use crate::{
-    generic_step,
-    query_answer_context::{with_rows_answer, QueryAnswer},
+    BehaviourTestExecutionError, Context, generic_step,
+    query_answer_context::{QueryAnswer, with_rows_answer},
     transaction_context::{
-        with_read_tx, with_schema_tx, with_write_tx_deconstructed,
         ActiveTransaction::{Read, Schema},
+        with_read_tx, with_schema_tx, with_write_tx_deconstructed,
     },
     util::{iter_table_map, list_contains_json, parse_json},
-    BehaviourTestExecutionError, Context,
 };
 
 fn row_batch_result_to_answer(
@@ -71,15 +89,18 @@ fn row_answers_to_string(rows: &[HashMap<String, VariableValue<'static>>]) -> St
 fn execute_read_query(
     context: &Context,
     query: typeql::Query,
+    given_rows: Option<GivenRowsSimple>,
     source_query: &str,
 ) -> Result<QueryAnswer, Box<QueryError>> {
     with_read_tx!(context, |tx| {
+        let parsed_pipeline = query.into_structure().into_pipeline();
         let pipeline = tx.query_manager.prepare_read_pipeline(
             tx.snapshot.clone(),
             &tx.type_manager,
             tx.thing_manager.clone(),
-            &tx.function_manager,
-            &query.into_structure().into_pipeline(),
+            tx.function_manager.clone(),
+            &parsed_pipeline,
+            given_rows,
             source_query,
         )?;
         if pipeline.has_fetch() {
@@ -121,9 +142,10 @@ fn execute_read_query(
 fn execute_write_query(
     context: &mut Context,
     query: typeql::Query,
+    given_rows: Option<GivenRowsSimple>,
     source_query: &str,
 ) -> Result<QueryAnswer, BehaviourTestExecutionError> {
-    if matches!(context.active_transaction.as_ref().unwrap(), Read(_)) {
+    if matches!(context.transaction().expect("Expected an active transaction"), Read(_)) {
         return Err(BehaviourTestExecutionError::UseInvalidTransactionAsWrite);
     }
 
@@ -134,12 +156,14 @@ fn execute_write_query(
                                            query_manager,
                                            _db,
                                            _opts| {
+        let parsed_pipeline = query.into_structure().into_pipeline();
         let pipeline_result = query_manager.prepare_write_pipeline(
             Arc::try_unwrap(snapshot).unwrap_or_else(|_| panic!("Expected unique ownership of snapshot")),
             &type_manager,
             thing_manager.clone(),
-            &function_manager,
-            &query.into_structure().into_pipeline(),
+            function_manager.clone(),
+            &parsed_pipeline,
+            given_rows,
             source_query,
         );
 
@@ -207,17 +231,35 @@ fn execute_analyze(
     source_query: &str,
 ) -> Result<AnalysedQuery, BehaviourTestExecutionError> {
     with_read_tx!(context, |tx| {
+        let parsed_pipeline = query.into_structure().into_pipeline();
         tx.query_manager
             .analyse(
                 tx.snapshot.clone(),
                 &tx.type_manager,
-                tx.thing_manager.clone(),
                 &tx.function_manager,
-                &query.into_structure().into_pipeline(),
+                &tx.thing_manager,
+                &parsed_pipeline,
                 source_query,
             )
             .map_err(|source| BehaviourTestExecutionError::Query(*source))
     })
+}
+
+fn may_take_given_rows(context: &mut Context, with_given: params::WithGiven) -> Option<GivenRowsSimple> {
+    (with_given == params::WithGiven::True).then(|| context.take_given_rows().expect("Expected given rows available"))
+}
+
+#[cucumber::given("set query given rows")]
+#[cucumber::when("set query given rows")]
+async fn set_query_given_rows(context: &mut Context, step: &Step) {
+    let table = step.table.as_ref().expect("Expected table for given rows");
+    let length = table.rows.len();
+    let width = table.rows.first().unwrap().len() as u32;
+    // First row is the variables
+    let variables = table.rows[0].iter().map(|s| s.split(":").next().unwrap().to_owned()).collect();
+    let rows = table.rows[1..].iter().map(|row| row.iter().map(parse_query_given_row_entry).collect()).collect();
+
+    context.given_rows = Some(GivenRowsSimple { variables, rows })
 }
 
 #[apply(generic_step)]
@@ -230,7 +272,7 @@ async fn typeql_schema_query(context: &mut Context, may_error: params::TypeQLMay
     }
     let typeql_schema = parse_result.unwrap().into_structure().into_schema();
 
-    if !matches!(context.active_transaction.as_ref().expect("Expected an active tx"), Schema(_)) {
+    if !matches!(context.transaction().expect("Expected an active transaction"), Schema(_)) {
         may_error.check_logic::<(), BehaviourTestExecutionError>(Err(
             BehaviourTestExecutionError::UseInvalidTransactionAsSchema,
         ));
@@ -243,7 +285,7 @@ async fn typeql_schema_query(context: &mut Context, may_error: params::TypeQLMay
             &tx.type_manager,
             &tx.thing_manager,
             &tx.function_manager,
-            typeql_schema,
+            &typeql_schema,
             query,
         );
         if let Either::Right(_err) = may_error.check_logic(result) {
@@ -253,55 +295,68 @@ async fn typeql_schema_query(context: &mut Context, may_error: params::TypeQLMay
 }
 
 #[apply(generic_step)]
-#[step(expr = "typeql write query{typeql_may_error}")]
-async fn typeql_write_query(context: &mut Context, may_error: params::TypeQLMayError, step: &Step) {
+#[step(expr = "typeql write query{with_given}{typeql_may_error}")]
+async fn typeql_write_query(
+    context: &mut Context,
+    with_given: params::WithGiven,
+    may_error: params::TypeQLMayError,
+    step: &Step,
+) {
     let query_str = step.docstring.as_ref().unwrap().as_str();
     let parse_result = typeql::parse_query(query_str);
     if let Either::Right(_) = may_error.check_parsing(parse_result.as_ref()) {
         return;
     }
     let query = parse_result.unwrap();
-
-    let result = execute_write_query(context, query, query_str);
+    let given_rows = may_take_given_rows(context, with_given);
+    let result = execute_write_query(context, query, given_rows, query_str);
     if let Either::Right(_) = may_error.check_logic(result) {
         context.close_active_transaction();
     }
 }
 
 #[apply(generic_step)]
-#[step(expr = "get answers of typeql write query")]
-async fn get_answers_of_typeql_write_query(context: &mut Context, step: &Step) {
+#[step(expr = "get answers of typeql write query{with_given}")]
+async fn get_answers_of_typeql_write_query(context: &mut Context, with_given: params::WithGiven, step: &Step) {
     let query_str = step.docstring.as_ref().unwrap().as_str();
     let query = typeql::parse_query(query_str).unwrap();
-    let result = execute_write_query(context, query, query_str);
+    let given_rows = may_take_given_rows(context, with_given);
+    let result = execute_write_query(context, query, given_rows, query_str);
     context.query_answer = Some(result.unwrap());
 }
 
 #[apply(generic_step)]
-#[step(expr = "typeql read query{typeql_may_error}")]
-async fn typeql_read_query(context: &mut Context, may_error: params::TypeQLMayError, step: &Step) {
+#[step(expr = "typeql read query{with_given}{typeql_may_error}")]
+async fn typeql_read_query(
+    context: &mut Context,
+    with_given: params::WithGiven,
+    may_error: params::TypeQLMayError,
+    step: &Step,
+) {
     let query_str = step.docstring.as_ref().unwrap().as_str();
     let parse_result = typeql::parse_query(query_str);
     if let Either::Right(_) = may_error.check_parsing(parse_result.as_ref()) {
         return;
     }
     let query = parse_result.unwrap();
-    let result = execute_read_query(context, query, query_str);
+    let given_rows = may_take_given_rows(context, with_given);
+    let result = execute_read_query(context, query, given_rows, query_str);
     may_error.check_logic(result); // we don't close read transactions with logical errors
 }
 
-fn record_answers_of_typeql_read_query(context: &mut Context, query_str: &str) {
+fn record_answers_of_typeql_read_query(context: &mut Context, query_str: &str, given_rows: Option<GivenRowsSimple>) {
     let query = typeql::parse_query(query_str).unwrap();
-    context.query_answer = match execute_read_query(context, query, query_str) {
+    context.query_answer = match execute_read_query(context, query, given_rows, query_str) {
         Ok(answers) => Some(answers),
         Err(error) => panic!("Unexpected get answers error: {:?}", error),
     }
 }
 
 #[apply(generic_step)]
-#[step("get answers of typeql read query")]
-async fn get_answers_of_typeql_read_query(context: &mut Context, step: &Step) {
-    record_answers_of_typeql_read_query(context, step.docstring.as_ref().unwrap().as_str());
+#[step(expr = "get answers of typeql read query{with_given}")]
+async fn get_answers_of_typeql_read_query(context: &mut Context, with_given: params::WithGiven, step: &Step) {
+    let given_rows = may_take_given_rows(context, with_given);
+    record_answers_of_typeql_read_query(context, step.docstring.as_ref().unwrap().as_str(), given_rows);
 }
 
 #[cucumber::when("get answers of templated typeql read query")]
@@ -310,7 +365,7 @@ async fn get_answers_of_templated_typeql_read_query(context: &mut Context, step:
     let rows = context.query_answer.as_ref().unwrap().as_rows();
     let [answer] = rows else { panic!("Expected single answer, found {}", rows.len()) };
     let templated_query = step.docstring.as_ref().unwrap().as_str();
-    record_answers_of_typeql_read_query(context, &apply_query_template(templated_query, answer));
+    record_answers_of_typeql_read_query(context, &apply_query_template(templated_query, answer), None);
 }
 
 #[apply(generic_step)]
@@ -320,8 +375,12 @@ async fn uniquely_identify_answer_concepts(context: &mut Context, step: &Step) {
     with_rows_answer!(context, |query_answer| {
         let num_answers = query_answer.len();
         if num_specs != num_answers {
-            panic!("expected the number of identifier entries to match the number of answers, found {} expected entries and {} real answers. Real answers: \n{}",
-            num_specs, num_answers, row_answers_to_string(query_answer))
+            panic!(
+                "expected the number of identifier entries to match the number of answers, found {} expected entries and {} real answers. Real answers: \n{}",
+                num_specs,
+                num_answers,
+                row_answers_to_string(query_answer)
+            )
         }
         for row in iter_table_map(step) {
             let mut num_matches = 0;
@@ -441,12 +500,8 @@ fn does_attribute_match(id: &str, var_value: &VariableValue<'_>, context: &Conte
     })
 }
 
-fn does_value_match(id: &str, var_value: &VariableValue<'_>, _context: &Context) -> bool {
-    let VariableValue::Value(value) = var_value else {
-        return false;
-    };
-    let (id_type, id_value) = id.split_once(":").unwrap();
-    let expected_value_type = match id_type {
+fn parse_value_type(value_type_string: &str) -> ValueType {
+    match value_type_string {
         "boolean" => ValueType::Boolean,
         "integer" => ValueType::Integer,
         "double" => ValueType::Double,
@@ -457,7 +512,15 @@ fn does_value_match(id: &str, var_value: &VariableValue<'_>, _context: &Context)
         "duration" => ValueType::Duration,
         "string" => ValueType::String,
         _ => todo!("TypeQL test value type is not covered"),
+    }
+}
+
+fn does_value_match(id: &str, var_value: &VariableValue<'_>, _context: &Context) -> bool {
+    let VariableValue::Value(value) = var_value else {
+        return false;
     };
+    let (id_type, id_value) = id.split_once(":").unwrap();
+    let expected_value_type = parse_value_type(id_type);
     let expected = params::Value::from_str(id_value).unwrap().into_typedb(expected_value_type);
     if expected.value_type() == ValueType::Double {
         let precision = id_value.split_once(".").map(|(_, decimal)| decimal.len()).unwrap_or(5) as i32;
@@ -536,7 +599,7 @@ async fn each_answer_satisfies(context: &mut Context, step: &Step) {
     for answer in context.query_answer.as_ref().unwrap().as_rows() {
         let query_string = apply_query_template(templated_query, answer);
         let query = typeql::parse_query(&query_string).unwrap();
-        let answer_size = match execute_read_query(context, query, &query_string) {
+        let answer_size = match execute_read_query(context, query, None, &query_string) {
             Ok(answers) => answers.len(),
             Err(error) => panic!("Unexpected get answers error: {:?}", error),
         };
@@ -575,13 +638,15 @@ async fn verify_answer_set(context: &mut Context, step: &Step) {
     }
     let query_str = step.docstring.as_ref().unwrap().as_str();
     let query = typeql::parse_query(query_str).unwrap();
-    let verify_answers = execute_read_query(context, query, query_str).unwrap();
+    let verify_answers = execute_read_query(context, query, None, query_str).unwrap();
     match (&context.query_answer.as_ref().unwrap(), verify_answers) {
         (QueryAnswer::ConceptRows(actual), QueryAnswer::ConceptRows(expected)) => {
             assert_eq!(
-                expected.len(), actual.len(),
+                expected.len(),
+                actual.len(),
                 "expected the number of identifier entries to match the number of answers, found {} entries and {} answers",
-                expected.len(), actual.len()
+                expected.len(),
+                actual.len()
             );
             assert!(expected.iter().all(|answer| actual.contains(answer)));
         }
@@ -624,6 +689,15 @@ async fn typeql_analyze_may_error(context: &mut Context, may_error: params::Type
     may_error.check_logic(result);
 }
 
+#[cucumber::then("analyzed query given structure is:")]
+async fn analyzed_query_given_is(context: &mut Context, step: &Step) {
+    let expected_functor = step.docstring().unwrap();
+    let analyzed = context.analyzed.as_ref().unwrap();
+    let actual_functor = encode_pipeline_given_as_functor(&analyzed.query, &analyzed.given.as_ref().unwrap());
+
+    assert_eq!(normalize_functor_for_compare(&actual_functor), normalize_functor_for_compare(&expected_functor));
+}
+
 #[cucumber::then("analyzed query pipeline structure is:")]
 async fn analyzed_query_pipeline_is(context: &mut Context, step: &Step) {
     let expected_functor = step.docstring().unwrap();
@@ -650,6 +724,16 @@ async fn analyzed_query_preamble_contains(context: &mut Context, step: &Step) {
         expected_functor,
         preamble_functors.iter().join("\n\t")
     );
+}
+
+#[cucumber::then("analyzed query given annotations are:")]
+async fn analyzed_query_given_annotations_is(context: &mut Context, step: &Step) {
+    let expected_functor = step.docstring().unwrap();
+    let analyzed = context.analyzed.as_ref().unwrap();
+    let actual_functor =
+        encode_pipeline_given_annotations_as_functor(&analyzed.query, analyzed.given.as_ref().unwrap());
+
+    assert_eq!(normalize_functor_for_compare(&actual_functor), normalize_functor_for_compare(expected_functor));
 }
 
 #[cucumber::then("analyzed query pipeline annotations are:")]
@@ -693,4 +777,52 @@ fn normalize_functor_for_compare(functor: &str) -> String {
     let mut normalized = functor.to_lowercase();
     normalized.retain(|c| !c.is_whitespace());
     normalized
+}
+
+fn parse_query_given_row_entry(entry: &String) -> GivenRowEntry {
+    fn hex_to_u64(hex: &str) -> u64 {
+        u64::from_str_radix(hex, 16).expect("Bad hex in iid: {hex}")
+    }
+
+    let mut parts = entry.split(":");
+    match parts.next().unwrap() {
+        "none" => GivenRowEntry::None,
+        "value" => {
+            let value_type_str = parts.next().expect("value:<value-type>:<value>");
+            let value_str = parts.collect::<Vec<&str>>().join(":");
+            let expected_value_type = parse_value_type(value_type_str);
+            let value = params::Value::from_str(&value_str).unwrap().into_typedb(expected_value_type);
+            GivenRowEntry::Value(value)
+        }
+        "iid" => {
+            let expected = "Expected iid:<kind>:<typeid-hex>:<instanceid-hex>";
+            let kind = parts.next().unwrap();
+            let type_id = TypeID::new(hex_to_u64(parts.next().expect(expected)) as u16);
+
+            let thing = match kind {
+                "entity" => {
+                    let instance_id = hex_to_u64(parts.next().expect(expected));
+                    Entity::new(ObjectVertex::build_entity(type_id, ObjectID::new(instance_id))).into()
+                }
+                "relation" => {
+                    let instance_id = hex_to_u64(parts.next().expect(expected));
+                    Relation::new(ObjectVertex::build_entity(type_id, ObjectID::new(instance_id))).into()
+                }
+                "attr" => {
+                    debug_assert!(false, "Untested code. Remove this assert and try your luck");
+                    let hex = parts.next().expect(expected);
+                    let hex = hex.replace("_", "");
+                    let bytes = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    Attribute::new(AttributeVertex::new(type_id, AttributeID::new(&bytes))).into()
+                }
+                other => panic!("Invalid kind: {other}"),
+            };
+            GivenRowEntry::Thing(thing)
+        }
+        other => panic!("Invalid entry type: {other}"),
+    }
 }

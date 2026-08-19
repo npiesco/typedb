@@ -7,53 +7,32 @@
 use lending_iterator::LendingIterator;
 
 use crate::{
-    batch::{FixedBatch, FixedBatchRowIterator},
-    pipeline::{
-        stage::{ExecutionContext, StageAPI},
-        PipelineExecutionError, StageIterator,
-    },
+    batch::{Batch, BatchRowIterator},
+    pipeline::{PipelineExecutionError, StageIterator, stage::StageAPI},
     row::MaybeOwnedRow,
-    ExecutionInterrupt,
 };
 
-pub struct InitialStage<Snapshot> {
-    context: ExecutionContext<Snapshot>,
-    initial_batch: FixedBatch,
+pub struct InitialStage {
+    initial_batch: Batch,
 }
 
-impl<Snapshot> InitialStage<Snapshot> {
-    pub fn new_empty(context: ExecutionContext<Snapshot>) -> Self {
-        Self { context, initial_batch: FixedBatch::SINGLE_EMPTY_ROW }
+impl InitialStage {
+    pub fn new(initial_batch: Batch) -> Self {
+        Self { initial_batch }
     }
 
-    pub fn new_with(context: ExecutionContext<Snapshot>, initial_row: MaybeOwnedRow<'_>) -> Self {
-        let batch = FixedBatch::from(initial_row);
-        Self { context, initial_batch: batch }
-    }
-}
-
-impl<Snapshot> StageAPI<Snapshot> for InitialStage<Snapshot> {
-    type OutputIterator = InitialIterator;
-
-    fn into_iterator(
-        self,
-        _interrupt: ExecutionInterrupt,
-    ) -> Result<
-        (Self::OutputIterator, ExecutionContext<Snapshot>),
-        (Box<PipelineExecutionError>, ExecutionContext<Snapshot>),
-    > {
-        Ok((InitialIterator::new(self.initial_batch), self.context))
+    pub(crate) fn into_iterator(self) -> InitialIterator {
+        InitialIterator::new(self.initial_batch)
     }
 }
 
 pub struct InitialIterator {
-    iterator: Box<FixedBatchRowIterator>,
-    index: u32,
+    iterator: Box<BatchRowIterator>,
 }
 
 impl InitialIterator {
-    fn new(batch: FixedBatch) -> Self {
-        Self { iterator: Box::new(FixedBatchRowIterator::new(Ok(batch))), index: 0 }
+    pub(crate) fn new(batch: Batch) -> Self {
+        Self { iterator: Box::new(batch.into_iterator()) }
     }
 }
 
@@ -61,9 +40,7 @@ impl LendingIterator for InitialIterator {
     type Item<'a> = Result<MaybeOwnedRow<'a>, Box<PipelineExecutionError>>;
 
     fn next(&mut self) -> Option<Self::Item<'_>> {
-        self.iterator.next().map(|result| {
-            result.map_err(|err| Box::new(PipelineExecutionError::ReadPatternExecution { typedb_source: err.clone() }))
-        })
+        self.iterator.next().map(|row| Ok(row))
     }
 }
 

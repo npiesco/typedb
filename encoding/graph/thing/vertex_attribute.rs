@@ -6,25 +6,27 @@
 
 use std::{fmt, marker::PhantomData, ops::Range, sync::Arc};
 
-use bytes::{byte_array::ByteArray, util::HexBytesFormatter, Bytes};
+use bytes::{Bytes, byte_array::ByteArray, util::HexBytesFormatter};
 use error::unimplemented_feature;
 use primitive::either::Either;
 use resource::constants::snapshot::BUFFER_KEY_INLINE;
 use storage::{
     key_value::{StorageKey, StorageKeyReference},
     keyspace::{KeyspaceId, KeyspaceSet},
-    snapshot::{iterator::SnapshotIteratorError, ReadableSnapshot},
+    snapshot::{ReadableSnapshot, iterator::SnapshotIteratorError},
 };
 
 use crate::{
+    AsBytes, EncodingKeyspace, Keyable, Prefixed,
     graph::{
-        common::value_hasher::HashedID,
-        thing::{ThingVertex, THING_VERTEX_LENGTH_PREFIX_TYPE},
-        type_::vertex::TypeID,
         Typed,
+        common::value_hasher::HashedID,
+        thing::{THING_VERTEX_LENGTH_PREFIX_TYPE, ThingVertex},
+        type_::vertex::TypeID,
     },
     layout::prefix::{Prefix, PrefixID},
     value::{
+        ValueEncodable,
         boolean_bytes::BooleanBytes,
         date_bytes::DateBytes,
         date_time_bytes::DateTimeBytes,
@@ -37,9 +39,7 @@ use crate::{
         struct_bytes::StructBytes,
         value::Value,
         value_type::{ValueType, ValueTypeBytes, ValueTypeCategory},
-        ValueEncodable,
     },
-    AsBytes, EncodingKeyspace, Keyable, Prefixed,
 };
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Ord, PartialOrd)]
@@ -111,12 +111,12 @@ impl AttributeVertex {
         self.attribute_id
     }
 
-    pub(crate) fn is_category_short_encoding(value_type_category: ValueTypeCategory) -> bool {
-        AttributeID::value_type_encoded_value_length(value_type_category).is_short()
+    pub(crate) fn category_encoding_length(value_type_category: ValueTypeCategory) -> ValueEncodingLength {
+        AttributeID::value_type_encoded_value_length(value_type_category)
     }
 
-    pub(crate) fn is_short_encoding(&self) -> bool {
-        Self::is_category_short_encoding(self.value_type_category())
+    pub(crate) fn encoding_length(&self) -> ValueEncodingLength {
+        Self::category_encoding_length(self.value_type_category())
     }
 
     fn range_of_attribute_id(&self) -> Range<usize> {
@@ -131,20 +131,42 @@ impl AttributeVertex {
         PrefixID::LENGTH + TypeID::LENGTH + self.attribute_id.length()
     }
 
-    pub fn keyspace_for_is_short(is_short_encoding: bool) -> EncodingKeyspace {
-        if is_short_encoding {
-            EncodingKeyspace::DefaultOptimisedPrefix11
+    pub fn prefix_key_short() -> StorageKey<'static, { PrefixID::LENGTH }> {
+        StorageKey::new(
+            AttributeVertex::keyspace_for_short_encoding(),
+            Bytes::copy(&Prefix::VertexAttribute.prefix_id().to_bytes()),
+        )
+    }
+
+    pub fn prefix_key_long() -> StorageKey<'static, { PrefixID::LENGTH }> {
+        StorageKey::new(
+            AttributeVertex::keyspace_for_long_encoding(),
+            Bytes::copy(&Prefix::VertexAttribute.prefix_id().to_bytes()),
+        )
+    }
+
+    fn keyspace_for_encoding_length(encoding_length: ValueEncodingLength) -> EncodingKeyspace {
+        if encoding_length.is_short() {
+            Self::keyspace_for_short_encoding()
         } else {
-            EncodingKeyspace::OptimisedPrefix17
+            Self::keyspace_for_long_encoding()
         }
     }
 
+    pub fn keyspace_for_short_encoding() -> EncodingKeyspace {
+        EncodingKeyspace::DefaultOptimisedPrefix11
+    }
+
+    pub fn keyspace_for_long_encoding() -> EncodingKeyspace {
+        EncodingKeyspace::OptimisedPrefix17
+    }
+
     pub fn keyspace_for_category(value_type_category: ValueTypeCategory) -> EncodingKeyspace {
-        Self::keyspace_for_is_short(AttributeID::value_type_encoded_value_length(value_type_category).is_short())
+        Self::keyspace_for_encoding_length(AttributeID::value_type_encoded_value_length(value_type_category))
     }
 
     pub(crate) fn keyspace(&self) -> EncodingKeyspace {
-        Self::keyspace_for_is_short(self.is_short_encoding())
+        Self::keyspace_for_encoding_length(self.encoding_length())
     }
 
     pub(crate) fn is_valid_keyspace(keyspace_id: KeyspaceId) -> bool {
@@ -209,7 +231,7 @@ impl ValueEncodingLength {
         }
     }
 
-    const fn is_short(&self) -> bool {
+    pub(crate) const fn is_short(&self) -> bool {
         matches!(self, Self::Short)
     }
 
@@ -284,10 +306,9 @@ impl AttributeID {
             ValueTypeCategory::DateTime => (DateTimeAttributeID::write(value.encode_date_time(), bytes), true),
             ValueTypeCategory::DateTimeTZ => (DateTimeTZAttributeID::write(value.encode_date_time_tz(), bytes), true),
             ValueTypeCategory::Duration => (DurationAttributeID::write(value.encode_duration(), bytes), true),
-            ValueTypeCategory::String => (
-                StringAttributeID::write_deterministic_prefix(value.encode_string::<64>(), large_value_hasher, bytes),
-                false,
-            ),
+            ValueTypeCategory::String => {
+                (StringAttributeID::write_deterministic_prefix(value.encode_string::<64>(), bytes), false)
+            }
             ValueTypeCategory::Struct => (
                 StructAttributeID::write_hashed_id_deterministic_prefix(
                     value.encode_struct::<64>(),
@@ -330,6 +351,45 @@ impl AttributeID {
             AttributeID::Duration(duration_id) => duration_id.bytes_ref(),
             AttributeID::String(string_id) => string_id.bytes_ref(),
             AttributeID::Struct(struct_id) => struct_id.bytes_ref(),
+        }
+    }
+
+    pub fn deterministic_bytes(&self) -> &[u8] {
+        match self {
+            AttributeID::Boolean(boolean_id) => {
+                debug_assert!(BooleanAttributeID::is_inlineable());
+                boolean_id.bytes_ref()
+            }
+            AttributeID::Integer(integer_id) => {
+                debug_assert!(IntegerAttributeID::is_inlineable());
+                integer_id.bytes_ref()
+            }
+            AttributeID::Double(double_id) => {
+                debug_assert!(DoubleAttributeID::is_inlineable());
+                double_id.bytes_ref()
+            }
+            AttributeID::Decimal(decimal_id) => {
+                debug_assert!(DecimalAttributeID::is_inlineable());
+                decimal_id.bytes_ref()
+            }
+            AttributeID::Date(date_id) => {
+                debug_assert!(DateAttributeID::is_inlineable());
+                date_id.bytes_ref()
+            }
+            AttributeID::DateTime(date_time_id) => {
+                debug_assert!(DateTimeAttributeID::is_inlineable());
+                date_time_id.bytes_ref()
+            }
+            AttributeID::DateTimeTZ(date_time_tz_id) => {
+                debug_assert!(DateTimeTZAttributeID::is_inlineable());
+                date_time_tz_id.bytes_ref()
+            }
+            AttributeID::Duration(duration_id) => {
+                debug_assert!(DurationAttributeID::is_inlineable());
+                duration_id.bytes_ref()
+            }
+            AttributeID::String(string_id) => string_id.deterministic_bytes_ref(),
+            AttributeID::Struct(struct_id) => struct_id.deterministic_bytes_ref(),
         }
     }
 
@@ -575,7 +635,7 @@ impl StringAttributeID {
     const VALUE_LENGTH_ID: ValueEncodingLength = ValueEncodingLength::Long;
     const LENGTH: usize = Self::VALUE_TYPE_LENGTH + Self::VALUE_LENGTH_ID.length();
 
-    const INLINE_OR_PREFIXED_HASH_LENGTH: usize = Self::VALUE_LENGTH_ID.length() - 1;
+    pub const INLINE_OR_PREFIXED_HASH_LENGTH: usize = Self::VALUE_LENGTH_ID.length() - 1;
 
     pub const HASHED_PREFIX_LENGTH: usize = Self::INLINE_OR_PREFIXED_HASH_LENGTH - Self::HASHED_HASH_LENGTH;
     pub const HASHED_HASH_LENGTH: usize = 8;
@@ -586,14 +646,9 @@ impl StringAttributeID {
         Self::HASHED_PREFIX_RANGE.end..Self::HASHED_PREFIX_RANGE.end + Self::HASHED_HASH_LENGTH;
     pub const HASHED_DISAMBIGUATED_HASH_RANGE: Range<usize> =
         Self::HASHED_HASH_RANGE.start..Self::HASHED_HASH_RANGE.end + 1;
-    // const HASHED_PREFIX_HASH_RANGE: Range<usize> =
-    //     Self::VALUE_TYPE_LENGTH..Self::VALUE_TYPE_LENGTH + Self::HASHED_ENCODING_LENGTH;
 
     const TAIL_IS_HASH_MASK: u8 = 0b1000_0000;
     const TAIL_INDEX: usize = Self::LENGTH - 1;
-
-    // pub const HASHED_ID_STRING_PREFIX_LENGTH: usize =
-    //     { StringAttributeID::INLINE_OR_PREFIXED_HASH_LENGTH - StringAttributeID::HASH_LENGTH };
 
     pub fn new(bytes: [u8; Self::LENGTH]) -> Self {
         Self { bytes }
@@ -711,20 +766,14 @@ impl StringAttributeID {
     // write the deterministic prefix of the hash ID, and return the length of the prefix written
     pub(crate) fn write_deterministic_prefix<const INLINE_LENGTH: usize>(
         string: StringBytes<INLINE_LENGTH>,
-        hasher: &impl Fn(&[u8]) -> u64,
         bytes: &mut [u8],
     ) -> usize {
         debug_assert!(bytes.len() >= Self::LENGTH);
-        if Self::is_inlineable(string.as_reference()) {
-            let bytes_range = &mut bytes[0..Self::LENGTH];
-            Self::write_inline_id(bytes_range.try_into().unwrap(), string);
-            Self::LENGTH
-        } else {
-            bytes[0..Self::VALUE_TYPE_LENGTH].copy_from_slice(&ValueTypeCategory::String.to_bytes());
-            bytes[Self::HASHED_PREFIX_RANGE].copy_from_slice(&string.bytes()[0..{ Self::HASHED_PREFIX_LENGTH }]);
-            let hash_length = Self::write_hash(&mut bytes[Self::HASHED_HASH_RANGE], hasher, string.bytes());
-            Self::VALUE_TYPE_LENGTH + Self::HASHED_PREFIX_LENGTH + hash_length
-        }
+        bytes[0..Self::VALUE_TYPE_LENGTH].copy_from_slice(&ValueTypeCategory::String.to_bytes());
+        bytes[Self::HASHED_PREFIX_RANGE].fill(0);
+        let prefix_len = usize::min(Self::HASHED_PREFIX_LENGTH, string.len());
+        bytes[Self::HASHED_PREFIX_RANGE.start..][..prefix_len].copy_from_slice(&string.bytes()[..prefix_len]);
+        Self::VALUE_TYPE_LENGTH + Self::HASHED_PREFIX_LENGTH
     }
 
     ///
@@ -733,7 +782,7 @@ impl StringAttributeID {
     fn set_tail_inline_length(bytes: &mut [u8; Self::LENGTH], length: u8) {
         debug_assert!(bytes.len() == Self::LENGTH);
         assert_eq!(0, length & Self::TAIL_IS_HASH_MASK); // ie < 128, high bit not set
-                                                         // because the high bit is not set, we already conform to the required mask of high bit = 0
+        // because the high bit is not set, we already conform to the required mask of high bit = 0
         bytes[Self::TAIL_INDEX] = length;
     }
 
@@ -780,6 +829,10 @@ impl StringAttributeID {
     pub fn bytes_ref(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub fn deterministic_bytes_ref(&self) -> &[u8] {
+        if self.is_inline() { self.bytes_ref() } else { &self.bytes_ref()[0..Self::HASHED_HASH_RANGE.end] }
+    }
 }
 
 impl HashedID<{ StringAttributeID::HASHED_HASH_LENGTH + 1 }> for StringAttributeID {
@@ -799,14 +852,6 @@ impl StructAttributeID {
 
     pub fn new(bytes: [u8; Self::LENGTH]) -> Self {
         Self { bytes }
-    }
-
-    pub fn bytes(&self) -> [u8; Self::LENGTH] {
-        self.bytes
-    }
-
-    pub fn bytes_ref(&self) -> &[u8] {
-        &self.bytes
     }
 
     pub(crate) fn build_hashed_id<const INLINE_LENGTH: usize, Snapshot>(
@@ -898,6 +943,18 @@ impl StructAttributeID {
 
     pub(crate) const fn is_inlineable() -> bool {
         false
+    }
+
+    pub fn bytes(&self) -> [u8; Self::LENGTH] {
+        self.bytes
+    }
+
+    pub fn bytes_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn deterministic_bytes_ref(&self) -> &[u8] {
+        &self.bytes[0..Self::TAIL_INDEX]
     }
 }
 

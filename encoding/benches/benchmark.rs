@@ -8,18 +8,20 @@
 
 use std::sync::Arc;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
+use diagnostics::metrics::FsyncMetrics;
 use durability::wal::WAL;
 use encoding::{
+    EncodingKeyspace, Keyable,
     graph::{
         thing::{vertex_generator::ThingVertexGenerator, vertex_object::ObjectVertex},
         type_::vertex::TypeID,
     },
-    EncodingKeyspace, Keyable,
 };
 use resource::constants::snapshot::BUFFER_KEY_INLINE;
-use storage::{durability_client::WALClient, key_value::StorageKey, snapshot::WriteSnapshot, MVCCStorage};
-use test_utils::{create_tmp_dir, init_logging};
+use storage::{MVCCStorage, durability_client::WALClient, key_value::StorageKey, snapshot::WriteSnapshot};
+use test_utils::{create_tmp_storage_dir, init_logging};
+use test_utils_storage::create_rocks_resources;
 
 fn vertex_generation<D>(
     thing_vertex_generator: Arc<ThingVertexGenerator>,
@@ -39,10 +41,12 @@ fn vertex_generation_to_key<D>(
 
 fn criterion_benchmark(c: &mut Criterion) {
     init_logging();
-    let storage_path = create_tmp_dir();
-    let wal = WAL::create(&storage_path).unwrap();
+    let storage_path = create_tmp_storage_dir();
+    let wal = WAL::create(&storage_path, FsyncMetrics::disabled()).unwrap();
+    let resources = create_rocks_resources();
     let storage = Arc::new(
-        MVCCStorage::<WALClient>::create::<EncodingKeyspace>("storage", &storage_path, WALClient::new(wal)).unwrap(),
+        MVCCStorage::<WALClient>::create::<EncodingKeyspace>("storage", &storage_path, WALClient::new(wal), &resources)
+            .unwrap(),
     );
 
     let type_id = TypeID::new(0);

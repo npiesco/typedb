@@ -9,22 +9,23 @@ use std::collections::{HashMap, HashSet};
 use answer::variable::Variable;
 use encoding::graph::type_::Kind;
 use ir::{
-    pattern::{constraint::Constraint, nested_pattern::NestedPattern, Vertex},
-    pipeline::{block::Block, VariableRegistry},
+    pattern::{Vertex, constraint::Constraint, nested_pattern::NestedPattern},
+    pipeline::{VariableRegistry, block::Block},
 };
 use typeql::common::Span;
 
 use crate::{
+    VariablePosition,
     annotation::type_annotations::BlockAnnotations,
     executable::{
+        WriteCompilationError,
         delete::instructions::{ConnectionInstruction, Has, Links, ThingInstruction},
         insert::{
-            executable::{get_thing_position, resolve_links_roles},
             ThingPosition,
+            executable::{get_thing_position, resolve_links_roles},
         },
-        next_executable_id, WriteCompilationError,
+        next_executable_id,
     },
-    VariablePosition,
 };
 
 #[derive(Debug)]
@@ -54,6 +55,18 @@ pub fn compile(
         &mut connection_instructions,
     )?;
 
+    let unsafely_used_optional_variable = block
+        .conjunction()
+        .constraints()
+        .iter()
+        .flat_map(|constraint| constraint.ids())
+        .find(|var| variable_registry.is_variable_optional(*var));
+
+    if let Some(var) = unsafely_used_optional_variable {
+        let variable = variable_registry.get_variable_name_or_unnamed(var).to_owned();
+        return Err(Box::new(WriteCompilationError::OptionalVariableUsedOutsideTry { source_span, variable }));
+    }
+
     let mut optional_deletes = Vec::with_capacity(block.conjunction().nested_patterns().len());
     for nested_pattern in block.conjunction().nested_patterns() {
         let NestedPattern::Optional(optional) = nested_pattern else {
@@ -66,29 +79,23 @@ pub fn compile(
     for &variable in deleted_concepts {
         let Some(input_position) = input_variables.get(&variable) else {
             return Err(Box::new(WriteCompilationError::DeletedThingWasNotInInput {
-                variable: variable_registry
-                    .variable_names()
-                    .get(&variable)
-                    .cloned()
-                    .unwrap_or_else(|| VariableRegistry::UNNAMED_VARIABLE_DISPLAY_NAME.to_string()),
+                variable: variable_registry.get_variable_name_or_unnamed(variable).to_owned(),
                 source_span,
             }));
         };
-        assert!(block_annotations
-            .type_annotations()
-            .values()
-            .any(|type_annotations| type_annotations.vertex_annotations_of(&Vertex::Variable(variable)).is_some()));
+        assert!(
+            block_annotations
+                .type_annotations()
+                .values()
+                .any(|type_annotations| type_annotations.vertex_annotations_of(&Vertex::Variable(variable)).is_some())
+        );
         if block_annotations.type_annotations().values().any(|type_annotations| {
             type_annotations
                 .vertex_annotations_of(&Vertex::Variable(variable))
                 .is_some_and(|anno| anno.iter().any(|type_| type_.kind() == Kind::Role))
         }) {
             return Err(Box::new(WriteCompilationError::DeleteIllegalRoleVariable {
-                variable: variable_registry
-                    .variable_names()
-                    .get(&variable)
-                    .cloned()
-                    .unwrap_or_else(|| VariableRegistry::UNNAMED_VARIABLE_DISPLAY_NAME.to_string()),
+                variable: variable_registry.get_variable_name_or_unnamed(variable).to_owned(),
                 source_span,
             }));
         } else {

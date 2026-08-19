@@ -6,14 +6,14 @@
 
 use std::ops::Range;
 
-use bytes::{byte_array::ByteArray, Bytes};
+use bytes::{Bytes, byte_array::ByteArray};
 use resource::constants::snapshot::BUFFER_KEY_INLINE;
 use storage::key_value::StorageKey;
 
 use crate::{
+    AsBytes, EncodingKeyspace, Keyable, Prefixed,
     graph::type_::vertex::{TypeVertex, TypeVertexEncoding},
     layout::prefix::{Prefix, PrefixID},
-    AsBytes, EncodingKeyspace, Keyable, Prefixed,
 };
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
@@ -38,7 +38,8 @@ impl TypeEdge {
 
     pub fn decode(bytes: Bytes<'_, BUFFER_KEY_INLINE>) -> Self {
         debug_assert_eq!(bytes.length(), Self::LENGTH);
-        let prefix = Prefix::from_prefix_id(PrefixID::new(bytes[Self::INDEX_PREFIX]));
+        let prefix =
+            Prefix::from_prefix_id(PrefixID::new(bytes[Self::INDEX_PREFIX])).expect("Unrecognized prefix byte");
         let from = TypeVertex::decode(bytes.clone().into_range(Self::range_from()));
         let to = TypeVertex::decode(bytes.clone().into_range(Self::range_to()));
         Self { prefix, from, to }

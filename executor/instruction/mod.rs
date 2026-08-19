@@ -7,10 +7,10 @@
 use std::fmt;
 
 use ::iterator::minmax_or;
-use answer::{variable_value::VariableValue, Type};
+use answer::{Type, variable_value::VariableValue};
 use compiler::{
-    executable::match_::instructions::{ConstraintInstruction, VariableMode, VariableModes},
     ExecutorVariable,
+    executable::match_::instructions::{ConstraintInstruction, VariableMode, VariableModes},
 };
 use concept::{error::ConceptReadError, thing::thing_manager::ThingManager};
 use ir::pattern::Vertex;
@@ -34,15 +34,15 @@ use crate::{
 };
 
 pub(crate) mod checker;
-mod has_executor;
-mod has_reverse_executor;
+pub(crate) mod has_executor;
+pub(crate) mod has_reverse_executor;
 mod iid_executor;
 mod indexed_relation_executor;
 mod is_executor;
 mod isa_executor;
 mod isa_reverse_executor;
 pub(crate) mod iterator;
-mod links_executor;
+pub(crate) mod links_executor;
 mod links_reverse_executor;
 mod owns_executor;
 mod owns_reverse_executor;

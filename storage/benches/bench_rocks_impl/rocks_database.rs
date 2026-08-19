@@ -8,7 +8,7 @@ use non_transactional_rocks::NonTransactionalRocks;
 use rocksdb::{Options, WriteOptions};
 use storage::StorageOpenError;
 
-use crate::{bench_rocks_impl::rocks_database::typedb_database::TypeDBDatabase, CLIArgs};
+use crate::{CLIArgs, bench_rocks_impl::rocks_database::typedb_database::TypeDBDatabase};
 
 fn database_options(args: &CLIArgs) -> Options {
     let mut opts = Options::default();
@@ -41,8 +41,8 @@ pub fn create_typedb<const N_DATABASES: usize>() -> Result<TypeDBDatabase<N_DATA
 mod non_transactional_rocks {
     use std::iter::zip;
 
-    use rocksdb::{Options, WriteBatch, WriteOptions, DB};
-    use test_utils::{create_tmp_dir, TempDir};
+    use rocksdb::{DB, Options, WriteBatch, WriteOptions};
+    use test_utils::{TempDir, create_tmp_storage_dir};
 
     use crate::{RocksDatabase, RocksWriteBatch};
 
@@ -54,7 +54,7 @@ mod non_transactional_rocks {
 
     impl<const N_DATABASES: usize> NonTransactionalRocks<N_DATABASES> {
         pub(super) fn setup(options: Options, write_options: WriteOptions) -> Result<Self, rocksdb::Error> {
-            let path = create_tmp_dir();
+            let path = create_tmp_storage_dir();
             let databases = std::array::from_fn(|i| DB::open(&options, path.join(format!("db_{i}"))).unwrap());
 
             Ok(Self { _path: path, databases, write_options })
@@ -93,18 +93,20 @@ mod typedb_database {
     use std::sync::Arc;
 
     use bytes::byte_array::ByteArray;
+    use diagnostics::metrics::FsyncMetrics;
     use durability::wal::WAL;
     use resource::profile::CommitProfile;
     use storage::{
+        MVCCStorage, StorageOpenError,
         durability_client::WALClient,
         key_value::StorageKeyArray,
         keyspace::{KeyspaceId, KeyspaceSet},
         snapshot::{CommittableSnapshot, SnapshotError, WritableSnapshot, WriteSnapshot},
-        MVCCStorage, StorageOpenError,
     };
-    use test_utils::{create_tmp_dir, TempDir};
+    use test_utils::{TempDir, create_tmp_storage_dir};
+    use test_utils_storage::create_rocks_resources;
 
-    use crate::{RocksDatabase, RocksWriteBatch, KEY_SIZE};
+    use crate::{KEY_SIZE, RocksDatabase, RocksWriteBatch};
 
     pub struct TypeDBDatabase<const N_DATABASES: usize> {
         storage: Arc<MVCCStorage<WALClient>>,
@@ -114,10 +116,15 @@ mod typedb_database {
     impl<const N_DATABASES: usize> TypeDBDatabase<N_DATABASES> {
         pub(super) fn setup() -> Result<Self, StorageOpenError> {
             let name = "bench_rocks__typedb";
-            let path = create_tmp_dir();
-            let wal = WAL::create(&path).unwrap();
-            let storage =
-                Arc::new(MVCCStorage::<WALClient>::create::<BenchKeySpace>(name, &path, WALClient::new(wal))?);
+            let path = create_tmp_storage_dir();
+            let wal = WAL::create(&path, FsyncMetrics::disabled()).unwrap();
+            let resources = create_rocks_resources();
+            let storage = Arc::new(MVCCStorage::<WALClient>::create::<BenchKeySpace>(
+                name,
+                &path,
+                WALClient::new(wal),
+                &resources,
+            )?);
             Ok(Self { path, storage })
         }
     }

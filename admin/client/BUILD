@@ -1,0 +1,49 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@typedb_dependencies//tool/checkstyle:rules.bzl", "checkstyle_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "client",
+    crate_name = "typedb_admin",
+    srcs = glob(["**/*.rs"]),
+    crate_root = "lib.rs",
+    tags = [
+        "crate-name=typedb-admin",
+    ],
+    deps = [
+        "//common/error",
+        "//resource",
+        "//server/service/admin/proto:server_admin_proto",
+        "@crates//:home",
+        "@crates//:rustyline",
+        "@crates//:rpassword",
+        "@crates//:hyper-util",
+        "@crates//:tokio",
+        "@crates//:tonic",
+        "@crates//:tonic-types",
+        "@crates//:tower",
+        "@typeql//rust:typeql",
+    ],
+)
+
+rust_test(
+    name = "test_crate_client",
+    crate = ":client",
+    deps = [
+        "//util/test:test_utils",
+    ],
+)
+
+checkstyle_test(
+    name = "checkstyle",
+    include = glob(["**/*"]),
+    exclude = glob([
+        "Cargo.*",
+    ]),
+    license_type = "mpl-header",
+)

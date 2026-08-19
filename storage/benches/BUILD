@@ -17,8 +17,10 @@ rust_test(
         "//common/bytes",
         "//common/logger",
         "//common/primitive",
+        "//diagnostics",
         "//resource",
         "//storage",
+        "//storage/tests:test_utils_storage",
         "//durability",
         "//util/test:test_utils",
 
@@ -50,9 +52,11 @@ rust_test(
 
         "//common/bytes",
         "//database:database",
+        "//diagnostics",
         "//durability",
         "//resource",
         "//storage:storage",
+        "//storage/tests:test_utils_storage",
         "//util/test:test_utils",
     ],
     tags = ["manual"],  # in order for bazel test //... to not fail

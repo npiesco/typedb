@@ -11,13 +11,16 @@ use concept::{
     error::{ConceptReadError, ConceptWriteError},
     thing::thing_manager::ThingManager,
     type_::{
-        annotation::{Annotation, AnnotationError},
+        Capability, KindAPI, Ordering, OwnerAPI, PlayerAPI, TypeAPI,
+        annotation::{Annotation, AnnotationError, HasAnnotationCategory},
         attribute_type::AttributeType,
+        entity_type::EntityType,
         owns::Owns,
         plays::Plays,
         relates::Relates,
+        relation_type::RelationType,
+        sub::Sub,
         type_manager::TypeManager,
-        Capability, KindAPI, Ordering, OwnerAPI, PlayerAPI, TypeAPI,
     },
 };
 use encoding::{
@@ -25,34 +28,34 @@ use encoding::{
     value::{label::Label, value_type::ValueType},
 };
 use error::typedb_error;
-use function::{function_manager::FunctionManager, FunctionError};
-use ir::{pipeline::VariableRegistry, translation::tokens::translate_annotation, LiteralParseError};
+use function::{FunctionError, function_manager::FunctionManager};
+use ir::{LiteralParseError, pipeline::VariableRegistry, translation::tokens::translate_annotation};
 use resource::profile::StorageCounters;
 use storage::snapshot::{ReadableSnapshot, WritableSnapshot};
 use typeql::{
-    common::{error::TypeQLError, Span, Spanned},
+    Definable, TypeRef, TypeRefAny,
+    common::{Span, Spanned, error::TypeQLError},
     query::schema::Define,
     schema::definable::{
-        struct_::Field,
-        type_::{capability::Relates as TypeQLRelates, Capability as TypeQLCapability, CapabilityBase},
         Struct, Type,
+        struct_::Field,
+        type_::{Capability as TypeQLCapability, CapabilityBase, capability::Relates as TypeQLRelates},
     },
     token,
     token::Keyword,
-    Definable, TypeRef, TypeRefAny,
 };
 
 use crate::{
     definable_resolution::{
-        filter_variants, get_struct_field_value_type_optionality, resolve_attribute_type, resolve_relates,
-        resolve_relates_declared, resolve_role_type, resolve_struct_definition_key, resolve_typeql_type,
-        resolve_value_type, try_resolve_typeql_type, type_ref_to_label_and_ordering, type_to_object_type,
-        SymbolResolutionError,
+        SymbolResolutionError, filter_variants, get_struct_field_value_type_optionality, resolve_attribute_type,
+        resolve_relates, resolve_relates_declared, resolve_role_type, resolve_struct_definition_key,
+        resolve_typeql_type, resolve_value_type, try_resolve_typeql_type, type_ref_to_label_and_ordering,
+        type_to_object_type,
     },
     definable_status::{
-        get_capability_annotation_status, get_owns_status, get_plays_status, get_relates_status,
-        get_struct_field_status, get_struct_status, get_sub_status, get_type_annotation_status, get_value_type_status,
-        DefinableStatus, DefinableStatusMode,
+        DefinableStatus, DefinableStatusMode, get_capability_annotation_status, get_owns_status, get_plays_status,
+        get_relates_status, get_struct_field_status, get_struct_status, get_sub_status, get_type_annotation_status,
+        get_value_type_status,
     },
 };
 
@@ -81,7 +84,7 @@ pub(crate) fn execute(
     type_manager: &TypeManager,
     thing_manager: &ThingManager,
     function_manager: &FunctionManager,
-    define: Define,
+    define: &Define,
     storage_counters: StorageCounters,
 ) -> Result<(), DefineError> {
     process_struct_definitions(snapshot, type_manager, &define.definables)?;
@@ -143,7 +146,7 @@ fn process_function_definitions(
     if functions.clone().next().is_some() {
         function_manager
             .define_functions(snapshot, functions)
-            .map_err(|typedb_source| DefineError::FunctionDefinition { typedb_source })?;
+            .map_err(|err| DefineError::FunctionDefinition { typedb_source: *err })?;
     }
     Ok(())
 }
@@ -364,7 +367,7 @@ fn define_type_annotations(
                     if converted.is_value_type_annotation() {
                         return Err(DefineError::IllegalAnnotation {
                             source_span: typeql_annotation.span(),
-                            typedb_source: AnnotationError::UnsupportedAnnotationForAttributeType {
+                            typedb_source: AnnotationError::UnsupportedAttributeTypeAnnotation {
                                 category: annotation.category(),
                             },
                         });
@@ -401,11 +404,7 @@ fn define_alias(
 }
 
 fn define_alias_annotations(typeql_capability: &TypeQLCapability) -> Result<(), DefineError> {
-    verify_empty_annotations_for_capability!(
-        typeql_capability,
-        AnnotationError::UnsupportedAnnotationForAlias,
-        category
-    )
+    verify_empty_annotations_for_capability!(typeql_capability, AnnotationError::UnsupportedAliasAnnotation, category)
 }
 
 fn define_sub(
@@ -427,33 +426,63 @@ fn define_sub(
         let supertype = resolve_typeql_type(snapshot, type_manager, &supertype_label)
             .map_err(|typedb_source| DefineError::SymbolResolution { typedb_source })?;
 
-        match (&type_, supertype) {
+        match (type_, supertype) {
             (TypeEnum::Entity(type_), TypeEnum::Entity(supertype)) => {
                 let need_define =
-                    check_can_and_need_define_sub(snapshot, type_manager, &label, *type_, supertype, capability)?;
+                    check_can_and_need_define_sub(snapshot, type_manager, &label, type_, supertype, capability)?;
                 if need_define {
                     type_.set_supertype(snapshot, type_manager, thing_manager, supertype).map_err(|source| {
                         DefineError::SetSupertype { source_span: sub.span(), typedb_source: source }
                     })?;
                 }
+
+                define_sub_entity_type_annotations(
+                    snapshot,
+                    type_manager,
+                    thing_manager,
+                    &label,
+                    type_,
+                    supertype,
+                    capability,
+                )?;
             }
             (TypeEnum::Relation(type_), TypeEnum::Relation(supertype)) => {
                 let need_define =
-                    check_can_and_need_define_sub(snapshot, type_manager, &label, *type_, supertype, capability)?;
+                    check_can_and_need_define_sub(snapshot, type_manager, &label, type_, supertype, capability)?;
                 if need_define {
                     type_.set_supertype(snapshot, type_manager, thing_manager, supertype).map_err(|source| {
                         DefineError::SetSupertype { source_span: sub.span(), typedb_source: source }
                     })?;
                 }
+
+                define_sub_relation_type_annotations(
+                    snapshot,
+                    type_manager,
+                    thing_manager,
+                    &label,
+                    type_,
+                    supertype,
+                    capability,
+                )?;
             }
             (TypeEnum::Attribute(type_), TypeEnum::Attribute(supertype)) => {
                 let need_define =
-                    check_can_and_need_define_sub(snapshot, type_manager, &label, *type_, supertype, capability)?;
+                    check_can_and_need_define_sub(snapshot, type_manager, &label, type_, supertype, capability)?;
                 if need_define {
                     type_.set_supertype(snapshot, type_manager, thing_manager, supertype).map_err(|source| {
                         DefineError::SetSupertype { source_span: sub.span(), typedb_source: source }
                     })?;
                 }
+
+                define_sub_attribute_type_annotations(
+                    snapshot,
+                    type_manager,
+                    thing_manager,
+                    &label,
+                    type_,
+                    supertype,
+                    capability,
+                )?;
             }
             (TypeEnum::RoleType(_), TypeEnum::RoleType(_)) => {
                 unreachable!("RoleType's sub is controlled by specialise")
@@ -465,17 +494,110 @@ fn define_sub(
                     capability,
                     type_.kind(),
                     supertype.kind(),
-                ))
+                ));
             }
         }
-
-        define_sub_annotations(capability)?;
     }
     Ok(())
 }
 
-fn define_sub_annotations(typeql_capability: &TypeQLCapability) -> Result<(), DefineError> {
-    verify_empty_annotations_for_capability!(typeql_capability, AnnotationError::UnsupportedAnnotationForSub, category)
+fn define_sub_entity_type_annotations(
+    snapshot: &mut impl WritableSnapshot,
+    type_manager: &TypeManager,
+    thing_manager: &ThingManager,
+    subtype_label: &Label,
+    subtype: EntityType,
+    supertype: EntityType,
+    typeql_capability: &TypeQLCapability,
+) -> Result<(), DefineError> {
+    for typeql_annotation in &typeql_capability.annotations {
+        let annotation = translate_annotation(typeql_annotation)
+            .map_err(|typedb_source| DefineError::LiteralParseError { typedb_source })?;
+        let sub = Sub::<EntityType>::new(subtype, supertype);
+        if let Some(converted) = capability_convert_and_validate_annotation_definition_need(
+            snapshot,
+            type_manager,
+            sub,
+            annotation.clone(),
+            typeql_annotation,
+            typeql_capability,
+        )? {
+            sub.set_annotation(snapshot, type_manager, thing_manager, converted).map_err(|source| {
+                DefineError::SetAnnotation {
+                    type_: subtype_label.clone(),
+                    typedb_source: source,
+                    source_span: typeql_annotation.span(),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn define_sub_relation_type_annotations(
+    snapshot: &mut impl WritableSnapshot,
+    type_manager: &TypeManager,
+    thing_manager: &ThingManager,
+    subtype_label: &Label,
+    subtype: RelationType,
+    supertype: RelationType,
+    typeql_capability: &TypeQLCapability,
+) -> Result<(), DefineError> {
+    for typeql_annotation in &typeql_capability.annotations {
+        let annotation = translate_annotation(typeql_annotation)
+            .map_err(|typedb_source| DefineError::LiteralParseError { typedb_source })?;
+        let sub = Sub::<RelationType>::new(subtype, supertype);
+        if let Some(converted) = capability_convert_and_validate_annotation_definition_need(
+            snapshot,
+            type_manager,
+            sub,
+            annotation.clone(),
+            typeql_annotation,
+            typeql_capability,
+        )? {
+            sub.set_annotation(snapshot, type_manager, thing_manager, converted).map_err(|source| {
+                DefineError::SetAnnotation {
+                    type_: subtype_label.clone(),
+                    typedb_source: source,
+                    source_span: typeql_annotation.span(),
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn define_sub_attribute_type_annotations(
+    snapshot: &mut impl WritableSnapshot,
+    type_manager: &TypeManager,
+    thing_manager: &ThingManager,
+    subtype_label: &Label,
+    subtype: AttributeType,
+    supertype: AttributeType,
+    typeql_capability: &TypeQLCapability,
+) -> Result<(), DefineError> {
+    for typeql_annotation in &typeql_capability.annotations {
+        let annotation = translate_annotation(typeql_annotation)
+            .map_err(|typedb_source| DefineError::LiteralParseError { typedb_source })?;
+        let sub = Sub::<AttributeType>::new(subtype, supertype);
+        if let Some(converted) = capability_convert_and_validate_annotation_definition_need(
+            snapshot,
+            type_manager,
+            sub,
+            annotation.clone(),
+            typeql_annotation,
+            typeql_capability,
+        )? {
+            sub.set_annotation(snapshot, type_manager, thing_manager, converted).map_err(|source| {
+                DefineError::SetAnnotation {
+                    type_: subtype_label.clone(),
+                    typedb_source: source,
+                    source_span: typeql_annotation.span(),
+                }
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn define_value_type(
@@ -570,9 +692,7 @@ fn define_value_type_annotations(
             if !converted.is_value_type_annotation() {
                 return Err(DefineError::IllegalAnnotation {
                     source_span: typeql_annotation.span(),
-                    typedb_source: AnnotationError::UnsupportedAnnotationForValueType {
-                        category: annotation.category(),
-                    },
+                    typedb_source: AnnotationError::UnsupportedValueTypeAnnotation { category: annotation.category() },
                 });
             }
             attribute_type
@@ -741,13 +861,13 @@ fn define_relates_specialise(
                     return Err(DefineError::UnexpectedSpecialiseScopedLabel {
                         label: format!("{}", scoped),
                         source_span: scoped.span(),
-                    })
+                    });
                 }
                 TypeRef::Variable(variable) => {
                     return Err(DefineError::UnexpectedSpecialiseVariable {
                         variable: variable.name().unwrap_or(VariableRegistry::UNNAMED_VARIABLE_DISPLAY_NAME).to_owned(),
                         source_span: variable.span(),
-                    })
+                    });
                 }
             },
             TypeRefAny::List(list) => match &list.inner {
@@ -756,13 +876,13 @@ fn define_relates_specialise(
                     return Err(DefineError::UnexpectedSpecialiseScopedLabel {
                         label: format!("{}", scoped),
                         source_span: scoped.span(),
-                    })
+                    });
                 }
                 TypeRef::Variable(variable) => {
                     return Err(DefineError::UnexpectedSpecialiseVariable {
                         variable: variable.name().unwrap_or(VariableRegistry::UNNAMED_VARIABLE_DISPLAY_NAME).to_owned(),
                         source_span: variable.span(),
-                    })
+                    });
                 }
             },
         };
@@ -1034,7 +1154,7 @@ fn type_convert_and_validate_annotation_definition_need<T: KindAPI>(
     })?;
 
     let definition_status =
-        get_type_annotation_status(snapshot, type_manager, type_, &converted, annotation.category())
+        get_type_annotation_status(snapshot, type_manager, type_, &converted, &annotation.category())
             .map_err(|source| DefineError::UnexpectedConceptRead { typedb_source: source })?;
     match definition_status {
         DefinableStatus::DoesNotExist => Ok(Some(converted)),

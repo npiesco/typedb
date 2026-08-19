@@ -8,26 +8,27 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use answer::variable::Variable;
 use bytes::byte_array::ByteArray;
+use concept::type_::annotation::{Annotation, AnnotationCategory};
 use encoding::{
     graph::thing::THING_VERTEX_MAX_LENGTH,
-    value::{value::Value, ValueEncodable},
+    value::{ValueEncodable, value::Value},
 };
 use error::typedb_error;
 use itertools::Itertools;
-use storage::snapshot::{iterator::SnapshotIteratorError, SnapshotGetError};
+use storage::snapshot::{SnapshotGetError, iterator::SnapshotIteratorError};
 use typeql::{
     common::Span,
     schema::definable::function::{ReturnStatement, Signature},
 };
 
 use crate::{
+    LiteralParseError, RepresentationError,
     pattern::{
+        BranchID, ParameterID, ValueType,
         constraint::Constraint,
         variable_category::{VariableCategory, VariableOptionality},
-        BranchID, ParameterID, ValueType,
     },
     pipeline::{function_signature::FunctionID, reduce::Reducer},
-    RepresentationError,
 };
 
 pub mod block;
@@ -46,9 +47,9 @@ typedb_error! {
     }
 }
 
-impl Into<FunctionReadError> for fmt::Error {
-    fn into(self) -> FunctionReadError {
-        FunctionReadError::FormatError { source: self }
+impl From<fmt::Error> for FunctionReadError {
+    fn from(source: fmt::Error) -> Self {
+        FunctionReadError::FormatError { source }
     }
 }
 
@@ -92,11 +93,13 @@ typedb_error! {
             "Functions may not contain write stages.",
             source_span: Option<Span>,
         ),
-        InconsistentReturn(
+        InconsistentReturnLengths(
             8,
-            "The return statement in the body of the function did not match that in the signature. \nSignature: {signature}\nDefinition: {return_}",
+            "The function declares it returns {declared_length} item(s), but the definition returns {actual_length}. \nSignature: {signature}\nDefinition: {return_}",
             signature: Signature,
-            return_: ReturnStatement
+            return_: ReturnStatement,
+            declared_length: usize,
+            actual_length: usize,
         ),
         IllegalKeywordAsIdentifier(
             9,
@@ -109,12 +112,47 @@ typedb_error! {
             "A non-anonymous variable is expected in this context.",
             source_span: Option<Span>,
         ),
-        UnimplementedFunctionOptionals(
-            255,
-            "Functions returning optionals are not yet implemented.",
-            source_span: Option<Span>,
-            feature: error::UnimplementedFeature
+        DeclaresStreamReturnsSingle(
+            11,
+            "The function declares it returns a stream but the implementation returns a single row.\nSignature: {signature}\nDefinition: {return_}",
+            signature: Signature,
+            return_: ReturnStatement,
         ),
+        DeclaresSingleReturnsStream(
+            12,
+            "The function declares it returns a single row but the implementation returns a stream.\nSignature: {signature}\nDefinition: {return_}",
+            signature: Signature,
+            return_: ReturnStatement,
+        ),
+        InconsistentReturnOptionality(
+            13,
+            "The optionality of the value returned by the function at index '{mismatch_index}' does not match that declared in the signature. \nSignature: {signature}\nDefinition: {return_}",
+            signature: Signature,
+            return_: ReturnStatement,
+            mismatch_index: usize,
+        ),
+        LiteralParseError(
+            14,
+            "Error parsing annotation '{annotation}' of function '{function}'.",
+            annotation: typeql::Annotation,
+            function: String,
+            source_span: Option<Span>,
+            typedb_source: LiteralParseError,
+        ),
+        AnnotationNotSupported(
+            15,
+            "Annotation '{annotation}' is not supported on functions.",
+            annotation: Annotation,
+            source_span: Option<Span>,
+        ),
+        DuplicateAnnotationCategory(
+            16,
+            "Annotation category '{category}' is specified multiple times in function '{function}'.",
+            category: AnnotationCategory,
+            function: String,
+            source_span: Option<Span>,
+        ),
+
     }
 }
 
@@ -169,6 +207,20 @@ impl VariableRegistry {
         Ok(variable)
     }
 
+    pub(crate) fn create_anonymous_variable_copying(
+        &mut self,
+        variable: Variable,
+    ) -> Result<Variable, Box<RepresentationError>> {
+        let new_var = self.register_anonymous_variable(None)?;
+        if let Some(category) = self.get_variable_category(variable) {
+            self.set_variable_category(new_var, category, VariableCategorySource::Variable(variable))?;
+        }
+        if let Some(optionality) = self.variable_optionality.get(&variable) {
+            self.set_variable_is_optional(new_var, *optionality == VariableOptionality::Optional);
+        }
+        Ok(new_var)
+    }
+
     fn allocate_variable(
         &mut self,
         anonymous: bool,
@@ -219,17 +271,30 @@ impl VariableRegistry {
             Some((existing_category, existing_source)) => {
                 let narrowest = existing_category.narrowest(category);
                 match narrowest {
-                    None => Err(Box::new(RepresentationError::VariableCategoryMismatch {
-                        variable_name: self
-                            .variable_names
-                            .get(&variable)
-                            .cloned()
-                            .unwrap_or_else(|| "$<INTERNAL>".to_owned()),
-                        category_1: category,
-                        // category_1_source: source,
-                        category_2: *existing_category,
-                        // category_2_source: existing_source.clone(),
-                    })),
+                    None => {
+                        if (category == VariableCategory::Attribute && *existing_category == VariableCategory::Value)
+                            || (category == VariableCategory::Value
+                                && *existing_category == VariableCategory::Attribute)
+                        {
+                            Err(Box::new(RepresentationError::VariableCategoryValueAttributeMismatch {
+                                variable_name: self
+                                    .variable_names
+                                    .get(&variable)
+                                    .cloned()
+                                    .unwrap_or_else(|| variable.to_string()),
+                            }))
+                        } else {
+                            Err(Box::new(RepresentationError::VariableCategoryMismatch {
+                                variable_name: self
+                                    .variable_names
+                                    .get(&variable)
+                                    .cloned()
+                                    .unwrap_or_else(|| variable.to_string()),
+                                category_1: category,
+                                category_2: *existing_category,
+                            }))
+                        }
+                    }
                     Some(narrowed) => {
                         if narrowed == *existing_category {
                             Ok(())
@@ -264,11 +329,7 @@ impl VariableRegistry {
         self.variable_categories.get(&variable).map(|(category, _constraint)| *category)
     }
 
-    pub fn get_variable_optionality(&self, variable: Variable) -> Option<VariableOptionality> {
-        self.variable_optionality.get(&variable).cloned()
-    }
-
-    pub(crate) fn is_variable_optional(&self, variable: Variable) -> bool {
+    pub fn is_variable_optional(&self, variable: Variable) -> bool {
         match self.variable_optionality.get(&variable).unwrap_or(&VariableOptionality::Required) {
             VariableOptionality::Required => false,
             VariableOptionality::Optional => true,
@@ -290,16 +351,17 @@ impl VariableRegistry {
         self.variable_source_spans.get(&variable).cloned()
     }
 
-    pub(crate) fn register_function_argument(
+    pub(crate) fn register_input_variable(
         &mut self,
         name: &str,
         category: VariableCategory,
+        optionality: VariableOptionality,
         source_span: Option<Span>,
     ) -> Result<Variable, Box<RepresentationError>> {
         let variable = self.register_variable_named(name.to_owned(), source_span)?;
-        self.set_variable_category(variable, category, VariableCategorySource::Argument)
+        self.set_variable_category(variable, category, VariableCategorySource::ArgumentOrGiven)
             .expect("Expected a newly created variable");
-        self.set_variable_is_optional(variable, false);
+        self.set_variable_is_optional(variable, optionality == VariableOptionality::Optional);
         Ok(variable)
     }
 
@@ -341,8 +403,9 @@ impl fmt::Display for VariableRegistry {
 pub enum VariableCategorySource {
     Constraint(Constraint<Variable>),
     Reduce(Reducer),
-    Argument,
+    ArgumentOrGiven,
     Delete,
+    Variable(Variable),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

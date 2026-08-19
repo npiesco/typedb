@@ -51,12 +51,35 @@ rust_test(
     deps = deps,
 )
 
+rust_test(
+    name = "test_pipeline_stages_limit",
+    crate_root = "pipeline_stages_limit.rs",
+    srcs = ["pipeline_stages_limit.rs"],
+    deps = deps,
+)
+
+rust_test(
+    name = "test_query_profile",
+    crate_root = "query_profile.rs",
+    srcs = ["query_profile.rs"],
+    deps = deps,
+)
+
+rust_test(
+    name = "test_query_cache",
+    crate_root = "query_cache.rs",
+    srcs = ["query_cache.rs"],
+    deps = deps,
+)
+
 rustfmt_test(
     name = "rustfmt_test",
     targets = [
         ":test_define",
         ":test_fetch",
         ":test_unimplemented",
+        ":test_pipeline_stages_limit",
+        ":test_query_profile",
     ],
     size = "small",
 )

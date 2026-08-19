@@ -10,12 +10,12 @@ use std::{
 };
 
 use typeql::{
+    TypeRef, TypeRefAny, Variable,
     schema::definable::function::{Output, Single, SingleSelector, Stream},
     type_::{NamedType, NamedTypeAny},
-    TypeRef, TypeRefAny, Variable,
 };
 
-use crate::{ordered_hash_combine, StructuralEquality};
+use crate::{StructuralEquality, ordered_hash_combine};
 
 impl StructuralEquality for Variable {
     fn hash(&self) -> u64 {

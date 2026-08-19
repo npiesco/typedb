@@ -3,15 +3,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+use std::sync::Arc;
 
 use compiler::VariablePosition;
+use resource::profile::StepProfile;
 
 use crate::{
     batch::{FixedBatch, FixedBatchRowIterator},
     read::{
+        BranchIndex, ExecutorIndex,
         collecting_stage_executor::{CollectedStageIterator, CollectorEnum},
         stream_modifier::StreamModifierResultMapper,
-        BranchIndex, ExecutorIndex,
     },
     row::MaybeOwnedRow,
 };
@@ -103,6 +105,7 @@ pub(super) struct ExecuteTabledCall {
 pub(super) struct CollectingStage {
     pub(super) index: ExecutorIndex,
     pub(super) collector: CollectorEnum,
+    pub(super) profile: Arc<StepProfile>,
 }
 
 #[derive(Debug)]

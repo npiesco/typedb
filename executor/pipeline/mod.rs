@@ -9,16 +9,17 @@ use error::typedb_error;
 use lending_iterator::LendingIterator;
 
 use crate::{
+    InterruptType,
     batch::Batch,
     error::ReadExecutionError,
     pipeline::{fetch::FetchExecutionError, stage::StageIterator},
     row::MaybeOwnedRow,
     write::WriteError,
-    InterruptType,
 };
 
 pub mod delete;
 pub mod fetch;
+mod given;
 pub mod initial;
 pub mod insert;
 pub mod match_;
@@ -69,7 +70,7 @@ impl StageIterator for WrittenRowsIterator {
 typedb_error! {
     pub PipelineExecutionError(component = "Pipeline execution", prefix = "PEX") {
         // TODO: migrate to `typedb_error` once they are typedb errors
-        Interrupted(1, "Execution interrupted by to a concurrent {interrupt}.", interrupt: InterruptType),
+        Interrupted(1, "Execution interrupted by a concurrent {interrupt}.", interrupt: InterruptType),
         FetchUsedAsRows(2, "Cannot use a Fetch query to return ConceptRows"),
         RowsUsedAsFetch(3, "Cannot use query returning ConceptRows as a Fetch query."),
         ConceptRead(4, "Error reading concept.", typedb_source: Box<ConceptReadError>),
@@ -77,5 +78,23 @@ typedb_error! {
         WriteError(6, "Error executing write operation.", typedb_source: Box<WriteError>),
         ReadPatternExecution(7, "Error executing a read pattern.", typedb_source: ReadExecutionError),
         FetchError(8, "Error executing fetch operation.", typedb_source: FetchExecutionError),
+        GivenValueDidNotSatisfyDeclaredType(
+            9,
+            "The given value at row '{row_index}' and column '{column_index}' does not not satisfy the declared type",
+            row_index: usize,
+            column_index: usize,
+        ),
+        GivenValueDidNotSatisfyDeclaredOptionality(
+            10,
+            "The given value at row '{row_index}' and column '{column_index}' was None, but the variable was not declared optional.",
+            row_index: usize,
+            column_index: usize,
+        ),
+        GivenConceptDoesNotExist(
+            11,
+            "The given instance at row '{row_index}' and column '{column_index}' does not exist in the database",
+            row_index: usize,
+            column_index: usize,
+        ),
     }
 }

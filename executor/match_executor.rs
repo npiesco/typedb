@@ -10,11 +10,12 @@ use compiler::executable::{
     function::ExecutableFunctionRegistry, match_::planner::conjunction_executable::ConjunctionExecutable,
 };
 use concept::{error::ConceptReadError, thing::thing_manager::ThingManager};
-use lending_iterator::{adaptors::FlatMap, AsLendingIterator, LendingIterator};
+use lending_iterator::{AsLendingIterator, LendingIterator, adaptors::FlatMap};
 use resource::profile::QueryProfile;
 use storage::snapshot::ReadableSnapshot;
 
 use crate::{
+    ExecutionInterrupt,
     batch::{FixedBatch, FixedBatchRowIterator},
     error::ReadExecutionError,
     pipeline::stage::ExecutionContext,
@@ -22,7 +23,6 @@ use crate::{
         create_pattern_executor_for_conjunction, pattern_executor::PatternExecutor, tabled_functions::TabledFunctions,
     },
     row::MaybeOwnedRow,
-    ExecutionInterrupt,
 };
 
 pub struct MatchExecutor {
@@ -40,13 +40,14 @@ impl MatchExecutor {
         function_registry: Arc<ExecutableFunctionRegistry>,
         profile: &QueryProfile,
     ) -> Result<Self, Box<ConceptReadError>> {
+        let stage_profile = profile.profile_stage(|| String::from("Match"), conjunction_executable.executable_id());
         Ok(Self {
             entry: create_pattern_executor_for_conjunction(
                 snapshot,
                 thing_manager,
                 &function_registry,
                 conjunction_executable,
-                profile,
+                stage_profile,
             )?,
             tabled_functions: TabledFunctions::new(function_registry),
             input: Some(input.into_owned()),

@@ -16,13 +16,13 @@ use answer::variable::Variable;
 use encoding::value::{label::Label, value_type::ValueType};
 use ir::{
     pattern::{
-        conjunction::Conjunction, constraint::Constraint, nested_pattern::NestedPattern, BranchID, IrID, Pattern,
-        Scope, ScopeId,
+        BranchID, IrID, Pattern, Scope, ScopeId, conjunction::Conjunction, constraint::Constraint,
+        nested_pattern::NestedPattern,
     },
     pipeline::{
+        ParameterRegistry, VariableRegistry,
         modifier::SortVariable,
         reduce::{AssignedReduction, Reducer},
-        ParameterRegistry, VariableRegistry,
     },
 };
 use itertools::Itertools;
@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::annotation::{
     function::{AnnotatedFunction, AnnotatedFunctionReturn},
-    pipeline::{AnnotatedPipeline, AnnotatedStage},
+    pipeline::{AnnotatedGiven, AnnotatedPipeline, AnnotatedStage},
     type_annotations::{BlockAnnotations, TypeAnnotations},
 };
 
@@ -78,7 +78,7 @@ impl From<&AnnotatedFunctionReturn> for FunctionReturnStructure {
                 let reducers = instructions
                     .iter()
                     .map(|reducer| StructureReducer {
-                        reducer: reducer.unresolved().name(),
+                        reducer: reducer.unresolved().name().to_owned(),
                         arguments: reducer.id().iter().map(|var| var.into()).collect(),
                     })
                     .collect();
@@ -96,6 +96,7 @@ pub fn extract_query_structure_from(
 ) -> QueryStructure {
     let parametrised_pipeline = extract_pipeline_structure_from(
         variable_registry,
+        annotated_pipeline.annotated_given.as_ref(),
         annotated_pipeline.annotated_stages.as_slice(),
         source_query,
     );
@@ -111,7 +112,7 @@ pub fn extract_query_structure_from(
 
 pub fn extract_function_structure_from(function: &AnnotatedFunction, source_query: &str) -> FunctionStructure {
     let parametrised_pipeline =
-        extract_pipeline_structure_from(&function.variable_registry, function.stages.as_slice(), source_query);
+        extract_pipeline_structure_from(&function.variable_registry, None, function.stages.as_slice(), source_query);
     let body = Arc::new(parametrised_pipeline)
         .with_parameters(Arc::new(function.parameter_registry.clone()), function.variable_registry.variable_names());
     let arguments = function.arguments.iter().map_into().collect();
@@ -121,36 +122,31 @@ pub fn extract_function_structure_from(function: &AnnotatedFunction, source_quer
 
 pub fn extract_pipeline_structure_from(
     variable_registry: &VariableRegistry,
+    annotated_given: Option<&AnnotatedGiven>,
     annotated_stages: &[AnnotatedStage],
     source_query: &str,
 ) -> ParametrisedPipelineStructure {
     let branch_ids_allocated = variable_registry.branch_ids_allocated();
     let mut builder = ParametrisedQueryStructureBuilder::new(source_query, branch_ids_allocated);
-    annotated_stages.into_iter().enumerate().for_each(|(index, stage)| builder.add_stage(stage, StageIndex(index)));
+    builder.may_add_given(annotated_given);
+    annotated_stages.iter().enumerate().for_each(|(index, stage)| builder.add_stage(stage, StageIndex(index)));
     let output_variables = annotated_stages
         .iter()
         .rev()
         .filter_map(|stage| match stage {
-            AnnotatedStage::Match { block, .. } => Some(
-                block
-                    .conjunction()
-                    .variable_binding_modes()
-                    .iter()
-                    .filter_map(|(v, mode)| (!mode.is_locally_binding_in_child()).then_some(v.clone()))
-                    .collect::<Vec<_>>(),
-            ),
+            AnnotatedStage::Match { block, .. } => {
+                Some(block.conjunction().named_visible_referenced_variables().collect::<Vec<_>>())
+            }
             | AnnotatedStage::Insert { block, .. }
             | AnnotatedStage::Update { block, .. }
             | AnnotatedStage::Put { block, .. } => {
-                Some(block.conjunction().variable_binding_modes().keys().cloned().collect::<Vec<_>>())
+                Some(block.conjunction().named_visible_referenced_variables().collect::<Vec<_>>())
             }
             AnnotatedStage::Delete { block, deleted_variables, .. } => Some(
                 block
                     .conjunction()
-                    .variable_binding_modes()
-                    .keys()
+                    .named_visible_referenced_variables()
                     .filter(|v| !deleted_variables.contains(v))
-                    .cloned()
                     .collect::<Vec<_>>(),
             ),
             AnnotatedStage::Select(select) => Some(select.variables.iter().cloned().collect::<Vec<_>>()),
@@ -183,10 +179,12 @@ pub struct PipelineVariableAnnotationAndModifier {
 }
 
 pub type ConjunctionAnnotations = BTreeMap<StructureVariableId, PipelineVariableAnnotationAndModifier>;
+pub type GivenStructureAnnotations = BTreeMap<StructureVariableId, PipelineVariableAnnotationAndModifier>;
 pub type PipelineStructureAnnotations = Vec<ConjunctionAnnotations>;
 
 #[derive(Debug, Clone)]
 pub struct ParametrisedPipelineStructure {
+    pub given: Option<QueryStructureGiven>,
     pub stages: Vec<QueryStructureStage>,
     pub conjunctions: Vec<QueryStructureConjunction>,
     pub output_variables: Vec<StructureVariableId>,
@@ -214,7 +212,7 @@ impl ParametrisedPipelineStructure {
                 | QueryStructureStage::Put { block }
                 | QueryStructureStage::Update { block } => Some(block),
 
-                QueryStructureStage::Select { .. }
+                | QueryStructureStage::Select { .. }
                 | QueryStructureStage::Delete { .. } // Deleted edges are deleted.
                 | QueryStructureStage::Sort { .. }
                 | QueryStructureStage::Offset { .. }
@@ -228,8 +226,14 @@ impl ParametrisedPipelineStructure {
     }
 
     pub fn resolve_conjunction_id(&self, stage_index: StageIndex, scope_id: ScopeId) -> QueryStructureConjunctionID {
-        self.scope_to_conjunction_id.get(&(stage_index, scope_id)).unwrap().clone()
+        *self.scope_to_conjunction_id.get(&(stage_index, scope_id)).unwrap()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "tag")]
+pub struct QueryStructureGiven {
+    pub variables: Vec<StructureVariableId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,6 +318,7 @@ impl<'a> ParametrisedQueryStructureBuilder<'a> {
         Self {
             source_query,
             pipeline_structure: ParametrisedPipelineStructure {
+                given: None,
                 stages: Vec::new(),
                 conjunctions,
                 output_variables: Vec::new(),
@@ -322,6 +327,12 @@ impl<'a> ParametrisedQueryStructureBuilder<'a> {
                 scope_to_conjunction_id: HashMap::new(),
             },
         }
+    }
+
+    pub fn may_add_given(&mut self, given: Option<&AnnotatedGiven>) {
+        self.pipeline_structure.given = given.map(|given| QueryStructureGiven {
+            variables: given.variables.iter().map(StructureVariableId::from).collect(),
+        });
     }
 
     pub fn add_stage(&mut self, stage: &AnnotatedStage, stage_index: StageIndex) {
@@ -433,7 +444,7 @@ impl<'a> ParametrisedQueryStructureBuilder<'a> {
             self.pipeline_structure.conjunctions.push(QueryStructureConjunction { constraints, nested });
             QueryStructureConjunctionID(self.pipeline_structure.conjunctions.len() as u16 - 1)
         };
-        self.pipeline_structure.scope_to_conjunction_id.insert((stage_index, scope_id), conj_id.clone());
+        self.pipeline_structure.scope_to_conjunction_id.insert((stage_index, scope_id), conj_id);
         conj_id
     }
 
@@ -454,7 +465,7 @@ impl<'a> ParametrisedQueryStructureBuilder<'a> {
     fn extend_labels_from(&mut self, type_annotations: &TypeAnnotations) {
         self.pipeline_structure.resolved_labels.extend(type_annotations.vertex_annotations().iter().filter_map(
             |(vertex, type_)| match (vertex.as_label(), type_.iter().exactly_one()) {
-                (Some(label), Ok(type_)) => Some((label.clone(), type_.clone())),
+                (Some(label), Ok(&type_)) => Some((label.clone(), type_)),
                 _ => None,
             },
         ));
@@ -544,7 +555,7 @@ impl From<&AssignedReduction> for StructureReduceAssign {
             | Reducer::Min(var)
             | Reducer::Std(var) => vec![var.into()],
         };
-        let reducer = StructureReducer { reducer: value.reduction.name(), arguments };
+        let reducer = StructureReducer { reducer: value.reduction.name().to_owned(), arguments };
         StructureReduceAssign { assigned: value.assigned.into(), reducer }
     }
 }

@@ -7,10 +7,11 @@
 use std::collections::HashSet;
 
 use encoding::{
-    graph::type_::{edge::TypeEdgeEncoding, CapabilityKind},
+    graph::type_::{CapabilityKind, edge::TypeEdgeEncoding},
     layout::prefix::Prefix,
 };
 use lending_iterator::higher_order::Hkt;
+use macro_rules_attribute::derive;
 use primitive::maybe_owns::MaybeOwns;
 use resource::profile::StorageCounters;
 use storage::snapshot::{ReadableSnapshot, WritableSnapshot};
@@ -19,15 +20,16 @@ use crate::{
     error::{ConceptReadError, ConceptWriteError},
     thing::thing_manager::ThingManager,
     type_::{
+        Capability, Ordering,
         annotation::{
             Annotation, AnnotationAbstract, AnnotationCardinality, AnnotationCategory, AnnotationDistinct,
-            AnnotationError, DefaultFrom,
+            AnnotationDoc, AnnotationError, AnnotationMeta, FromAnnotation, HasAnnotationCategory,
+            HasAnnotationCategoryDerive,
         },
         constraint::CapabilityConstraint,
         relation_type::RelationType,
         role_type::RoleType,
         type_manager::TypeManager,
-        Capability, Ordering,
     },
 };
 
@@ -122,7 +124,9 @@ impl Relates {
             RelatesAnnotation::Cardinality(cardinality) => {
                 type_manager.set_relates_annotation_cardinality(snapshot, thing_manager, *self, cardinality)?
             }
-        };
+            RelatesAnnotation::Doc(doc) => type_manager.set_relates_annotation_doc(snapshot, *self, doc)?,
+            RelatesAnnotation::Meta(meta) => type_manager.set_relates_annotation_meta(snapshot, *self, meta)?,
+        }
         Ok(())
     }
 
@@ -133,13 +137,17 @@ impl Relates {
         thing_manager: &ThingManager,
         annotation_category: AnnotationCategory,
     ) -> Result<(), Box<ConceptWriteError>> {
-        let relates_annotation = RelatesAnnotation::try_getting_default(annotation_category)
+        let relates_annotation = RelatesAnnotationCategory::try_from(annotation_category)
             .map_err(|typedb_source| ConceptWriteError::Annotation { typedb_source })?;
         match relates_annotation {
-            RelatesAnnotation::Abstract(_) => type_manager.unset_relates_annotation_abstract(snapshot, *self)?,
-            RelatesAnnotation::Distinct(_) => type_manager.unset_relates_annotation_distinct(snapshot, *self)?,
-            RelatesAnnotation::Cardinality(_) => {
+            RelatesAnnotationCategory::Abstract => type_manager.unset_relates_annotation_abstract(snapshot, *self)?,
+            RelatesAnnotationCategory::Distinct => type_manager.unset_relates_annotation_distinct(snapshot, *self)?,
+            RelatesAnnotationCategory::Cardinality => {
                 type_manager.unset_relates_annotation_cardinality(snapshot, thing_manager, *self)?
+            }
+            RelatesAnnotationCategory::Doc => type_manager.unset_relates_annotation_doc(snapshot, *self)?,
+            RelatesAnnotationCategory::Meta(meta) => {
+                type_manager.unset_relates_annotation_meta(snapshot, *self, meta)?
             }
         }
         Ok(())
@@ -238,41 +246,11 @@ impl Capability for Relates {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, FromAnnotation!, HasAnnotationCategoryDerive!)]
 pub enum RelatesAnnotation {
     Abstract(AnnotationAbstract),
     Distinct(AnnotationDistinct),
     Cardinality(AnnotationCardinality),
-}
-
-impl TryFrom<Annotation> for RelatesAnnotation {
-    type Error = AnnotationError;
-
-    fn try_from(annotation: Annotation) -> Result<RelatesAnnotation, AnnotationError> {
-        match annotation {
-            Annotation::Abstract(annotation) => Ok(RelatesAnnotation::Abstract(annotation)),
-            Annotation::Distinct(annotation) => Ok(RelatesAnnotation::Distinct(annotation)),
-            Annotation::Cardinality(annotation) => Ok(RelatesAnnotation::Cardinality(annotation)),
-
-            | Annotation::Independent(_)
-            | Annotation::Unique(_)
-            | Annotation::Key(_)
-            | Annotation::Regex(_)
-            | Annotation::Cascade(_)
-            | Annotation::Range(_)
-            | Annotation::Values(_) => {
-                Err(AnnotationError::UnsupportedAnnotationForRelates { category: annotation.category() })
-            }
-        }
-    }
-}
-
-impl From<RelatesAnnotation> for Annotation {
-    fn from(anno: RelatesAnnotation) -> Self {
-        match anno {
-            RelatesAnnotation::Abstract(annotation) => Annotation::Abstract(annotation),
-            RelatesAnnotation::Distinct(annotation) => Annotation::Distinct(annotation),
-            RelatesAnnotation::Cardinality(annotation) => Annotation::Cardinality(annotation),
-        }
-    }
+    Doc(AnnotationDoc),
+    Meta(AnnotationMeta),
 }

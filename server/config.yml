@@ -3,10 +3,15 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 server:
-    address: 0.0.0.0:1729
+    listen-address: 0.0.0.0:1729
+    advertise-address:
     http:
         enabled: true
-        address: 0.0.0.0:8000
+        listen-address: 0.0.0.0:8000
+        advertise-address:
+    admin:
+        enabled: false
+        socket-path:
     # Experimental PostgreSQL wire compatibility layer for read-only clients.
     pgwire:
         enabled: false
@@ -23,6 +28,9 @@ server:
 
 storage:
     data-directory: "data"
+    rocksdb:
+        cache-size: 1gb
+        write-buffers-limit: 512mb
 
 logging:
     directory: "logs"

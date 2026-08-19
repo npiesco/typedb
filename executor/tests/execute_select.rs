@@ -6,17 +6,21 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use answer::variable::Variable;
 use compiler::{
-    annotation::{function::EmptyAnnotatedFunctionSignatures, match_inference::infer_types},
+    ExecutorVariable, VariablePosition,
+    annotation::{
+        PipelineAnnotationContext, function::EmptyAnnotatedFunctionSignatures,
+        inference::match_inference::infer_types_for_test_only,
+    },
     executable::{
         function::ExecutableFunctionRegistry,
         match_::{
-            instructions::{thing::HasInstruction, ConstraintInstruction, Inputs},
+            instructions::{ConstraintInstruction, Inputs, thing::HasInstruction},
             planner::{
                 conjunction_executable::{ConjunctionExecutable, ExecutionStep, IntersectionStep},
                 plan::PlannerStatistics,
@@ -24,28 +28,27 @@ use compiler::{
         },
         next_executable_id,
     },
-    ExecutorVariable, VariablePosition,
 };
 use concept::{
     thing::object::ObjectAPI,
-    type_::{annotation::AnnotationCardinality, owns::OwnsAnnotation, Ordering, OwnerAPI},
+    type_::{Ordering, OwnerAPI, annotation::AnnotationCardinality, owns::OwnsAnnotation},
 };
 use encoding::value::{label::Label, value::Value, value_type::ValueType};
 use executor::{
-    error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext, row::MaybeOwnedRow,
-    ExecutionInterrupt,
+    ExecutionInterrupt, error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext,
+    row::MaybeOwnedRow,
 };
 use ir::{
     pattern::constraint::IsaKind,
-    pipeline::{block::Block, ParameterRegistry},
+    pipeline::{ParameterRegistry, block::Block},
     translation::PipelineTranslationContext,
 };
 use lending_iterator::LendingIterator;
 use resource::profile::{CommitProfile, QueryProfile, StorageCounters};
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     snapshot::{CommittableSnapshot, ReadSnapshot},
-    MVCCStorage,
 };
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;
@@ -213,18 +216,14 @@ fn anonymous_vars_not_enumerated_or_counted() {
     let block_annotations = {
         let snapshot: ReadSnapshot<WALClient> = storage.clone().open_snapshot_read();
         let (type_manager, _) = load_managers(storage.clone(), None);
-        let variable_registry = &translation_context.variable_registry;
-        let previous_stage_variable_annotations = &BTreeMap::new();
-        infer_types(
+        let mut ctx = PipelineAnnotationContext::new(
             &snapshot,
-            &entry,
-            variable_registry,
             &type_manager,
-            previous_stage_variable_annotations,
             &EmptyAnnotatedFunctionSignatures,
-            false,
-        )
-        .unwrap()
+            &mut translation_context.variable_registry,
+            &value_parameters,
+        );
+        infer_types_for_test_only(&mut ctx, &entry, false).unwrap()
     };
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
@@ -258,7 +257,7 @@ fn anonymous_vars_not_enumerated_or_counted() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> = iterator
@@ -308,18 +307,14 @@ fn unselected_named_vars_counted() {
     let block_annotations = {
         let snapshot: ReadSnapshot<WALClient> = storage.clone().open_snapshot_read();
         let (type_manager, _) = load_managers(storage.clone(), None);
-        let variable_registry = &translation_context.variable_registry;
-        let previous_stage_variable_annotations = &BTreeMap::new();
-        infer_types(
+        let mut ctx = PipelineAnnotationContext::new(
             &snapshot,
-            &entry,
-            variable_registry,
             &type_manager,
-            previous_stage_variable_annotations,
             &EmptyAnnotatedFunctionSignatures,
-            false,
-        )
-        .unwrap()
+            &mut translation_context.variable_registry,
+            &value_parameters,
+        );
+        infer_types_for_test_only(&mut ctx, &entry, false).unwrap()
     };
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
@@ -355,7 +350,7 @@ fn unselected_named_vars_counted() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> = iterator
@@ -416,18 +411,14 @@ fn cartesian_named_counted_checked() {
     let block_annotations = {
         let snapshot: ReadSnapshot<WALClient> = storage.clone().open_snapshot_read();
         let (type_manager, _) = load_managers(storage.clone(), None);
-        let variable_registry = &translation_context.variable_registry;
-        let previous_stage_variable_annotations = &BTreeMap::new();
-        infer_types(
+        let mut ctx = PipelineAnnotationContext::new(
             &snapshot,
-            &entry,
-            variable_registry,
             &type_manager,
-            previous_stage_variable_annotations,
             &EmptyAnnotatedFunctionSignatures,
-            false,
-        )
-        .unwrap()
+            &mut translation_context.variable_registry,
+            &value_parameters,
+        );
+        infer_types_for_test_only(&mut ctx, &entry, false).unwrap()
     };
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
@@ -472,7 +463,7 @@ fn cartesian_named_counted_checked() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default());
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::default());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> = iterator

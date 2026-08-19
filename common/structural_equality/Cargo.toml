@@ -6,27 +6,21 @@ features = {}
 
 [package]
 	name = "structural_equality"
-	edition = "2021"
+	edition = "2024"
 	version = "0.0.0"
 
 [lib]
 	path = "structural_equality.rs"
+	crate-type = ["lib"]
 
 [dependencies]
 
 	[dependencies.serde]
-		features = ["alloc", "default", "derive", "rc", "serde_derive", "std"]
-		version = "1.0.219"
-		default-features = false
+		workspace = true
 
 	[dependencies.typeql]
-		features = []
-		git = "https://github.com/typedb/typeql"
-		tag = "3.8.0"
-		default-features = false
+		workspace = true
 
 	[dependencies.paste]
-		features = []
-		version = "1.0.15"
-		default-features = false
+		workspace = true
 

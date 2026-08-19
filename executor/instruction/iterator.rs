@@ -12,12 +12,12 @@ use std::{
 
 use answer::variable_value::VariableValue;
 use compiler::{
-    executable::match_::instructions::{VariableMode, VariableModes},
     ExecutorVariable, VariablePosition,
+    executable::match_::instructions::{VariableMode, VariableModes},
 };
 use concept::error::ConceptReadError;
 use itertools::zip_eq;
-use lending_iterator::{adaptors::Inspect, kmerge::KMergeBy, LendingIterator, Peekable};
+use lending_iterator::{LendingIterator, Peekable, adaptors::Inspect, kmerge::KMergeBy};
 
 use crate::{
     instruction::{
@@ -44,7 +44,7 @@ use crate::{
     row::Row,
 };
 
-pub(super) trait TupleSeekable {
+pub(crate) trait TupleSeekable {
     fn seek(&mut self, target: &Tuple<'_>) -> Result<(), Box<ConceptReadError>>;
 }
 
@@ -177,7 +177,7 @@ macro_rules! dispatch_tuple_iterator {
 
 dispatch_tuple_iterator! {
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum TupleIterator {
+pub enum TupleIterator {
     Is(SortedTupleIterator<IsIterator>),
     Iid(SortedTupleIterator<IidIterator>),
     Type(SortedTupleIterator<TypeIterator>),
@@ -229,16 +229,16 @@ pub(crate) enum TupleIterator {
 }
 
 impl {
-    pub(crate) fn write_values(&mut self, row: &mut Row<'_>);
-    pub(crate) fn peek(&mut self) -> Option<&Result<Tuple<'_>, Box<ConceptReadError>>>;
-    pub(crate) fn advance_past(&mut self) -> Result<usize, Box<ConceptReadError>>;
+    pub fn write_values(&mut self, row: &mut Row<'_>);
+    pub fn peek(&mut self) -> Option<&Result<Tuple<'_>, Box<ConceptReadError>>>;
+    pub fn advance_past(&mut self) -> Result<usize, Box<ConceptReadError>>;
     fn skip_until_first_unbound_value(
         &mut self,
         value: &VariableValue<'_>,
     ) -> Result<Option<Ordering>, Box<ConceptReadError>>;
-    pub(crate) fn advance_single(&mut self) -> Result<(), Box<ConceptReadError>>;
-    pub(crate) fn peek_first_unbound_value(&mut self) -> Option<Result<&VariableValue<'_>, Box<ConceptReadError>>>;
-    pub(crate) fn first_unbound_index(&self) -> TupleIndex ;
+    pub fn advance_single(&mut self) -> Result<(), Box<ConceptReadError>>;
+    pub fn peek_first_unbound_value(&mut self) -> Option<Result<&VariableValue<'_>, Box<ConceptReadError>>>;
+    pub fn first_unbound_index(&self) -> TupleIndex ;
 }
 }
 

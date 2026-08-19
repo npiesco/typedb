@@ -11,16 +11,17 @@ use std::{
     sync::Arc,
 };
 
-use bytes::{util::MB, Bytes};
+use bytes::Bytes;
+use fail_point::{KEYSPACE_CHECKPOINT_FAIL, KEYSPACE_DELETE_FAIL, KEYSPACE_OPEN_FAIL, fail_point};
 use itertools::Itertools;
-use resource::{constants::storage::ROCKSDB_CACHE_SIZE_MB, profile::StorageCounters};
-use rocksdb::{checkpoint::Checkpoint, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
+use resource::profile::StorageCounters;
+use rocksdb::{DB, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, checkpoint::Checkpoint};
 use serde::{Deserialize, Serialize};
 
-use super::{constants, iterator, IteratorPool};
-use crate::{key_range::KeyRange, write_batches::WriteBatches};
+use super::{IteratorPool, constants, iterator};
+use crate::{key_range::KeyRange, keyspace::rocks_resources::RocksResources, write_batches::WriteBatches};
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct KeyspaceId(pub u8);
 
 impl fmt::Debug for KeyspaceId {
@@ -46,7 +47,7 @@ pub trait KeyspaceSet: Copy {
     fn iter() -> impl Iterator<Item = Self>;
     fn id(&self) -> KeyspaceId;
     fn name(&self) -> &'static str;
-    fn rocks_configuration(&self, _cache: &rocksdb::Cache) -> rocksdb::Options {
+    fn rocks_configuration(&self, _resources: &RocksResources) -> rocksdb::Options {
         let mut options = Options::default();
         options.create_if_missing(true);
         options
@@ -65,16 +66,19 @@ impl Keyspaces {
         Self { keyspaces: Vec::new(), index: std::array::from_fn(|_| None) }
     }
 
-    pub(crate) fn open<KS: KeyspaceSet>(storage_dir: impl AsRef<Path>) -> Result<Self, KeyspaceOpenError> {
+    pub(crate) fn open<KS: KeyspaceSet>(
+        storage_dir: impl AsRef<Path>,
+        resources: &RocksResources,
+    ) -> Result<Self, KeyspaceOpenError> {
         let path = storage_dir.as_ref();
 
-        let cache = rocksdb::Cache::new_lru_cache((ROCKSDB_CACHE_SIZE_MB * MB) as usize);
         let mut keyspaces = Keyspaces::new();
         for keyspace in KS::iter() {
             keyspaces
                 .validate_new_keyspace(keyspace)
                 .map_err(|error| KeyspaceOpenError::Validation { source: error })?;
-            keyspaces.keyspaces.push(Keyspace::open(path, keyspace, &keyspace.rocks_configuration(&cache))?);
+            fail_point!(KEYSPACE_OPEN_FAIL);
+            keyspaces.keyspaces.push(Keyspace::open(path, keyspace, &keyspace.rocks_configuration(resources))?);
             keyspaces.index[keyspace.id().0 as usize] = Some(KeyspaceId(keyspaces.keyspaces.len() as u8 - 1));
         }
         Ok(keyspaces)
@@ -122,13 +126,21 @@ impl Keyspaces {
 
     pub(crate) fn checkpoint(&self, current_checkpoint_dir: &Path) -> Result<(), KeyspaceCheckpointError> {
         for keyspace in &self.keyspaces {
+            fail_point!(KEYSPACE_CHECKPOINT_FAIL);
             keyspace.checkpoint(current_checkpoint_dir)?;
         }
         Ok(())
     }
 
     pub(crate) fn delete(self) -> Result<(), Vec<KeyspaceDeleteError>> {
-        let errors = self.keyspaces.into_iter().filter_map(|keyspace| keyspace.delete().err()).collect_vec();
+        let errors = self
+            .keyspaces
+            .into_iter()
+            .filter_map(|keyspace| {
+                fail_point!(KEYSPACE_DELETE_FAIL);
+                keyspace.delete().err()
+            })
+            .collect_vec();
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -169,9 +181,12 @@ impl fmt::Display for KeyspaceValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NameExists { name, .. } => write!(f, "keyspace '{name}' is defined multiple times."),
-            Self::IdReserved { name, id, .. } => write!(f, "reserved keyspace id '{id}' cannot be used for new keyspace '{name}'."),
+            Self::IdReserved { name, id, .. } => {
+                write!(f, "reserved keyspace id '{id}' cannot be used for new keyspace '{name}'.")
+            }
             Self::IdTooLarge { name, id, max_id, .. } => write!(
-                f, "keyspace id '{id}' cannot be used for new keyspace '{name}' since it is larger than maximum keyspace id '{max_id}'.",
+                f,
+                "keyspace id '{id}' cannot be used for new keyspace '{name}' since it is larger than maximum keyspace id '{max_id}'.",
             ),
             Self::IdExists { new_name, id, existing_name, .. } => write!(
                 f,
@@ -232,7 +247,7 @@ impl Keyspace {
     }
 
     pub(crate) fn prefix_length(&self) -> Option<usize> {
-        self.prefix_length.clone()
+        self.prefix_length
     }
 
     pub(crate) fn put(&self, key: &[u8], value: &[u8]) -> Result<(), KeyspaceError> {

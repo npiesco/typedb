@@ -7,7 +7,10 @@
 use std::sync::Arc;
 
 use concept::type_::{
-    annotation::Annotation, constraint::Constraint, object_type::ObjectType, Capability, KindAPI, Ordering, TypeAPI,
+    Capability, KindAPI, Ordering, TypeAPI,
+    annotation::{Annotation, HasAnnotationCategory},
+    constraint::Constraint,
+    object_type::ObjectType,
 };
 use cucumber::gherkin::Step;
 use itertools::Itertools;
@@ -16,10 +19,11 @@ use params::{self, check_boolean};
 use resource::profile::StorageCounters;
 
 use crate::{
+    Context,
     concept::type_::BehaviourConceptTestExecutionError,
     generic_step,
     transaction_context::{with_read_tx, with_schema_tx},
-    unused_step, util, when_then, Context,
+    unused_step, util, when_then,
 };
 
 #[apply(generic_step)]
@@ -892,9 +896,8 @@ pub async fn relation_role_declared_annotation_categories_contain(
         let actual_contains = relates
             .get_annotations_declared(tx.snapshot.as_ref(), &tx.type_manager)
             .unwrap()
-            .into_iter()
-            .map(|annotation| Annotation::from(*annotation).category())
-            .contains(&parsed_annotation_category);
+            .iter()
+            .any(|annotation| annotation.has_category(&parsed_annotation_category));
         assert_eq!(contains_or_doesnt.expected_contains(), actual_contains);
     });
 }

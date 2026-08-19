@@ -3,20 +3,23 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-
 use std::sync::Arc;
 
 use concept::{thing::thing_manager::ThingManager, type_::type_manager::TypeManager};
+use function::function_manager::FunctionManager;
 use ir::pipeline::ParameterRegistry;
 use lending_iterator::LendingIterator;
 use resource::{constants::traversal::BATCH_DEFAULT_CAPACITY, profile::QueryProfile};
 use storage::snapshot::{ReadableSnapshot, WritableSnapshot};
 
 use crate::{
+    ExecutionInterrupt,
     batch::Batch,
     pipeline::{
+        PipelineExecutionError, WrittenRowsIterator,
         delete::DeleteStageExecutor,
-        initial::{InitialIterator, InitialStage},
+        given::{GivenStageExecutor, GivenStageIterator},
+        initial::InitialIterator,
         insert::InsertStageExecutor,
         match_::{MatchStageExecutor, MatchStageIterator},
         modifiers::{
@@ -27,38 +30,50 @@ use crate::{
         put::PutStageExecutor,
         reduce::ReduceStageExecutor,
         update::UpdateStageExecutor,
-        PipelineExecutionError, WrittenRowsIterator,
     },
     row::MaybeOwnedRow,
-    ExecutionInterrupt,
 };
 
 #[derive(Debug)]
 pub struct ExecutionContext<Snapshot> {
     pub snapshot: Arc<Snapshot>,
     pub thing_manager: Arc<ThingManager>,
+    pub function_manager: Arc<FunctionManager>,
     pub parameters: Arc<ParameterRegistry>,
     pub profile: Arc<QueryProfile>,
 }
 
 impl<Snapshot> ExecutionContext<Snapshot> {
-    pub fn new(snapshot: Arc<Snapshot>, thing_manager: Arc<ThingManager>, parameters: Arc<ParameterRegistry>) -> Self {
-        Self::new_with_profile(snapshot, thing_manager, parameters, Arc::new(QueryProfile::new(false)))
+    pub fn new(
+        snapshot: Arc<Snapshot>,
+        thing_manager: Arc<ThingManager>,
+        function_manager: Arc<FunctionManager>,
+        parameters: Arc<ParameterRegistry>,
+    ) -> Self {
+        Self::new_with_profile(
+            snapshot,
+            thing_manager,
+            function_manager,
+            parameters,
+            Arc::new(QueryProfile::new(false)),
+        )
     }
 
     pub fn new_with_profile(
         snapshot: Arc<Snapshot>,
         thing_manager: Arc<ThingManager>,
+        function_manager: Arc<FunctionManager>,
         parameters: Arc<ParameterRegistry>,
         query_profile: Arc<QueryProfile>,
     ) -> Self {
-        Self { snapshot, thing_manager, parameters, profile: query_profile }
+        Self { snapshot, thing_manager, function_manager, parameters, profile: query_profile }
     }
 
     pub(crate) fn clone_with_replaced_parameters(&self, parameters: Arc<ParameterRegistry>) -> Self {
         Self {
             snapshot: self.snapshot.clone(),
             thing_manager: self.thing_manager.clone(),
+            function_manager: self.function_manager.clone(),
             parameters,
             profile: self.profile.clone(),
         }
@@ -76,6 +91,10 @@ impl<Snapshot> ExecutionContext<Snapshot> {
         self.thing_manager.type_manager()
     }
 
+    pub(crate) fn function_manager(&self) -> &FunctionManager {
+        &self.function_manager
+    }
+
     pub(crate) fn parameters(&self) -> &ParameterRegistry {
         &self.parameters
     }
@@ -83,10 +102,11 @@ impl<Snapshot> ExecutionContext<Snapshot> {
 
 impl<Snapshot> Clone for ExecutionContext<Snapshot> {
     fn clone(&self) -> Self {
-        let Self { snapshot, thing_manager, parameters, profile } = self;
+        let Self { snapshot, thing_manager, parameters, function_manager, profile } = self;
         Self {
             snapshot: snapshot.clone(),
             thing_manager: thing_manager.clone(),
+            function_manager: function_manager.clone(),
             parameters: parameters.clone(),
             profile: profile.clone(),
         }
@@ -94,10 +114,13 @@ impl<Snapshot> Clone for ExecutionContext<Snapshot> {
 }
 
 pub trait StageAPI<Snapshot> {
+    type InputIterator: StageIterator;
     type OutputIterator: StageIterator;
 
     fn into_iterator(
         self,
+        input_iterator: Self::InputIterator,
+        context: ExecutionContext<Snapshot>,
         interrupt: ExecutionInterrupt,
     ) -> Result<
         (Self::OutputIterator, ExecutionContext<Snapshot>),
@@ -135,19 +158,20 @@ pub trait StageIterator:
 }
 
 pub enum ReadPipelineStage<Snapshot: ReadableSnapshot + 'static> {
-    Initial(Box<InitialStage<Snapshot>>),
-    Match(Box<MatchStageExecutor<ReadPipelineStage<Snapshot>>>),
-    Select(Box<SelectStageExecutor<ReadPipelineStage<Snapshot>>>),
-    Sort(Box<SortStageExecutor<ReadPipelineStage<Snapshot>>>),
-    Distinct(Box<DistinctStageExecutor<ReadPipelineStage<Snapshot>>>),
-    Limit(Box<LimitStageExecutor<ReadPipelineStage<Snapshot>>>),
-    Offset(Box<OffsetStageExecutor<ReadPipelineStage<Snapshot>>>),
-    Require(Box<RequireStageExecutor<ReadPipelineStage<Snapshot>>>),
-    Reduce(Box<ReduceStageExecutor<ReadPipelineStage<Snapshot>>>),
+    Given(Box<GivenStageExecutor<ReadStageIterator<Snapshot>>>),
+    Match(Box<MatchStageExecutor<ReadStageIterator<Snapshot>>>),
+    Select(Box<SelectStageExecutor<ReadStageIterator<Snapshot>>>),
+    Sort(Box<SortStageExecutor<ReadStageIterator<Snapshot>>>),
+    Distinct(Box<DistinctStageExecutor<ReadStageIterator<Snapshot>>>),
+    Limit(Box<LimitStageExecutor<ReadStageIterator<Snapshot>>>),
+    Offset(Box<OffsetStageExecutor<ReadStageIterator<Snapshot>>>),
+    Require(Box<RequireStageExecutor<ReadStageIterator<Snapshot>>>),
+    Reduce(Box<ReduceStageExecutor<ReadStageIterator<Snapshot>>>),
 }
 
 pub enum ReadStageIterator<Snapshot: ReadableSnapshot + 'static> {
     Initial(Box<InitialIterator>),
+    Given(Box<GivenStageIterator<Snapshot, ReadStageIterator<Snapshot>>>),
     Match(Box<MatchStageIterator<Snapshot, ReadStageIterator<Snapshot>>>),
     Sort(SortStageIterator),
     Distinct(Box<DistinctStageIterator<ReadStageIterator<Snapshot>>>),
@@ -159,50 +183,53 @@ pub enum ReadStageIterator<Snapshot: ReadableSnapshot + 'static> {
 }
 
 impl<Snapshot: ReadableSnapshot + 'static> StageAPI<Snapshot> for ReadPipelineStage<Snapshot> {
+    type InputIterator = ReadStageIterator<Snapshot>;
     type OutputIterator = ReadStageIterator<Snapshot>;
 
     fn into_iterator(
         self,
+        input_iterator: Self::InputIterator,
+        context: ExecutionContext<Snapshot>,
         interrupt: ExecutionInterrupt,
     ) -> Result<
         (Self::OutputIterator, ExecutionContext<Snapshot>),
         (Box<PipelineExecutionError>, ExecutionContext<Snapshot>),
     > {
         match self {
-            ReadPipelineStage::Initial(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
-                Ok((ReadStageIterator::Initial(Box::new(iterator)), snapshot))
+            ReadPipelineStage::Given(stage) => {
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
+                Ok((ReadStageIterator::Given(Box::new(iterator)), snapshot))
             }
             ReadPipelineStage::Match(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Match(Box::new(iterator)), snapshot))
             }
             ReadPipelineStage::Sort(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Sort(iterator), snapshot))
             }
             ReadPipelineStage::Distinct(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Distinct(Box::new(iterator)), snapshot))
             }
             ReadPipelineStage::Offset(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Offset(Box::new(iterator)), snapshot))
             }
             ReadPipelineStage::Limit(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Limit(Box::new(iterator)), snapshot))
             }
             ReadPipelineStage::Select(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Select(Box::new(iterator)), snapshot))
             }
             ReadPipelineStage::Require(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Require(Box::new(iterator)), snapshot))
             }
             ReadPipelineStage::Reduce(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((ReadStageIterator::Reduce(Box::new(iterator)), snapshot))
             }
         }
@@ -215,6 +242,7 @@ impl<Snapshot: ReadableSnapshot + 'static> LendingIterator for ReadStageIterator
     fn next(&mut self) -> Option<Self::Item<'_>> {
         match self {
             ReadStageIterator::Initial(iterator) => iterator.next(),
+            ReadStageIterator::Given(iterator) => iterator.next(),
             ReadStageIterator::Match(iterator) => iterator.next(),
             ReadStageIterator::Sort(iterator) => iterator.next(),
             ReadStageIterator::Distinct(iterator) => iterator.next(),
@@ -231,6 +259,7 @@ impl<Snapshot: ReadableSnapshot + 'static> StageIterator for ReadStageIterator<S
     fn collect_owned(self) -> Result<Batch, Box<PipelineExecutionError>> {
         match self {
             ReadStageIterator::Initial(iterator) => iterator.collect_owned(),
+            ReadStageIterator::Given(iterator) => iterator.collect_owned(),
             ReadStageIterator::Match(iterator) => iterator.collect_owned(),
             ReadStageIterator::Sort(iterator) => iterator.collect_owned(),
             ReadStageIterator::Distinct(iterator) => iterator.collect_owned(),
@@ -244,82 +273,85 @@ impl<Snapshot: ReadableSnapshot + 'static> StageIterator for ReadStageIterator<S
 }
 
 pub enum WritePipelineStage<Snapshot: WritableSnapshot + 'static> {
-    Initial(Box<InitialStage<Snapshot>>),
-    Match(Box<MatchStageExecutor<WritePipelineStage<Snapshot>>>),
-    Insert(Box<InsertStageExecutor<WritePipelineStage<Snapshot>>>),
-    Update(Box<UpdateStageExecutor<WritePipelineStage<Snapshot>>>),
-    Put(Box<PutStageExecutor<WritePipelineStage<Snapshot>>>),
-    Delete(Box<DeleteStageExecutor<WritePipelineStage<Snapshot>>>),
-    Sort(Box<SortStageExecutor<WritePipelineStage<Snapshot>>>),
-    Limit(Box<LimitStageExecutor<WritePipelineStage<Snapshot>>>),
-    Offset(Box<OffsetStageExecutor<WritePipelineStage<Snapshot>>>),
-    Select(Box<SelectStageExecutor<WritePipelineStage<Snapshot>>>),
-    Require(Box<RequireStageExecutor<WritePipelineStage<Snapshot>>>),
-    Distinct(Box<DistinctStageExecutor<WritePipelineStage<Snapshot>>>),
-    Reduce(Box<ReduceStageExecutor<WritePipelineStage<Snapshot>>>),
+    Given(Box<GivenStageExecutor<WriteStageIterator<Snapshot>>>),
+    Match(Box<MatchStageExecutor<WriteStageIterator<Snapshot>>>),
+    Insert(Box<InsertStageExecutor<WriteStageIterator<Snapshot>>>),
+    Update(Box<UpdateStageExecutor<WriteStageIterator<Snapshot>>>),
+    Put(Box<PutStageExecutor<WriteStageIterator<Snapshot>>>),
+    Delete(Box<DeleteStageExecutor<WriteStageIterator<Snapshot>>>),
+    Sort(Box<SortStageExecutor<WriteStageIterator<Snapshot>>>),
+    Limit(Box<LimitStageExecutor<WriteStageIterator<Snapshot>>>),
+    Offset(Box<OffsetStageExecutor<WriteStageIterator<Snapshot>>>),
+    Select(Box<SelectStageExecutor<WriteStageIterator<Snapshot>>>),
+    Require(Box<RequireStageExecutor<WriteStageIterator<Snapshot>>>),
+    Distinct(Box<DistinctStageExecutor<WriteStageIterator<Snapshot>>>),
+    Reduce(Box<ReduceStageExecutor<WriteStageIterator<Snapshot>>>),
 }
 
 impl<Snapshot: WritableSnapshot + 'static> StageAPI<Snapshot> for WritePipelineStage<Snapshot> {
+    type InputIterator = WriteStageIterator<Snapshot>;
     type OutputIterator = WriteStageIterator<Snapshot>;
 
     fn into_iterator(
         self,
+        input_iterator: Self::InputIterator,
+        context: ExecutionContext<Snapshot>,
         interrupt: ExecutionInterrupt,
     ) -> Result<
         (Self::OutputIterator, ExecutionContext<Snapshot>),
         (Box<PipelineExecutionError>, ExecutionContext<Snapshot>),
     > {
         match self {
-            WritePipelineStage::Initial(stage) => {
-                let (iterator, context) = stage.into_iterator(interrupt)?;
-                Ok((WriteStageIterator::Initial(Box::new(iterator)), context))
+            WritePipelineStage::Given(stage) => {
+                let (iterator, context) = stage.into_iterator(input_iterator, context, interrupt)?;
+                Ok((WriteStageIterator::Given(Box::new(iterator)), context))
             }
             WritePipelineStage::Match(stage) => {
-                let (iterator, context) = stage.into_iterator(interrupt)?;
+                let (iterator, context) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Match(Box::new(iterator)), context))
             }
             WritePipelineStage::Insert(stage) => {
-                let (iterator, context) = stage.into_iterator(interrupt)?;
+                let (iterator, context) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Write(iterator), context))
             }
             WritePipelineStage::Update(stage) => {
-                let (iterator, context) = stage.into_iterator(interrupt)?;
+                let (iterator, context) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Write(iterator), context))
             }
             WritePipelineStage::Put(stage) => {
-                let (iterator, context) = stage.into_iterator(interrupt)?;
+                let (iterator, context) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Write(iterator), context))
             }
             WritePipelineStage::Delete(stage) => {
-                let (iterator, context) = stage.into_iterator(interrupt)?;
+                let (iterator, context) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Write(iterator), context))
             }
             WritePipelineStage::Sort(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Sort(iterator), snapshot))
             }
             WritePipelineStage::Distinct(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Distinct(Box::new(iterator)), snapshot))
             }
             WritePipelineStage::Limit(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Limit(Box::new(iterator)), snapshot))
             }
             WritePipelineStage::Offset(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Offset(Box::new(iterator)), snapshot))
             }
             WritePipelineStage::Select(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Select(Box::new(iterator)), snapshot))
             }
             WritePipelineStage::Require(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Require(Box::new(iterator)), snapshot))
             }
             WritePipelineStage::Reduce(stage) => {
-                let (iterator, snapshot) = stage.into_iterator(interrupt)?;
+                let (iterator, snapshot) = stage.into_iterator(input_iterator, context, interrupt)?;
                 Ok((WriteStageIterator::Reduce(iterator), snapshot))
             }
         }
@@ -328,6 +360,7 @@ impl<Snapshot: WritableSnapshot + 'static> StageAPI<Snapshot> for WritePipelineS
 
 pub enum WriteStageIterator<Snapshot: WritableSnapshot + 'static> {
     Initial(Box<InitialIterator>),
+    Given(Box<GivenStageIterator<Snapshot, WriteStageIterator<Snapshot>>>),
     Match(Box<MatchStageIterator<Snapshot, WriteStageIterator<Snapshot>>>),
     Write(WrittenRowsIterator),
     Sort(SortStageIterator),
@@ -345,6 +378,7 @@ impl<Snapshot: WritableSnapshot + 'static> LendingIterator for WriteStageIterato
     fn next(&mut self) -> Option<Self::Item<'_>> {
         match self {
             WriteStageIterator::Initial(iterator) => iterator.next(),
+            WriteStageIterator::Given(iterator) => iterator.next(),
             WriteStageIterator::Match(iterator) => iterator.next(),
             WriteStageIterator::Write(iterator) => iterator.next(),
             WriteStageIterator::Sort(iterator) => iterator.next(),
@@ -362,6 +396,7 @@ impl<Snapshot: WritableSnapshot + 'static> StageIterator for WriteStageIterator<
     fn collect_owned(self) -> Result<Batch, Box<PipelineExecutionError>> {
         match self {
             WriteStageIterator::Initial(iterator) => iterator.collect_owned(),
+            WriteStageIterator::Given(iterator) => iterator.collect_owned(),
             WriteStageIterator::Match(iterator) => iterator.collect_owned(),
             WriteStageIterator::Write(iterator) => iterator.collect_owned(),
             WriteStageIterator::Sort(iterator) => iterator.collect_owned(),

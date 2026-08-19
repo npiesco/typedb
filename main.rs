@@ -7,34 +7,51 @@
 #![deny(unused_must_use)]
 #![deny(elided_lifetimes_in_paths)]
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use clap::Parser;
 use logger::initialise_logging_global;
-use resource::constants::server::{DEFAULT_CONFIG_PATH, SENTRY_REPORTING_URI, SERVER_INFO};
+use resource::constants::server::{DEFAULT_CONFIG_PATH, DISTRIBUTION_INFO, SENTRY_REPORTING_URI};
 use sentry::ClientInitGuard as SentryGuard;
 use server::{
+    ServerBuilder,
     parameters::{
         cli::CLIArgs,
         config::{Config, ConfigBuilder},
     },
-    ServerBuilder,
 };
 use tokio::runtime::Runtime;
 
 fn main() {
+    #[cfg(not(debug_assertions))]
+    if std::env::var(fail_point::FAIL_POINT_ENV).is_ok() {
+        tracing::warn!(
+            "{} is set, but `debug_assertions` are not enabled; fail points will not trigger",
+            fail_point::FAIL_POINT_ENV
+        );
+    }
+
     initialise_abort_on_panic();
     let cli_args: CLIArgs = CLIArgs::parse();
     let config_file = match cli_args.config_file_override.as_ref() {
-        None => ConfigBuilder::resolve_path_from_executable(&PathBuf::from(DEFAULT_CONFIG_PATH)),
-        Some(path) => CLIArgs::resolve_path_from_pwd(&path.into()),
+        None => ConfigBuilder::resolve_path_from_executable(Path::new(DEFAULT_CONFIG_PATH)),
+        Some(path) => CLIArgs::resolve_path_from_pwd(Path::new(path)),
     };
-    let mut config_builder = ConfigBuilder::from_file(config_file.into()).expect("Error reading from config file");
-    config_builder.override_with_cliargs(cli_args);
-    let config = config_builder.build().expect("Error validating config file overridden with cli args");
+    let mut config_builder = ConfigBuilder::from_file(config_file).unwrap_or_else(|err| {
+        eprintln!("Error reading from config file: {:?}", err);
+        std::process::exit(1);
+    });
+    config_builder.override_with_cliargs(cli_args).unwrap_or_else(|err| {
+        eprintln!("Error applying CLI overrides: {:?}", err);
+        std::process::exit(1);
+    });
+    let config = config_builder.build().unwrap_or_else(|err| {
+        eprintln!("Error validating config file overridden with cli args: {:?}", err);
+        std::process::exit(1);
+    });
     initialise_logging_global(&config.logging.directory);
 
-    ServerApplication::new(config).run()
+    ServerApplication::new(config).run();
 }
 
 struct ServerApplication {
@@ -52,10 +69,11 @@ impl ServerApplication {
 
     fn run(self) {
         self.runtime.block_on(async {
-            let server = ServerBuilder::default().server_info(SERVER_INFO).build(self.config).await.unwrap();
+            let server =
+                ServerBuilder::default().distribution_info(DISTRIBUTION_INFO).build(self.config).await.unwrap();
             match server.serve().await {
-                Ok(_) => println!("Exited."),
-                Err(err) => println!("Exited with error: {:?}", err),
+                Ok(_) => eprintln!("Exited."),
+                Err(err) => eprintln!("Exited with error: {:?}", err),
             }
         })
     }
@@ -75,7 +93,7 @@ fn may_initialise_error_reporting(config: &Config) -> Option<SentryGuard> {
     if config.diagnostics.reporting.report_errors && !config.development_mode.enabled {
         let options = (
             SENTRY_REPORTING_URI,
-            sentry::ClientOptions { release: Some(SERVER_INFO.version.into()), ..Default::default() },
+            sentry::ClientOptions { release: Some(DISTRIBUTION_INFO.version.into()), ..Default::default() },
         );
         Some(sentry::init(options))
     } else {

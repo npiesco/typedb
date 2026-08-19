@@ -4,45 +4,43 @@
 * file, You can obtain one at https://mozilla.org/MPL/2.0/.
 */
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-    vec,
-};
+use std::{collections::HashMap, sync::Arc, vec};
 
 use answer::variable_value::VariableValue;
 use compiler::{
-    self,
-    annotation::{function::EmptyAnnotatedFunctionSignatures, match_inference::infer_types},
-    VariablePosition,
+    self, VariablePosition,
+    annotation::{
+        PipelineAnnotationContext, function::EmptyAnnotatedFunctionSignatures,
+        inference::match_inference::infer_types_for_test_only,
+    },
 };
 use concept::{
     thing::{object::ObjectAPI, relation::Relation, thing_manager::ThingManager},
-    type_::{object_type::ObjectType, type_manager::TypeManager, Ordering, OwnerAPI, PlayerAPI},
+    type_::{Ordering, OwnerAPI, PlayerAPI, object_type::ObjectType, type_manager::TypeManager},
 };
 use encoding::value::{label::Label, value::Value, value_type::ValueType};
 use executor::{
+    ExecutionInterrupt, Provenance,
     pipeline::{
+        PipelineExecutionError,
         delete::DeleteStageExecutor,
         insert::InsertStageExecutor,
         stage::{ExecutionContext, StageAPI, StageIterator},
-        PipelineExecutionError,
     },
     row::MaybeOwnedRow,
     write::WriteError,
-    ExecutionInterrupt, Provenance,
 };
 use ir::{
-    pipeline::{function_signature::HashMapFunctionSignatureIndex, ParameterRegistry},
+    pipeline::{ParameterRegistry, function_signature::HashMapFunctionSignatureIndex},
     translation::PipelineTranslationContext,
 };
 use itertools::Itertools;
 use lending_iterator::{AsHkt, AsNarrowingIterator, LendingIterator};
 use resource::profile::{CommitProfile, QueryProfile, StorageCounters};
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     snapshot::{CommittableSnapshot, WritableSnapshot, WriteSnapshot},
-    MVCCStorage,
 };
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;
@@ -151,17 +149,9 @@ impl LendingIterator for ShimIterator {
     }
 }
 
-impl<Snapshot> StageAPI<Snapshot> for ShimStage<Snapshot> {
-    type OutputIterator = ShimIterator;
-
-    fn into_iterator(
-        self,
-        _: ExecutionInterrupt,
-    ) -> Result<
-        (Self::OutputIterator, ExecutionContext<Snapshot>),
-        (Box<PipelineExecutionError>, ExecutionContext<Snapshot>),
-    > {
-        Ok((ShimIterator(AsNarrowingIterator::new(self.rows)), self.context))
+impl<Snapshot> ShimStage<Snapshot> {
+    fn into_iterator(self) -> (ShimIterator, ExecutionContext<Snapshot>) {
+        (ShimIterator(AsNarrowingIterator::new(self.rows)), self.context)
     }
 }
 
@@ -186,18 +176,14 @@ fn execute_insert<Snapshot: WritableSnapshot + 'static>(
         .map(|(i, v)| (translation_context.get_variable(*v).unwrap(), VariablePosition::new(i as u32)))
         .collect::<HashMap<_, _>>();
 
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &block,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &block, false).unwrap();
 
     let insert_plan = compiler::executable::insert::executable::compile(
         &block,
@@ -220,13 +206,16 @@ fn execute_insert<Snapshot: WritableSnapshot + 'static>(
         ExecutionContext {
             snapshot,
             thing_manager,
+            function_manager: Arc::default(),
             parameters: Arc::new(value_parameters),
             profile: Arc::new(QueryProfile::new(false)),
         },
     );
-    let insert_executor = InsertStageExecutor::new(Arc::new(insert_plan), initial);
-    let (output_iter, context) =
-        insert_executor.into_iterator(ExecutionInterrupt::new_uninterruptible()).map_err(|(err, _)| match *err {
+    let (input_iter, context) = initial.into_iterator();
+    let insert_executor: InsertStageExecutor<ShimIterator> = InsertStageExecutor::new(Arc::new(insert_plan));
+    let (output_iter, context) = insert_executor
+        .into_iterator(input_iter, context, ExecutionInterrupt::new_uninterruptible())
+        .map_err(|(err, _)| match *err {
             PipelineExecutionError::WriteError { typedb_source } => typedb_source.clone(),
             _ => unreachable!(),
         })?;
@@ -270,18 +259,14 @@ fn execute_delete<Snapshot: WritableSnapshot + 'static>(
         .unwrap()
         .finish()
         .unwrap();
-        let variable_registry = &translation_context.variable_registry;
-        let previous_stage_variable_annotations = &BTreeMap::new();
-        infer_types(
+        let mut ctx = PipelineAnnotationContext::new(
             &snapshot,
-            &block,
-            variable_registry,
             &type_manager,
-            previous_stage_variable_annotations,
             &EmptyAnnotatedFunctionSignatures,
-            false,
-        )
-        .unwrap()
+            &mut translation_context.variable_registry,
+            &value_parameters,
+        );
+        infer_types_for_test_only(&mut ctx, &block, false).unwrap()
     };
 
     let typeql_delete =
@@ -311,13 +296,16 @@ fn execute_delete<Snapshot: WritableSnapshot + 'static>(
         ExecutionContext {
             snapshot,
             thing_manager,
+            function_manager: Arc::default(),
             parameters: Arc::new(value_parameters),
             profile: Arc::new(QueryProfile::new(false)),
         },
     );
-    let delete_executor = DeleteStageExecutor::new(Arc::new(delete_plan), initial);
-    let (output_iter, context) =
-        delete_executor.into_iterator(ExecutionInterrupt::new_uninterruptible()).map_err(|(err, _)| match *err {
+    let (input_iter, context) = initial.into_iterator();
+    let delete_executor: DeleteStageExecutor<ShimIterator> = DeleteStageExecutor::new(Arc::new(delete_plan));
+    let (output_iter, context) = delete_executor
+        .into_iterator(input_iter, context, ExecutionInterrupt::new_uninterruptible())
+        .map_err(|(err, _)| match *err {
             PipelineExecutionError::WriteError { typedb_source } => typedb_source,
             _ => unreachable!(),
         })?;
@@ -419,12 +407,16 @@ fn relation() {
         .map(|item| item.map(|(roleplayer, _)| (roleplayer.player(), roleplayer.role_type())))
         .try_collect::<_, Vec<_>, _>()
         .unwrap();
-    assert!(role_players
-        .iter()
-        .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(person_type), member_role) }));
-    assert!(role_players
-        .iter()
-        .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(group_type), group_role) }));
+    assert!(
+        role_players
+            .iter()
+            .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(person_type), member_role) })
+    );
+    assert!(
+        role_players
+            .iter()
+            .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(group_type), group_role) })
+    );
 }
 
 #[test]
@@ -468,12 +460,16 @@ fn relation_with_inferred_roles() {
         .map(|item| item.map(|(roleplayer, _)| (roleplayer.player(), roleplayer.role_type())))
         .try_collect::<_, Vec<_>, _>()
         .unwrap();
-    assert!(role_players
-        .iter()
-        .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(person_type), member_role) }));
-    assert!(role_players
-        .iter()
-        .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(group_type), group_role) }));
+    assert!(
+        role_players
+            .iter()
+            .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(person_type), member_role) })
+    );
+    assert!(
+        role_players
+            .iter()
+            .any(|(player, role)| { (player.type_(), *role) == (ObjectType::Entity(group_type), group_role) })
+    );
 }
 
 #[test]

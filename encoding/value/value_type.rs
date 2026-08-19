@@ -6,18 +6,18 @@
 
 use std::{fmt, mem, ops::Range};
 
-use bytes::{byte_array::ByteArray, Bytes};
+use bytes::{Bytes, byte_array::ByteArray};
 use resource::constants::snapshot::BUFFER_VALUE_INLINE;
 use serde::{
-    de::{self, Unexpected, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Unexpected, Visitor},
 };
 use structural_equality::StructuralEquality;
 
 use crate::{
+    AsBytes,
     graph::{definition::definition_key::DefinitionKey, type_::property::TypeVertexPropertyEncoding},
     layout::infix::Infix,
-    AsBytes,
 };
 
 // We can support Prefix::ATTRIBUTE_MAX - Prefix::ATTRIBUTE_MIN different built-in value types
@@ -81,7 +81,7 @@ impl ValueType {
             ValueTypeCategory::Duration => Self::Duration,
             ValueTypeCategory::String => Self::String,
             ValueTypeCategory::Struct => {
-                let definition_key = DefinitionKey::new(Bytes::Array(ByteArray::copy(&tail)));
+                let definition_key = DefinitionKey::decode(Bytes::Array(ByteArray::copy(&tail)));
                 Self::Struct(definition_key)
             }
         }
@@ -182,6 +182,7 @@ pub enum ValueTypeCategory {
 
 impl ValueTypeCategory {
     pub const fn to_bytes(&self) -> [u8; ValueTypeBytes::CATEGORY_LENGTH] {
+        // WARNING: Order here must align with AttributeID enum ordering!!
         match self {
             Self::Boolean => [0],
             Self::Integer => [1],
@@ -321,7 +322,8 @@ impl Serialize for ValueType {
 impl TypeVertexPropertyEncoding for ValueType {
     const INFIX: Infix = Infix::PropertyValueType;
 
-    fn from_value_bytes(value: &[u8]) -> Self {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         let mut bytes: [u8; ValueTypeBytes::LENGTH] = [0; ValueTypeBytes::LENGTH];
         bytes.copy_from_slice(&value[0..ValueTypeBytes::LENGTH]);
         ValueTypeBytes::new(bytes).to_value_type()
@@ -350,8 +352,8 @@ impl<'de> Deserialize<'de> for ValueType {
             where
                 E: de::Error,
             {
-                if v.len() == ValueTypeBytes::LENGTH {
-                    Ok(ValueType::from_value_bytes(v))
+                if let Ok(value_bytes) = v.try_into() {
+                    Ok(ValueTypeBytes::new(value_bytes).to_value_type())
                 } else {
                     Err(E::invalid_value(Unexpected::Bytes(v), &self))
                 }

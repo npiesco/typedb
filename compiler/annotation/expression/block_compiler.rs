@@ -10,14 +10,14 @@ use answer::variable::Variable;
 use concept::type_::type_manager::TypeManager;
 use ir::{
     pattern::{
+        Vertex,
         conjunction::Conjunction,
         constraint::{Constraint, ExpressionBinding},
         disjunction::Disjunction,
         nested_pattern::NestedPattern,
         variable_category::VariableCategory,
-        Vertex,
     },
-    pipeline::{block::Block, ParameterRegistry, VariableRegistry},
+    pipeline::{ParameterRegistry, VariableRegistry, block::Block},
 };
 use itertools::Itertools;
 use storage::snapshot::ReadableSnapshot;
@@ -25,9 +25,9 @@ use typeql::common::Span;
 
 use crate::annotation::{
     expression::{
+        ExpressionCompileError,
         compiled_expression::{ExecutableExpression, ExpressionValueType},
         expression_compiler::ExpressionCompilationContext,
-        ExpressionCompileError,
     },
     type_annotations::BlockAnnotations,
     type_inference::resolve_value_types,
@@ -51,11 +51,7 @@ struct BlockExpressionsCompilationContext<'block, Snapshot: ReadableSnapshot> {
 
 impl<'block, Snapshot: ReadableSnapshot> BlockExpressionsCompilationContext<'block, Snapshot> {
     pub(crate) fn variable_name(&self, variable: &Variable) -> String {
-        self.variable_registry
-            .variable_names()
-            .get(variable)
-            .cloned()
-            .unwrap_or_else(|| VariableRegistry::UNNAMED_VARIABLE_DISPLAY_NAME.to_string())
+        self.variable_registry.get_variable_name_or_unnamed(*variable).to_owned()
     }
 }
 
@@ -153,7 +149,7 @@ fn index_expressions_disjunction<'block, Snapshot: ReadableSnapshot>(
         .into_iter()
         .flat_map(|branch_index| branch_index.into_iter())
         .for_each(|(var, expressions)| combined_indices.entry(var).or_default().extend(expressions));
-    combined_indices.into_iter().try_for_each(|(var, expressions)| match index.insert(var.clone(), expressions) {
+    combined_indices.into_iter().try_for_each(|(var, expressions)| match index.insert(var, expressions) {
         Some(_) => {
             debug_assert!(!index.get(&var).unwrap().is_empty());
             Err(ExpressionCompileError::MultipleAssignmentsForVariable {

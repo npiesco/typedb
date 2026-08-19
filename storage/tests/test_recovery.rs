@@ -8,18 +8,19 @@
 
 use std::fs;
 
+use diagnostics::metrics::FsyncMetrics;
 use durability::wal::WAL;
 use resource::{
     constants::snapshot::BUFFER_KEY_INLINE,
     profile::{CommitProfile, StorageCounters},
 };
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     key_value::{StorageKeyArray, StorageKeyReference},
     snapshot::{CommittableSnapshot, ReadableSnapshot, WritableSnapshot},
-    MVCCStorage,
 };
-use test_utils::{create_tmp_dir, init_logging};
+use test_utils::{create_tmp_storage_dir, init_logging};
 use test_utils_storage::{checkpoint_storage, create_storage, load_storage, test_keyspace_set};
 
 #[test]
@@ -30,7 +31,7 @@ fn wal_and_checkpoint_ok() {
     let key_hello = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"hello"));
     let key_world = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"world"));
 
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let (checkpoint, watermark) = {
         let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
@@ -43,15 +44,20 @@ fn wal_and_checkpoint_ok() {
     };
 
     {
-        let storage =
-            load_storage::<TestKeyspaceSet>(&storage_path, WAL::load(&storage_path).unwrap(), Some(checkpoint))
-                .unwrap();
+        let storage = load_storage::<TestKeyspaceSet>(
+            &storage_path,
+            WAL::load(&storage_path, FsyncMetrics::disabled()).unwrap(),
+            Some(checkpoint),
+        )
+        .unwrap();
         assert_eq!(watermark, storage.snapshot_watermark());
         let snapshot = storage.open_snapshot_read();
-        assert!(snapshot
-            .get_mapped(StorageKeyReference::from(&key_hello), |_| true, StorageCounters::DISABLED)
-            .unwrap()
-            .is_some());
+        assert!(
+            snapshot
+                .get_mapped(StorageKeyReference::from(&key_hello), |_| true, StorageCounters::DISABLED)
+                .unwrap()
+                .is_some()
+        );
     };
 }
 
@@ -75,7 +81,7 @@ fn wal_and_no_checkpoint_ok() {
     let key_hello = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"hello"));
     let key_world = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"world"));
 
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let watermark = {
         let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
@@ -88,13 +94,20 @@ fn wal_and_no_checkpoint_ok() {
     };
 
     {
-        let storage = load_storage::<TestKeyspaceSet>(&storage_path, WAL::load(&storage_path).unwrap(), None).unwrap();
+        let storage = load_storage::<TestKeyspaceSet>(
+            &storage_path,
+            WAL::load(&storage_path, FsyncMetrics::disabled()).unwrap(),
+            None,
+        )
+        .unwrap();
         assert_eq!(watermark, storage.snapshot_watermark());
         let snapshot = storage.open_snapshot_read();
-        assert!(snapshot
-            .get_mapped(StorageKeyReference::from(&key_hello), |_| true, StorageCounters::DISABLED)
-            .unwrap()
-            .is_some());
+        assert!(
+            snapshot
+                .get_mapped(StorageKeyReference::from(&key_hello), |_| true, StorageCounters::DISABLED)
+                .unwrap()
+                .is_some()
+        );
     }
 }
 
@@ -106,7 +119,7 @@ fn no_wal_and_checkpoint_illegal() {
     let key_hello = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"hello"));
     let key_world = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"world"));
 
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     let (_checkpoint, directory) = {
         let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
@@ -122,7 +135,7 @@ fn no_wal_and_checkpoint_illegal() {
     fs::remove_dir_all(directory.join(WAL::WAL_DIR_NAME)).unwrap();
 
     {
-        let wal_result = WAL::load(&storage_path);
+        let wal_result = WAL::load(&storage_path, FsyncMetrics::disabled());
         assert!(wal_result.is_err());
     }
 }
@@ -135,7 +148,7 @@ fn no_wal_and_no_checkpoint_and_keyspaces_illegal() {
     let key_hello = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"hello"));
     let key_world = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"world"));
 
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     {
         let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
@@ -149,7 +162,7 @@ fn no_wal_and_no_checkpoint_and_keyspaces_illegal() {
     fs::remove_dir_all(storage_path.join(WAL::WAL_DIR_NAME)).unwrap();
 
     {
-        let wal_result = WAL::load(&storage_path);
+        let wal_result = WAL::load(&storage_path, FsyncMetrics::disabled());
         assert!(wal_result.is_err());
     }
 }
@@ -162,7 +175,7 @@ fn no_wal_and_no_checkpoint_and_no_keyspaces_illegal() {
     let key_hello = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"hello"));
     let key_world = StorageKeyArray::<BUFFER_KEY_INLINE>::from((TestKeyspaceSet::Keyspace, b"world"));
 
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     {
         let storage = create_storage::<TestKeyspaceSet>(&storage_path).unwrap();
 
@@ -178,7 +191,7 @@ fn no_wal_and_no_checkpoint_and_no_keyspaces_illegal() {
     fs::remove_dir_all(storage_path.join(MVCCStorage::<WALClient>::STORAGE_DIR_NAME)).unwrap();
 
     {
-        let wal_result = WAL::load(&storage_path);
+        let wal_result = WAL::load(&storage_path, FsyncMetrics::disabled());
         assert!(wal_result.is_err());
     }
 }

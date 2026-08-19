@@ -12,7 +12,7 @@ use std::{
     vec,
 };
 
-use answer::{variable_value::VariableValue, Thing};
+use answer::{Thing, variable_value::VariableValue};
 use encoding::value::value::Value;
 use error::unimplemented_feature;
 use itertools::Itertools;
@@ -21,10 +21,10 @@ use resource::{constants::traversal::FIXED_BATCH_ROWS_MAX, profile::StorageCount
 use storage::snapshot::ReadableSnapshot;
 
 use crate::{
+    Provenance,
     error::ReadExecutionError,
     pipeline::stage::ExecutionContext,
     row::{MaybeOwnedRow, Row},
-    Provenance,
 };
 
 #[derive(Debug)]
@@ -192,7 +192,7 @@ pub struct Batch {
 }
 
 impl Batch {
-    pub(crate) fn new(width: u32, capacity: usize) -> Self {
+    pub fn new(width: u32, capacity: usize) -> Self {
         let size = width as usize * capacity;
         Batch {
             width,
@@ -200,6 +200,16 @@ impl Batch {
             multiplicities: Vec::with_capacity(capacity),
             provenance: Vec::with_capacity(capacity),
         }
+    }
+
+    pub fn new_single_empty_row() -> Batch {
+        let mut this = Self::new(0, 1);
+        this.append_row(MaybeOwnedRow::empty());
+        this
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
     }
 
     pub fn len(&self) -> usize {
@@ -227,7 +237,7 @@ impl Batch {
         self.append(|mut appended| appended.copy_from_row(row))
     }
 
-    pub(crate) fn append<T>(&mut self, writer: impl FnOnce(Row<'_>) -> T) -> T {
+    pub fn append<T>(&mut self, writer: impl FnOnce(Row<'_>) -> T) -> T {
         self.data.resize(self.data.len() + self.width as usize, VariableValue::None);
         self.multiplicities.push(1);
         self.provenance.push(Provenance::INITIAL);
@@ -309,6 +319,10 @@ pub struct BatchRowIterator {
 impl BatchRowIterator {
     pub(crate) fn new(batch: Batch) -> Self {
         Self { batch, index: 0 }
+    }
+
+    pub(crate) fn initial_len(&self) -> usize {
+        self.batch.len()
     }
 }
 

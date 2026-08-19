@@ -8,32 +8,23 @@ use std::{collections::HashMap, fmt};
 
 use answer::variable::Variable;
 use structural_equality::StructuralEquality;
+use typeql::common::Span;
 
-use crate::{
-    pattern::{
-        conjunction::{Conjunction, ConjunctionBuilder},
-        Pattern, Scope, ScopeId, VariableBindingMode,
-    },
-    pipeline::block::{BlockBuilderContext, BlockContext, VariableLocality},
+use crate::pattern::{
+    BindingMode, ContextualisedBindingMode, Pattern, PatternVariables, Scope, ScopeId,
+    conjunction::{Conjunction, ConjunctionBuilder},
+    impl_pattern_from_pattern_variables,
+    nested_pattern::NestedPattern,
 };
 
 #[derive(Debug, Clone)]
 pub struct Negation {
     conjunction: Conjunction,
+    pattern_variables: PatternVariables,
+    source_span: Option<Span>,
 }
 
 impl Negation {
-    pub fn new(scope_id: ScopeId) -> Self {
-        Self { conjunction: Conjunction::new(scope_id) }
-    }
-
-    pub(super) fn new_builder<'cx, 'reg>(
-        context: &'cx mut BlockBuilderContext<'reg>,
-        negation: &'cx mut Negation,
-    ) -> ConjunctionBuilder<'cx, 'reg> {
-        ConjunctionBuilder::new(context, &mut negation.conjunction)
-    }
-
     pub fn conjunction(&self) -> &Conjunction {
         &self.conjunction
     }
@@ -41,40 +32,13 @@ impl Negation {
     pub fn conjunction_mut(&mut self) -> &mut Conjunction {
         &mut self.conjunction
     }
-}
 
-impl Pattern for Negation {
-    fn referenced_variables(&self) -> impl Iterator<Item = Variable> + '_ {
-        self.conjunction().referenced_variables()
-    }
-
-    // Union of non-binding variables used here or below, and variables declared in parent scopes
-    fn required_inputs<'a>(&'a self, block_context: &'a BlockContext) -> impl Iterator<Item = Variable> + 'a {
-        self.variable_binding_modes().into_iter().filter_map(|(v, mode)| {
-            let locality = block_context.variable_locality_in_scope(v, self.scope_id());
-            if locality == VariableLocality::Parent || mode.is_require_prebound() {
-                Some(v)
-            } else {
-                None
-            }
-        })
-    }
-
-    fn variable_binding_modes(&self) -> HashMap<Variable, VariableBindingMode<'_>> {
-        self.conjunction
-            .variable_binding_modes()
-            .into_iter()
-            .filter_map(|(var, mut mode)| {
-                if mode.is_always_binding() {
-                    // if it is binding, we demote it to only locally binding (only relevant in the negation)
-                    mode.set_locally_binding_in_child();
-                }
-                // everything is either locally binding or non-binding (& therefore must be from parent)
-                Some((var, mode))
-            })
-            .collect()
+    pub(crate) fn source_span(&self) -> Option<Span> {
+        self.source_span
     }
 }
+
+impl_pattern_from_pattern_variables!(Negation);
 
 impl Scope for Negation {
     fn scope_id(&self) -> ScopeId {
@@ -95,5 +59,48 @@ impl StructuralEquality for Negation {
 impl fmt::Display for Negation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "not {}", self.conjunction)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct NegationBuilder {
+    conjunction: ConjunctionBuilder,
+    source_span: Option<Span>,
+}
+
+impl NegationBuilder {
+    pub(crate) fn new(scope_id: ScopeId, source_span: Option<Span>) -> Self {
+        Self { conjunction: ConjunctionBuilder::new(scope_id), source_span }
+    }
+
+    pub(crate) fn finish(self, parent_modes: &ContextualisedBindingMode) -> NestedPattern {
+        let source_span = self.source_span;
+        let binding_modes = ContextualisedBindingMode::from(self.variable_binding_modes(), parent_modes);
+        let conjunction = self.conjunction.finish(&binding_modes);
+        let pattern_variables = PatternVariables::from(&binding_modes);
+        NestedPattern::Negation(Negation { conjunction, pattern_variables, source_span })
+    }
+
+    pub(crate) fn conjunction(&self) -> &ConjunctionBuilder {
+        &self.conjunction
+    }
+
+    pub fn conjunction_mut(&mut self) -> &mut ConjunctionBuilder {
+        &mut self.conjunction
+    }
+
+    pub(crate) fn variable_binding_modes(&self) -> HashMap<Variable, BindingMode> {
+        self.conjunction
+            .variable_binding_modes()
+            .into_iter()
+            .map(|(var, mode)| {
+                if mode.is_always_binding() {
+                    // if it is binding, we demote it to only locally binding (only relevant in the negation)
+                    (var, BindingMode::LocallyBindingInChild)
+                } else {
+                    (var, mode)
+                }
+            })
+            .collect()
     }
 }

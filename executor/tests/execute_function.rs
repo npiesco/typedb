@@ -9,18 +9,18 @@ use std::{collections::HashMap, iter, sync::Arc};
 use answer::variable_value::VariableValue;
 use compiler::VariablePosition;
 use concept::{thing::thing_manager::ThingManager, type_::type_manager::TypeManager};
-use encoding::{graph::definition::definition_key_generator::DefinitionKeyGenerator, value::value::Value};
+use encoding::value::value::Value;
 use executor::{
-    pipeline::{stage::ExecutionContext, PipelineExecutionError},
-    row::MaybeOwnedRow,
     ExecutionInterrupt,
+    pipeline::{PipelineExecutionError, stage::ExecutionContext},
+    row::MaybeOwnedRow,
 };
 use function::function_manager::FunctionManager;
 use itertools::Either;
 use lending_iterator::LendingIterator;
-use query::{query_cache::QueryCache, query_manager::QueryManager};
+use query::{given_rows::GivenRowsSimple, query_cache::QueryCache, query_manager::QueryManager};
 use resource::profile::CommitProfile;
-use storage::{durability_client::WALClient, snapshot::CommittableSnapshot, MVCCStorage};
+use storage::{MVCCStorage, durability_client::WALClient, snapshot::CommittableSnapshot};
 use test_utils::TempDir;
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;
@@ -29,7 +29,7 @@ struct Context {
     storage: Arc<MVCCStorage<WALClient>>,
     type_manager: Arc<TypeManager>,
     thing_manager: Arc<ThingManager>,
-    function_manager: FunctionManager,
+    function_manager: Arc<FunctionManager>,
     query_manager: QueryManager,
     _tmp_dir: TempDir,
 }
@@ -95,13 +95,13 @@ fn setup_common(schema: &str) -> Context {
     setup_concept_storage(&mut storage);
 
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let function_manager = FunctionManager::new(Arc::new(DefinitionKeyGenerator::new()), None);
+    let function_manager = Arc::new(FunctionManager::default());
     let query_manager = QueryManager::new(None);
 
     let mut snapshot = storage.clone().open_snapshot_schema();
     let define = typeql::parse_query(schema).unwrap().into_structure().into_schema();
     query_manager
-        .execute_schema(&mut snapshot, &type_manager, &thing_manager, &function_manager, define, schema)
+        .execute_schema(&mut snapshot, &type_manager, &thing_manager, &function_manager, &define, schema)
         .unwrap();
     snapshot.commit(&mut CommitProfile::DISABLED).unwrap();
 
@@ -123,8 +123,9 @@ fn run_read_query(
             snapshot,
             &context.type_manager,
             context.thing_manager.clone(),
-            &context.function_manager,
+            context.function_manager.clone(),
             &match_,
+            None::<GivenRowsSimple>,
             query,
         )
         .unwrap();
@@ -137,7 +138,7 @@ fn run_read_query(
         .flat_map(|res| match res {
             Ok(row) => {
                 let multiplicity = row.multiplicity() as usize;
-                Either::Left(iter::repeat(Ok(row)).take(multiplicity))
+                Either::Left(iter::repeat_n(Ok(row), multiplicity))
             }
             Err(_) => Either::Right(iter::once(res)),
         })
@@ -158,8 +159,9 @@ fn run_write_query(
             snapshot,
             &context.type_manager,
             context.thing_manager.clone(),
-            &context.function_manager,
+            context.function_manager.clone(),
             &query_as_pipeline,
+            None::<GivenRowsSimple>,
             query,
         )
         .unwrap();

@@ -6,11 +6,11 @@
 
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
-use answer::{variable_value::VariableValue, Thing};
+use answer::{Thing, variable_value::VariableValue};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use compiler::{
-    executable::reduce::{ReduceInstruction, ReduceRowsExecutable},
     VariablePosition,
+    executable::reduce::{ReduceInstruction, ReduceRowsExecutable},
 };
 use encoding::value::{decimal_value::Decimal, timezone::TimeZone, value::Value};
 use paste::paste;
@@ -18,10 +18,10 @@ use resource::profile::StorageCounters;
 use storage::snapshot::ReadableSnapshot;
 
 use crate::{
-    batch::Batch,
-    pipeline::{stage::ExecutionContext, PipelineExecutionError},
-    row::MaybeOwnedRow,
     Provenance,
+    batch::Batch,
+    pipeline::{PipelineExecutionError, stage::ExecutionContext},
+    row::MaybeOwnedRow,
 };
 
 #[derive(Debug)]
@@ -54,6 +54,7 @@ impl GroupedReducer {
         &mut self,
         row: &MaybeOwnedRow<'_>,
         context: &ExecutionContext<Snapshot>,
+        storage_counters: &StorageCounters,
     ) -> Result<(), Box<PipelineExecutionError>> {
         self.reused_group.clear();
         for &pos in &self.rows_executable.input_group_positions {
@@ -64,7 +65,7 @@ impl GroupedReducer {
         }
         let reducers = self.grouped_reductions.get_mut(&self.reused_group).unwrap();
         for reducer in reducers {
-            reducer.accept(row, context);
+            reducer.accept(row, context, storage_counters);
         }
         Ok(())
     }
@@ -136,13 +137,15 @@ macro_rules! reducer_executor {
             }
 
             impl ReducerExecutor {
-                fn accept<Snapshot: ReadableSnapshot>(&mut self, row: &MaybeOwnedRow<'_>, context: &ExecutionContext<Snapshot>) {
-                    let profile = context.profile.profile_stage(|| String::from("Reduce"), 0); // TODO executable id
-                    let step_profile = profile.extend_or_get(0, || String::from("Reduce execution"));
-                    let storage_counters = step_profile.storage_counters();
+                fn accept<Snapshot: ReadableSnapshot>(
+                    &mut self,
+                    row: &MaybeOwnedRow<'_>,
+                    context: &ExecutionContext<Snapshot>,
+                    storage_counters: &StorageCounters,
+                ) {
                     match self {
-                        Self::$count(reducer) => reducer.accept(row, context, storage_counters),
-                        $(Self::$variant(reducer) => reducer.accept(row, context, storage_counters)),*
+                        Self::$count(reducer) => reducer.accept(row, context, storage_counters.clone()),
+                        $(Self::$variant(reducer) => reducer.accept(row, context, storage_counters.clone())),*
                     }
                 }
 
@@ -490,11 +493,7 @@ impl ReducerAPI for MeanDoubleExecutor {
     }
 
     fn finalise(self) -> Option<VariableValue<'static>> {
-        if self.count > 0 {
-            Some(VariableValue::Value(Value::Double(self.sum / self.count as f64)))
-        } else {
-            None
-        }
+        if self.count > 0 { Some(VariableValue::Value(Value::Double(self.sum / self.count as f64))) } else { None }
     }
 }
 
@@ -525,11 +524,7 @@ impl ReducerAPI for MeanDecimalExecutor {
     }
 
     fn finalise(self) -> Option<VariableValue<'static>> {
-        if self.count > 0 {
-            Some(VariableValue::Value(Value::Decimal(self.sum / self.count)))
-        } else {
-            None
-        }
+        if self.count > 0 { Some(VariableValue::Value(Value::Decimal(self.sum / self.count))) } else { None }
     }
 }
 

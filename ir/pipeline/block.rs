@@ -5,8 +5,8 @@
  */
 
 use std::{
-    collections::{HashMap, HashSet},
-    ops::ControlFlow,
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
 };
 
 use answer::variable::Variable;
@@ -15,15 +15,15 @@ use structural_equality::StructuralEquality;
 use typeql::common::Span;
 
 use crate::{
+    RepresentationError,
     pattern::{
-        conjunction::{Conjunction, ConjunctionBuilder},
+        BindingMode, BranchID, ContextualisedBindingMode, Pattern, ScopeId,
+        conjunction::{Conjunction, ConjunctionBuilder, ConjunctionBuilderWithContext, NestedPatternBuilder},
         constraint::Constraint,
         nested_pattern::NestedPattern,
         variable_category::VariableCategory,
-        BranchID, Pattern, Scope, ScopeId,
     },
     pipeline::{ParameterRegistry, VariableCategorySource, VariableRegistry},
-    RepresentationError,
 };
 
 #[derive(Debug, Clone)]
@@ -48,36 +48,6 @@ impl Block {
     pub fn block_context(&self) -> &BlockContext {
         &self.block_context
     }
-
-    pub fn scope_id(&self) -> ScopeId {
-        Scope::scope_id(self)
-    }
-
-    fn variable_scopes(&self) -> impl Iterator<Item = (&Variable, &ScopeId)> + '_ {
-        self.block_context.variable_declaration.iter()
-    }
-
-    pub fn variables(&self) -> impl Iterator<Item = Variable> + '_ {
-        self.block_context.referenced_variables.iter().cloned()
-    }
-
-    pub fn block_variables(&self) -> impl Iterator<Item = Variable> + '_ {
-        self.variable_scopes().filter_map(|(&v, scope)| if scope != &ScopeId::INPUT { Some(v) } else { None })
-    }
-
-    pub fn input_variables(&self) -> impl Iterator<Item = Variable> + '_ {
-        self.variable_scopes().filter_map(|(&v, scope)| if scope == &ScopeId::INPUT { Some(v) } else { None })
-    }
-
-    pub fn into_conjunction(self) -> Conjunction {
-        self.conjunction
-    }
-}
-
-impl Scope for Block {
-    fn scope_id(&self) -> ScopeId {
-        ScopeId::ROOT
-    }
 }
 
 impl StructuralEquality for Block {
@@ -93,76 +63,107 @@ impl StructuralEquality for Block {
 #[derive(Debug)]
 pub struct BlockBuilder<'reg> {
     context: BlockBuilderContext<'reg>,
-    conjunction: Conjunction,
+    conjunction: ConjunctionBuilder,
 }
 
 impl<'reg> BlockBuilder<'reg> {
     fn new(context: BlockBuilderContext<'reg>) -> Self {
-        Self { conjunction: Conjunction::new(ScopeId::ROOT), context }
+        Self { conjunction: ConjunctionBuilder::new(ScopeId::ROOT), context }
     }
 
-    pub fn finish(self) -> Result<Block, Box<RepresentationError>> {
-        let Self {
-            conjunction,
-            context:
-                BlockBuilderContext { block_context, variable_registry, variable_names_index: visible_variables, .. },
-        } = self;
-        validate_conjunction(&conjunction, variable_registry, &block_context)?;
-        let conjunction_visible: HashSet<_> = conjunction.named_visible_binding_variables(&block_context).collect();
-        visible_variables.retain(|name, var| {
-            conjunction_visible.contains(var) || block_context.get_declaring_scope(var).unwrap() == ScopeId::INPUT
-        });
+    pub fn finish(mut self) -> Result<Block, Box<RepresentationError>> {
+        let block_binding_modes = self.variable_binding_modes();
+        validate_no_optionals_in_negations(&self.conjunction, false)?;
+        validate_optional_returns(&self.context, &self.conjunction)?;
+        validate_all_required_variables_can_be_bound(&self, &block_binding_modes, &self.context.variable_registry)?;
+        validate_no_unbound_variable_categories(&self.conjunction, &self.context)?;
+        validate_is_variables_have_same_category(&self.conjunction, &self.context.variable_registry)?;
+
+        // Update
+        block_binding_modes
+            .iter()
+            .filter(|(_, mode)| mode.is_optionally_binding())
+            .for_each(|(v, _)| self.context.set_variable_optionality(*v, true));
+        self.context
+            .variable_names_index
+            .retain(|_, var| block_binding_modes.get(var).copied() != Some(BindingMode::LocallyBindingInChild));
+        let conjunction = self.conjunction.finish(&ContextualisedBindingMode::for_block(block_binding_modes));
+
+        validate_is_plannable(
+            &conjunction,
+            &self.context.input_variables().collect(),
+            &self.context.variable_registry,
+        )?;
+
+        let block_context = self.context.block_context;
         Ok(Block { conjunction, block_context })
     }
 
-    pub fn conjunction_mut(&mut self) -> ConjunctionBuilder<'_, 'reg> {
-        ConjunctionBuilder::new(&mut self.context, &mut self.conjunction)
+    pub fn conjunction_mut<'ctx>(&'ctx mut self) -> ConjunctionBuilderWithContext<'ctx, 'reg> {
+        ConjunctionBuilderWithContext::new(&mut self.context, &mut self.conjunction)
     }
 
     pub fn context_mut(&mut self) -> &mut BlockBuilderContext<'reg> {
         &mut self.context
     }
+
+    fn variable_binding_modes(&self) -> HashMap<Variable, BindingMode> {
+        let mut block_binding_modes = self.conjunction.variable_binding_modes();
+        block_binding_modes.extend(self.context.input_variables().map(|v| (v, BindingMode::AlwaysBinding)));
+        block_binding_modes
+    }
 }
 
-fn validate_conjunction(
-    conjunction: &Conjunction,
-    variable_registry: &VariableRegistry,
-    block_context: &BlockContext,
+fn validate_no_unbound_variable_categories(
+    conjunction: &ConjunctionBuilder,
+    context: &BlockBuilderContext<'_>,
 ) -> Result<(), Box<RepresentationError>> {
-    let unbound = conjunction.referenced_variables().find(|&variable| {
-        matches!(variable_registry.get_variable_category(variable), Some(VariableCategory::AttributeOrValue) | None)
+    let unbound = context.block_context.registered_variables().find(|&variable| {
+        matches!(
+            context.variable_registry.get_variable_category(variable),
+            Some(VariableCategory::AttributeOrValue) | None
+        )
     });
-    // TODO: unbound variable somewhere in the pattern is insufficient - a variable could be bound, but
-    //   it's actually only required in a sibling part of the pattern ??
     if let Some(variable) = unbound {
-        return Err(Box::new(RepresentationError::UnboundVariable {
-            variable: variable_registry.get_variable_name_or_unnamed(variable).to_owned(),
-            source_span: variable_registry.source_span(variable),
-        }));
+        Err(Box::new(RepresentationError::UnboundVariable {
+            variable: context.variable_registry.get_variable_name_or_unnamed(variable).to_owned(),
+            source_span: context.variable_registry.source_span(variable),
+        }))
+    } else {
+        Ok(())
     }
-    if let ControlFlow::Break((var, source_span)) = conjunction.find_disjoint_variable(block_context) {
-        let name = variable_registry.get_variable_name_or_unnamed(var).to_owned();
-        return Err(Box::new(RepresentationError::LocallyBoundVariableReuse { name, source_span }));
-    }
+}
 
-    for (var, mode) in conjunction.variable_binding_modes() {
-        if mode.is_require_prebound() && block_context.get_declaring_scope(&var) != Some(ScopeId::INPUT) {
-            let variable = variable_registry.get_variable_name_or_unnamed(var).to_owned();
-            let spans = mode.referencing_constraints().iter().map(|s| s.source_span()).collect_vec();
-            return Err(Box::new(RepresentationError::UnboundRequiredVariable {
-                variable,
-                source_span: spans[0],
-                _rest: spans,
-            }));
+fn validate_no_optionals_in_negations(
+    conjunction: &ConjunctionBuilder,
+    this_conjunction_in_negation: bool,
+) -> Result<(), Box<RepresentationError>> {
+    if this_conjunction_in_negation {
+        if let Some(optional) = conjunction
+            .nested_patterns()
+            .iter()
+            .filter_map(|nested| match nested {
+                NestedPatternBuilder::Optional(optional) => Some(optional),
+                _ => None,
+            })
+            .next()
+        {
+            return Err(Box::new(RepresentationError::OptionalInNegation {}));
         }
     }
-
-    validate_is_variables_have_same_category(conjunction, variable_registry)?;
-    Ok(())
+    conjunction.nested_patterns().iter().try_for_each(|nested| match nested {
+        NestedPatternBuilder::Disjunction(disjunction) => disjunction
+            .conjunctions()
+            .try_for_each(|c| validate_no_optionals_in_negations(c, this_conjunction_in_negation)),
+        NestedPatternBuilder::Negation(negation) => validate_no_optionals_in_negations(negation.conjunction(), true),
+        NestedPatternBuilder::Optional(optional) => {
+            validate_no_optionals_in_negations(optional.conjunction(), this_conjunction_in_negation)
+        }
+    })
 }
 
 fn validate_is_variables_have_same_category(
-    conjunction: &Conjunction,
+    conjunction: &ConjunctionBuilder,
     variable_registry: &VariableRegistry,
 ) -> Result<(), Box<RepresentationError>> {
     let is_with_mismatched_category = conjunction.constraints().iter().filter_map(|c| c.as_is()).find(|is| {
@@ -187,14 +188,13 @@ fn validate_is_variables_have_same_category(
     }
 
     conjunction.nested_patterns().iter().try_for_each(|nested| match nested {
-        NestedPattern::Disjunction(disjunction) => disjunction
+        NestedPatternBuilder::Disjunction(disjunction) => disjunction
             .conjunctions()
-            .iter()
             .try_for_each(|inner| validate_is_variables_have_same_category(inner, variable_registry)),
-        NestedPattern::Negation(negation) => {
+        NestedPatternBuilder::Negation(negation) => {
             validate_is_variables_have_same_category(negation.conjunction(), variable_registry)
         }
-        NestedPattern::Optional(optional) => {
+        NestedPatternBuilder::Optional(optional) => {
             validate_is_variables_have_same_category(optional.conjunction(), variable_registry)
         }
     })?;
@@ -202,12 +202,259 @@ fn validate_is_variables_have_same_category(
     Ok(())
 }
 
+fn validate_all_required_variables_can_be_bound(
+    block: &BlockBuilder<'_>,
+    block_binding_modes: &HashMap<Variable, BindingMode>,
+    variable_registry: &VariableRegistry,
+) -> Result<(), Box<RepresentationError>> {
+    for (var, mode) in block_binding_modes.iter() {
+        if mode.is_require_prebound() {
+            let mut all_spans = Vec::new();
+            find_constraints_referencing_variable(&block.conjunction, *var, &mut all_spans);
+            let variable = variable_registry.get_variable_name_or_unnamed(*var).to_owned();
+            let source_span = variable_registry.source_span(*var);
+            return Err(Box::new(RepresentationError::UnboundRequiredVariable {
+                variable,
+                source_span,
+                _all_spans: all_spans,
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn find_constraints_referencing_variable(conjunction: &ConjunctionBuilder, variable: Variable, spans: &mut Vec<Span>) {
+    spans.extend(
+        conjunction.constraints().iter().filter(|c| c.ids().contains(&variable)).filter_map(|c| c.source_span()),
+    );
+    conjunction.nested_patterns().iter().for_each(|nested| match nested {
+        NestedPatternBuilder::Disjunction(disjunction) => {
+            disjunction.conjunctions().for_each(|c| find_constraints_referencing_variable(c, variable, spans));
+        }
+        NestedPatternBuilder::Negation(negation) => {
+            find_constraints_referencing_variable(negation.conjunction(), variable, spans)
+        }
+        NestedPatternBuilder::Optional(optional) => {
+            find_constraints_referencing_variable(optional.conjunction(), variable, spans)
+        }
+    })
+}
+
+fn validate_optional_returns(
+    context: &BlockBuilderContext<'_>,
+    conjunction: &ConjunctionBuilder,
+) -> Result<(), Box<RepresentationError>> {
+    let mut optional_assignments = HashMap::new();
+    validate_optional_returns_recursive(context, conjunction, &mut optional_assignments)
+}
+
+fn validate_optional_returns_recursive(
+    context: &BlockBuilderContext<'_>,
+    conjunction: &ConjunctionBuilder,
+    acc: &mut HashMap<Variable, Option<Span>>,
+) -> Result<(), Box<RepresentationError>> {
+    let conjunction_binding_modes = conjunction.variable_binding_modes();
+    conjunction.nested_patterns().iter().try_for_each(|nested| match nested {
+        NestedPatternBuilder::Disjunction(disjunction) => {
+            disjunction.conjunctions().try_for_each(|branch| validate_optional_returns_recursive(context, branch, acc))
+        }
+        NestedPatternBuilder::Negation(negation) => {
+            validate_optional_returns_recursive(context, negation.conjunction(), acc)
+        }
+        NestedPatternBuilder::Optional(optional) => {
+            validate_optional_returns_recursive(context, optional.conjunction(), acc)
+        }
+    })?;
+    conjunction.constraints().iter().filter_map(|c| c.as_function_call_binding()).for_each(|call| {
+        for (var, mode) in call.binding_modes() {
+            if mode == BindingMode::OptionallyBinding {
+                acc.insert(var, call.source_span());
+            }
+        }
+    });
+    // Check at each level
+    let reused_optional_return_opt = acc.iter().find(|(var, _)| match conjunction_binding_modes.get(var) {
+        None => false,
+        Some(mode) => *mode != BindingMode::OptionallyBinding,
+    });
+    if let Some((var, &source_span)) = reused_optional_return_opt {
+        let variable = context.get_variable_name_or_unnamed(*var).to_owned();
+        // TODO: This has to wait till we finalize the spec
+        // // Err(Box::new(RepresentationError::OptionalFunctionReturnReferenced { variable, source_span }))
+        // use error::TypeDBError;
+        // tracing::warn!(
+        //     "Function call reuses optionally assigned variable. This will fail in the next version:\n{}",
+        //     RepresentationError::OptionalFunctionReturnReferenced { variable, source_span }.format_description()
+        // );
+        Ok(())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_is_plannable(
+    conjunction: &Conjunction,
+    input_variables: &BTreeSet<Variable>,
+    variable_registry: &VariableRegistry,
+) -> Result<(), Box<RepresentationError>> {
+    validate_conjunction_has_valid_constraint_ordering(conjunction, input_variables, variable_registry)?;
+    // Note: Passing ONLY required inputs may be too strict if we change behaviour in future.
+    // Then just push this recursive check alongside the shallow check in the _impl method.
+    conjunction.nested_patterns().iter().try_for_each(|nested| match nested {
+        NestedPattern::Disjunction(disjunction) => {
+            let inner_inputs = disjunction.required_inputs().collect();
+            disjunction
+                .conjunctions()
+                .iter()
+                .try_for_each(|inner| validate_is_plannable(inner, &inner_inputs, variable_registry))
+        }
+        NestedPattern::Optional(inner) => {
+            let inner_inputs = inner.required_inputs().collect();
+            validate_is_plannable(inner.conjunction(), &inner_inputs, variable_registry)
+        }
+        NestedPattern::Negation(inner) => {
+            let inner_inputs = inner.required_inputs().collect();
+            validate_is_plannable(inner.conjunction(), &inner_inputs, variable_registry)
+        }
+    })?;
+    Ok(())
+}
+
+fn validate_conjunction_has_valid_constraint_ordering(
+    conjunction: &Conjunction,
+    input_variables: &BTreeSet<Variable>,
+    variable_registry: &VariableRegistry,
+) -> Result<(), Box<RepresentationError>> {
+    let constraint_at = |i: usize| &conjunction.constraints()[i];
+
+    let disjunction_at = |i: usize| conjunction.nested_patterns()[i].as_disjunction().unwrap();
+
+    let mut remaining_constraint_indices: HashSet<usize> =
+        conjunction.constraints().iter().enumerate().map(|(i, _)| i).collect();
+    let mut remaining_disjunction_indices: HashSet<usize> =
+        conjunction.nested_patterns().iter().positions(|n| n.as_disjunction().is_some()).collect();
+
+    let mut bound_variables = input_variables.clone();
+
+    loop {
+        let enabled_constraint_indices = remaining_constraint_indices
+            .iter()
+            .copied()
+            .filter(|i| {
+                let mut required_vars =
+                    constraint_at(*i).binding_modes().filter_map(|(id, mode)| mode.is_require_prebound().then_some(id));
+                required_vars.all(|v| bound_variables.contains(&v))
+            })
+            .collect::<HashSet<usize>>();
+        let fresh_constraint_vars = enabled_constraint_indices.iter().flat_map(|i| constraint_at(*i).ids());
+
+        let enabled_disjunction_indices = remaining_disjunction_indices
+            .iter()
+            .copied()
+            .filter(|i| {
+                let mut required_vars = disjunction_at(*i).required_inputs();
+                required_vars.all(|v| bound_variables.contains(&v))
+            })
+            .collect::<HashSet<usize>>();
+        let fresh_disjunction_vars =
+            enabled_disjunction_indices.iter().flat_map(|i| disjunction_at(*i).visible_referenced_variables());
+
+        remaining_constraint_indices.retain(|i| !enabled_constraint_indices.contains(i));
+        remaining_disjunction_indices.retain(|i| !enabled_disjunction_indices.contains(i));
+
+        bound_variables.extend(fresh_constraint_vars);
+        bound_variables.extend(fresh_disjunction_vars);
+        if enabled_constraint_indices.is_empty() && enabled_disjunction_indices.is_empty() {
+            break;
+        }
+    }
+    let remaining_constraints = remaining_constraint_indices.iter().map(|i| constraint_at(*i));
+    let remaining_nested_patterns = conjunction
+        .nested_patterns()
+        .iter()
+        .enumerate()
+        .filter(|(i, nested)| {
+            match nested {
+                NestedPattern::Disjunction(_) => {
+                    remaining_disjunction_indices.contains(i) // In remaining_disjunction_indices,
+                }
+                NestedPattern::Optional(optional) => {
+                    optional.required_inputs().any(|id| !bound_variables.contains(&id))
+                }
+                NestedPattern::Negation(negation) => {
+                    negation.required_inputs().any(|id| !bound_variables.contains(&id))
+                }
+            }
+        })
+        .map(|(i, nested)| nested);
+    let unplannable_constraints = UnplannableConstraints::build(
+        &bound_variables,
+        variable_registry,
+        remaining_constraints,
+        remaining_nested_patterns,
+    );
+    if unplannable_constraints.constraints_and_requirements.is_empty() {
+        Ok(())
+    } else {
+        let earliest_span = unplannable_constraints
+            .constraints_and_requirements
+            .iter()
+            .filter_map(|(_, _, span)| *span)
+            .min_by_key(|span| span.begin_offset);
+        Err(Box::new(RepresentationError::UnplannableConjunction { span: earliest_span, unplannable_constraints }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UnplannableConstraints {
+    constraints_and_requirements: Vec<(String, String, Option<Span>)>,
+}
+
+impl UnplannableConstraints {
+    fn build<'conj>(
+        bound_variables: &BTreeSet<Variable>,
+        variable_registry: &VariableRegistry,
+        remaining_constraints: impl Iterator<Item = &'conj Constraint<Variable>>,
+        remaining_nested_patterns: impl Iterator<Item = &'conj NestedPattern>,
+    ) -> Self {
+        macro_rules! unsatisfied_vars {
+            ($iter:expr) => {
+                $iter
+                    .filter(|id| !bound_variables.contains(id))
+                    .map(|id| variable_registry.get_variable_name_or_unnamed(id))
+                    .join(", ")
+            };
+        }
+        let mut constraints_and_requirements = Vec::new();
+        constraints_and_requirements.extend(remaining_constraints.map(|c| {
+            let required_vars = c.binding_modes().filter_map(|(id, mode)| mode.is_require_prebound().then_some(id));
+            (c.name().to_owned(), unsatisfied_vars!(required_vars), c.source_span())
+        }));
+        constraints_and_requirements.extend(remaining_nested_patterns.map(|nested| {
+            let (name, required_vars) = match nested {
+                NestedPattern::Disjunction(disj) => ("Disjunction", unsatisfied_vars!(disj.required_inputs())),
+                NestedPattern::Negation(negation) => ("Negation", unsatisfied_vars!(negation.required_inputs())),
+                NestedPattern::Optional(optional) => ("Optional", unsatisfied_vars!(optional.required_inputs())),
+            };
+            (name.to_owned(), required_vars, nested.source_span())
+        }));
+        Self { constraints_and_requirements }
+    }
+}
+
+impl fmt::Display for UnplannableConstraints {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (name, required_vars, _span) in &self.constraints_and_requirements {
+            writeln!(f, "- {name}: [{required_vars}]")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct BlockContext {
-    variable_declaration: HashMap<Variable, ScopeId>,
-    scope_parents: HashMap<ScopeId, ScopeId>,
-    referenced_variables: HashSet<Variable>,
-    scope_types: HashMap<ScopeId, ScopeType>,
+    input_variables: HashSet<Variable>,
+    variable_declaration: HashSet<Variable>,
 }
 
 impl BlockContext {
@@ -216,106 +463,21 @@ impl BlockContext {
     }
 
     fn add_input_declaration(&mut self, var: Variable) {
-        self.variable_declaration.insert(var, ScopeId::INPUT);
+        self.add_variable_declaration(var);
+        self.input_variables.insert(var);
     }
 
-    fn add_variable_declaration(&mut self, var: Variable, scope: ScopeId) {
-        self.variable_declaration.insert(var, scope);
-        self.add_referenced_variable(var);
+    fn add_variable_declaration(&mut self, var: Variable) {
+        self.variable_declaration.insert(var);
     }
 
-    fn declare_scope(&mut self, scope_id: ScopeId, scope_type: ScopeType) {
-        debug_assert!(!self.scope_types.contains_key(&scope_id));
-        self.scope_types.insert(scope_id, scope_type);
+    fn is_block_input_variable(&self, var: &Variable) -> bool {
+        self.input_variables.contains(var)
     }
 
-    fn set_scope_parent(&mut self, scope_id: ScopeId, parent_scope_id: ScopeId) {
-        debug_assert!(self.scope_types.contains_key(&scope_id));
-        self.scope_parents.insert(scope_id, parent_scope_id);
+    fn registered_variables(&self) -> impl Iterator<Item = Variable> + '_ {
+        self.variable_declaration.iter().copied()
     }
-
-    fn may_update_declaration_scope(
-        &mut self,
-        var: Variable,
-        var_name: &str,
-        source_span: Option<Span>,
-        scope: ScopeId,
-    ) -> Result<(), Box<RepresentationError>> {
-        debug_assert!(self.variable_declaration.contains_key(&var));
-        self.add_referenced_variable(var);
-        let recorded_scope = self.variable_declaration[&var];
-        if is_equal_or_parent_scope(&self.scope_parents, scope, recorded_scope) {
-            // Parent defines same name: ok, reuse the variable
-        } else if is_child_scope(&self.scope_parents, scope, recorded_scope) {
-            // Child defines the same name: ok, reuse the variable, and change the declaration scope to the current one
-            *self.variable_declaration.get_mut(&var).unwrap() = scope;
-        } else {
-            // Sibling scope declares the name
-            // This could be "{ A(x) } or { B(x) }" or "{ A(x) } or { B(y) }; { C(x) } or { D(y) };"
-            // or even " not { A(x) }; not { B(x) }; "
-            // These same-named variables will for now be all treated as identical so the constraints using assigned VarId don't have to get rewritten later
-            // Future: we can allow scope-local variables with re-use across branches by always assigning new variables and equating them elsewhere
-            // In these cases the 'x' and 'y' declarations will be pulled up the root conjunction
-            // We can only later validate the requirements about whether each pattern conforms to the required variable usages & visibility
-
-            let ancestor = lowest_common_ancestor(&self.scope_parents, recorded_scope, scope);
-            let ancestor_conjunction =
-                lowest_parent_conjunction_or_negation(&self.scope_parents, &self.scope_types, ancestor);
-            *self.variable_declaration.get_mut(&var).unwrap() = ancestor_conjunction;
-        }
-        Ok(())
-    }
-
-    pub fn get_declaring_scope(&self, var: &Variable) -> Option<ScopeId> {
-        self.variable_declaration.get(var).cloned()
-    }
-
-    fn add_referenced_variable(&mut self, var: Variable) {
-        self.referenced_variables.insert(var);
-    }
-
-    pub fn referenced_variables(&self) -> impl Iterator<Item = Variable> + '_ {
-        self.referenced_variables.iter().copied()
-    }
-
-    pub fn is_variable_available_in(&self, scope: ScopeId, variable: Variable) -> bool {
-        let variable_scope = self.variable_declaration.get(&variable);
-        let in_scope = variable_scope
-            .is_some_and(|variable_scope| is_equal_or_parent_scope(&self.scope_parents, scope, *variable_scope));
-        in_scope
-    }
-
-    pub fn is_child_scope(&self, child: ScopeId, ancestor: ScopeId) -> bool {
-        let Some(&parent) = self.scope_parents.get(&child) else { return false };
-        parent == ancestor || self.is_child_scope(parent, ancestor)
-    }
-
-    pub fn variable_locality_in_scope(&self, var: Variable, scope: ScopeId) -> VariableLocality {
-        let var_scope = self.variable_declaration[&var];
-        if var_scope == scope {
-            VariableLocality::Local
-        } else if self.is_child_scope(scope, var_scope) {
-            VariableLocality::Parent
-        } else {
-            VariableLocality::None // or an error
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VariableLocality {
-    Parent,
-    Local,
-    None,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScopeType {
-    Input,
-    Conjunction,
-    Disjunction,
-    Negation,
-    Optional,
 }
 
 #[derive(Debug)]
@@ -338,9 +500,6 @@ impl<'a> BlockBuilderContext<'a> {
         available_input_names.values().for_each(|v| {
             block_context.add_input_declaration(*v);
         });
-        block_context.declare_scope(ScopeId::ROOT, ScopeType::Conjunction);
-        block_context.declare_scope(ScopeId::INPUT, ScopeType::Input);
-        block_context.set_scope_parent(ScopeId::ROOT, ScopeId::INPUT);
         Self {
             variable_registry,
             variable_names_index: available_input_names,
@@ -358,64 +517,47 @@ impl<'a> BlockBuilderContext<'a> {
         self.variable_registry.get_variable_name(variable)
     }
 
-    pub(crate) fn get_parent_scope(&self, scope: ScopeId) -> Option<ScopeId> {
-        self.block_context.scope_parents.get(&scope).copied()
-    }
-
-    pub(crate) fn get_scope_type(&self, scope: ScopeId) -> ScopeType {
-        debug_assert!(self.block_context.scope_types.contains_key(&scope));
-        *self.block_context.scope_types.get(&scope).unwrap()
+    pub(crate) fn get_variable_name_or_unnamed(&self, variable: Variable) -> &str {
+        self.variable_registry.get_variable_name_or_unnamed(variable)
     }
 
     pub(crate) fn get_or_declare_variable(
         &mut self,
         name: &str,
-        scope: ScopeId,
         source_span: Option<Span>,
     ) -> Result<Variable, Box<RepresentationError>> {
         match self.variable_names_index.get(name) {
             None => {
                 let variable = self.variable_registry.register_variable_named(name.to_string(), source_span)?;
-                self.block_context.add_variable_declaration(variable, scope);
+                self.block_context.add_variable_declaration(variable);
                 self.variable_names_index.insert(name.to_string(), variable);
                 Ok(variable)
             }
-            Some(&existing_variable) => {
-                self.block_context.may_update_declaration_scope(
-                    existing_variable,
-                    name,
-                    self.variable_registry.source_span(existing_variable),
-                    scope,
-                )?;
-                Ok(existing_variable)
-            }
+            Some(&existing_variable) => Ok(existing_variable),
         }
     }
 
     pub(crate) fn create_anonymous_variable(
         &mut self,
-        scope: ScopeId,
         source_span: Option<Span>,
     ) -> Result<Variable, Box<RepresentationError>> {
         let variable = self.variable_registry.register_anonymous_variable(source_span)?;
-        self.block_context.add_variable_declaration(variable, scope);
+        self.block_context.add_variable_declaration(variable);
         Ok(variable)
     }
 
-    pub fn is_variable_available_in(&self, scope: ScopeId, variable: Variable) -> bool {
-        self.block_context.is_variable_available_in(scope, variable)
+    pub(crate) fn is_block_input_variable(&self, variable: Variable) -> bool {
+        self.block_context.is_block_input_variable(&variable)
     }
 
-    pub(crate) fn is_variable_input(&self, variable: Variable) -> bool {
-        self.block_context.variable_declaration.get(&variable) == Some(&ScopeId::INPUT)
+    pub(crate) fn input_variables(&self) -> impl Iterator<Item = Variable> + '_ {
+        self.block_context.registered_variables().filter(|var| self.is_block_input_variable(*var))
     }
 
-    pub(crate) fn create_child_scope(&mut self, parent: ScopeId, scope_type: ScopeType) -> ScopeId {
+    pub(crate) fn next_scope_id(&mut self) -> ScopeId {
         let scope = ScopeId::new(self.scope_id_allocator);
         debug_assert_ne!(scope, ScopeId::ROOT);
         self.scope_id_allocator += 1;
-        self.block_context.declare_scope(scope, scope_type);
-        self.block_context.set_scope_parent(scope, parent);
         scope
     }
 
@@ -432,39 +574,7 @@ impl<'a> BlockBuilderContext<'a> {
         self.variable_registry.set_variable_is_optional(variable, is_optional);
     }
 
-    pub fn parameters(&mut self) -> &mut ParameterRegistry {
+    pub(crate) fn parameters(&mut self) -> &mut ParameterRegistry {
         self.parameters
-    }
-}
-
-fn is_equal_or_parent_scope(parents: &HashMap<ScopeId, ScopeId>, scope: ScopeId, maybe_parent: ScopeId) -> bool {
-    scope == maybe_parent || parents.get(&scope).is_some_and(|&p| is_equal_or_parent_scope(parents, p, maybe_parent))
-}
-
-fn is_child_scope(parents: &HashMap<ScopeId, ScopeId>, scope: ScopeId, maybe_child: ScopeId) -> bool {
-    parents.get(&maybe_child).is_some_and(|&c| c == scope || is_child_scope(parents, scope, c))
-}
-
-fn lowest_common_ancestor(parents: &HashMap<ScopeId, ScopeId>, left: ScopeId, right: ScopeId) -> ScopeId {
-    if left == right || is_child_scope(parents, left, right) {
-        left
-    } else if is_child_scope(parents, right, left) {
-        right
-    } else {
-        lowest_common_ancestor(parents, parents[&left], parents[&right])
-    }
-}
-
-fn lowest_parent_conjunction_or_negation(
-    parents: &HashMap<ScopeId, ScopeId>,
-    scope_types: &HashMap<ScopeId, ScopeType>,
-    scope_id: ScopeId,
-) -> ScopeId {
-    debug_assert!(scope_types.contains_key(&scope_id));
-    let scope_type = *scope_types.get(&scope_id).unwrap();
-    if scope_type == ScopeType::Conjunction || scope_type == ScopeType::Negation {
-        scope_id
-    } else {
-        lowest_parent_conjunction_or_negation(parents, scope_types, *parents.get(&scope_id).unwrap())
     }
 }

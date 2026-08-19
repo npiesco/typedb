@@ -24,6 +24,11 @@ pub(crate) mod reduce_executor;
 pub mod row;
 pub mod write;
 
+pub use instruction::{
+    has_executor::HasExecutor, has_reverse_executor::HasReverseExecutor, iterator::TupleIterator,
+    links_executor::LinksExecutor, tuple::Tuple,
+};
+
 // TODO: use a bit-vec, since we have a continuously allocated range of positions
 // ---> for now, using a byte vec, which is 8x wasteful and on the heap!
 #[derive(Debug)]
@@ -54,6 +59,7 @@ pub enum InterruptType {
     TransactionRolledback,
     WriteQueryExecution,
     SchemaQueryExecution,
+    DatabaseImportAborted,
 }
 
 impl fmt::Display for InterruptType {
@@ -64,6 +70,7 @@ impl fmt::Display for InterruptType {
             InterruptType::TransactionRolledback => write!(f, "transaction rollback"),
             InterruptType::WriteQueryExecution => write!(f, "write query"),
             InterruptType::SchemaQueryExecution => write!(f, "schema query"),
+            InterruptType::DatabaseImportAborted => write!(f, "database import abort"),
         }
     }
 }
@@ -93,7 +100,9 @@ impl ExecutionInterrupt {
                 Ok(type_) => Some(type_),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Closed) | Err(TryRecvError::Lagged(_)) => {
-                    unreachable!("Unexpected interrupt signal state. They should never be lagged or closed before cleaning up the receivers.")
+                    unreachable!(
+                        "Unexpected interrupt signal state. They should never be lagged or closed before cleaning up the receivers."
+                    )
                 }
             },
         }
@@ -119,7 +128,7 @@ impl Provenance {
         }
     }
 
-    pub fn branch_ids(&self) -> impl Iterator<Item = BranchID> {
+    pub fn branch_ids(&self) -> impl Iterator<Item = BranchID> + use<> {
         let provenance = self.0;
         (0..64).filter(move |id| 0 != provenance & (1 << id)).map(|id| BranchID(id))
     }

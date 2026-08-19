@@ -5,10 +5,9 @@
  */
 
 use encoding::graph::type_::Kind;
-use macro_rules_attribute::apply;
 use params;
 
-use crate::{generic_step, Context};
+use crate::Context;
 
 #[cucumber::then(expr = r"{kind} {var} {exists_or_doesnt}")]
 async fn object_exists(

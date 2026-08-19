@@ -6,16 +6,20 @@
 
 use std::sync::Arc;
 
+use diagnostics::metrics::FsyncMetrics;
 use durability::wal::WAL;
 use encoding::EncodingKeyspace;
-use storage::{durability_client::WALClient, MVCCStorage};
-use test_utils::{create_tmp_dir, init_logging, TempDir};
+use storage::{MVCCStorage, durability_client::WALClient};
+use test_utils::{TempDir, create_tmp_storage_dir, init_logging};
+use test_utils_storage::create_rocks_resources;
 
 pub fn create_core_storage() -> (TempDir, Arc<MVCCStorage<WALClient>>) {
     init_logging();
-    let storage_path = create_tmp_dir();
-    let wal = WAL::create(&storage_path).unwrap();
-    let storage =
-        Arc::new(MVCCStorage::create::<EncodingKeyspace>("db_storage", &storage_path, WALClient::new(wal)).unwrap());
+    let storage_path = create_tmp_storage_dir();
+    let wal = WAL::create(&storage_path, FsyncMetrics::disabled()).unwrap();
+    let resources = create_rocks_resources();
+    let storage = Arc::new(
+        MVCCStorage::create::<EncodingKeyspace>("db_storage", &storage_path, WALClient::new(wal), &resources).unwrap(),
+    );
     (storage_path, storage)
 }

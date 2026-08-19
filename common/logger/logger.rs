@@ -6,14 +6,14 @@
 
 #![allow(unexpected_cfgs)]
 
-use std::{fs, io::stdout, path::PathBuf};
+use std::{fs, io::stderr, path::PathBuf};
 
-use tracing::{self, dispatcher::DefaultGuard, metadata::LevelFilter, Level};
+use tracing::{self, Level, dispatcher::DefaultGuard, metadata::LevelFilter};
 pub use tracing::{debug, error, info, trace};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{
-    fmt::{writer::Tee, SubscriberBuilder},
     EnvFilter,
+    fmt::{SubscriberBuilder, writer::Tee},
 };
 
 use crate::log_panic::log_panic;
@@ -23,8 +23,9 @@ pub mod result;
 
 pub fn initialise_logging_global(logdir: &PathBuf) {
     debug_assert!(logdir.is_absolute());
-    let filter = EnvFilter::from_default_env()
-        .add_directive(LevelFilter::INFO.into())
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy()
         // .add_directive("database=trace".parse().unwrap())
         // .add_directive("server=trace".parse().unwrap())
         // .add_directive("storage=trace".parse().unwrap())
@@ -40,7 +41,7 @@ pub fn initialise_logging_global(logdir: &PathBuf) {
     let subscriber = SubscriberBuilder::default()
         .with_max_level(Level::TRACE)
         .with_env_filter(filter)
-        .with_writer(Tee::new(stdout, file_appender))
+        .with_writer(Tee::new(stderr, file_appender))
         .with_ansi(false) // Disable ANSI colors in file output
         .with_thread_ids(true)
         .with_target(false)

@@ -11,10 +11,10 @@ use encoding::{
     graph::{
         definition::r#struct::StructDefinition,
         type_::{
+            CapabilityKind, Kind,
             edge::TypeEdgeEncoding,
             property::{TypeEdgePropertyEncoding, TypeVertexPropertyEncoding},
             vertex::{TypeVertex, TypeVertexEncoding},
-            CapabilityKind, Kind,
         },
     },
     layout::infix::Infix,
@@ -30,10 +30,11 @@ use serde::{Deserialize, Serialize};
 use storage::snapshot::{ReadableSnapshot, WritableSnapshot};
 
 use crate::{
+    ConceptAPI,
     error::{ConceptReadError, ConceptWriteError},
-    thing::{thing_manager::ThingManager, ThingAPI},
+    thing::{ThingAPI, thing_manager::ThingManager},
     type_::{
-        annotation::{Annotation, AnnotationCardinality, AnnotationError},
+        annotation::{Annotation, AnnotationCardinality, AnnotationError, HasAnnotationCategory},
         attribute_type::AttributeType,
         constraint::{CapabilityConstraint, Constraint, TypeConstraint},
         object_type::ObjectType,
@@ -42,7 +43,6 @@ use crate::{
         role_type::RoleType,
         type_manager::TypeManager,
     },
-    ConceptAPI,
 };
 
 pub mod annotation;
@@ -189,7 +189,12 @@ pub trait TypeAPI: ConceptAPI + TypeVertexEncoding + Copy + Sized + Hash + Eq {
 }
 
 pub trait KindAPI: TypeAPI {
-    type AnnotationType: Hash + Eq + Clone + TryFrom<Annotation, Error = AnnotationError> + Into<Annotation>;
+    type AnnotationType: Hash
+        + Eq
+        + Clone
+        + TryFrom<Annotation, Error = AnnotationError>
+        + Into<Annotation>
+        + HasAnnotationCategory;
     const KIND: Kind;
 
     fn get_annotations_declared<'this>(
@@ -223,13 +228,16 @@ pub trait KindAPI: TypeAPI {
         let label = self.get_label(snapshot, type_manager)?;
         write!(f, "\n{} {}", Self::KIND, label.scoped_name().as_str()).map_err(|err| Box::new(err.into()))?;
         self.type_annotations_syntax(f, snapshot, type_manager)?;
-        if let Some(supertype) = self.get_supertype(snapshot, type_manager)? {
-            let supertype_label = supertype.get_label(snapshot, type_manager)?;
-            write!(f, ",\n  {} {}", typeql::token::Keyword::Sub, supertype_label.name.as_str())
-                .map_err(|err| Box::new(err.into()))?;
-        }
+        self.sub_syntax(f, snapshot, type_manager)?;
         Ok(())
     }
+
+    fn sub_syntax(
+        &self,
+        f: &mut impl std::fmt::Write,
+        snapshot: &impl ReadableSnapshot,
+        type_manager: &TypeManager,
+    ) -> Result<(), Box<ConceptReadError>>;
 
     fn type_annotations_syntax(
         &self,
@@ -754,7 +762,8 @@ impl fmt::Display for Ordering {
 impl TypeVertexPropertyEncoding for Ordering {
     const INFIX: Infix = Infix::PropertyOrdering;
 
-    fn from_value_bytes(value: &[u8]) -> Ordering {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         bincode::deserialize(value).unwrap()
     }
 
@@ -766,7 +775,8 @@ impl TypeVertexPropertyEncoding for Ordering {
 impl TypeEdgePropertyEncoding for Ordering {
     const INFIX: Infix = Infix::PropertyOrdering;
 
-    fn from_value_bytes(value: &[u8]) -> Ordering {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Ordering {
+        debug_assert!(key.is_empty());
         bincode::deserialize(value).unwrap()
     }
 
@@ -787,7 +797,8 @@ impl fmt::Display for Independent {
 impl TypeVertexPropertyEncoding for Independent {
     const INFIX: Infix = Infix::PropertyRelationTypeIndependent;
 
-    fn from_value_bytes(value: &[u8]) -> Independent {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         bincode::deserialize(value).unwrap()
     }
 
@@ -799,12 +810,17 @@ impl TypeVertexPropertyEncoding for Independent {
 pub trait Capability:
     TypeEdgeEncoding<From = Self::ObjectType, To = Self::InterfaceType> + Sized + Copy + Hash + Eq + 'static
 {
-    type AnnotationType: Hash + Eq + Clone + TryFrom<Annotation, Error = AnnotationError> + Into<Annotation>;
+    type AnnotationType: Hash
+        + Eq
+        + Clone
+        + TryFrom<Annotation, Error = AnnotationError>
+        + Into<Annotation>
+        + HasAnnotationCategory;
     type ObjectType: TypeAPI;
     type InterfaceType: KindAPI;
     const KIND: CapabilityKind;
 
-    fn new(object_type: Self::ObjectType, attribute_type: Self::InterfaceType) -> Self;
+    fn new(object_type: Self::ObjectType, interface_type: Self::InterfaceType) -> Self;
 
     fn object(&self) -> Self::ObjectType;
 

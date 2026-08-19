@@ -1,59 +1,45 @@
 **Download from TypeDB Package Repository:**
 
-[Distributions for 3.8.1](https://cloudsmith.io/~typedb/repos/public-release/packages/?q=name%3A%5Etypedb-all+version%3A3.8.1)
+[Distributions for 3.12.3](https://cloudsmith.io/~typedb/repos/public-release/packages/?q=name%3A%5Etypedb-all+version%3A3.12.3)
 
 **Pull the Docker image:**
 
-```docker pull typedb/typedb:3.8.1```
+```docker pull typedb/typedb:3.12.3```
 
+
+## New Features
 
 
 ## Bugs Fixed
-- **Fix lowering so equality checks against variables can be inlined to iterators**
-  Fixes a bug which prevented statements of the form `$a isa attribute-type == $value;` from efficiently retrieving attribute instances. It worked fine when a literal was used as value.
+- **Fix database import blockers on inherited constraints**
   
+  In specific situations, database import could be incorrectly rejected while relaxing or recovering the schema due to coincidental combinations of inherited constraints. We fix these cases completely.
   
-- **Fix output variables in analyzed structure**
-  We were using `named_referenced_variables` of the last stage to determine the output variables of a pipeline. 
-  We replace this with a method based on `variable_binding_modes` or the retained variables for select & reduce stages.
+  ### Independent sub attributes
+  
+  Independent sub attributes could lead to rejects on schema relaxation. At this stage, every attribute type must become independent so as not to lose data. However, double redeclarations of such annotations are prohibited, and an incorrectly working algorithm could produce a schema like `define attribute name @independent, value string; attribute surname @independent, sub name;`.
+  
+  ### Ownerships and roleplaying specializations
+  
+  A similar problem with `owns` and `plays` specializations using the same interface types (e.g., `define superperson owns name @card(0..); define person sub superperson, owns name @card(1..);`.
+  
+  While the algorithm correctly avoided conflicts in declared cardinalities, it could still have rare conflicts with other annotations, which, with the change of cardinality-based constraints, could lead to identical `owns`/`plays` declarations (which is, just like in the `attribute @independent` case, is prohibited). 
   
   
 
+## Code Refactors
+- **Add specific error message for 'Attribute' and 'Value' mismatch**
+  
+  Add a correction hint that help people fix Attribute and Value concept mismatches themselves.
+  
+  
 
 ## Other Improvements
-- **Optimize isolation checks - 5-20% multithreaded insert performance**
-  
-  We update one loop in the isolation manager on the hot path, which improves throughput under heavily contended write workloads with many threads by 5-20%, and is in the noise at other thread counts. 
-  
-  Benchmarked using an embedded TypeDB benchmark to exclude network and driver noise.
+- **Fix add_or_intersect change condition**
+  Fixes the condition that determines whether add_or_intersect changed the type annotations of the vertex
   
   
-  ```
-    PureInsert batch=1000                                       
+- **Move unit tests from type-inference to match-inference**
+  Straight copy paste + update imports.
   
-  Query >>
-  
-  insert $p isa person, has name "person_{N}", has age {random};        
-                                                                                                                                                                 
-    ┌─────────┬──────────────┬────────────────┬────────────────────┐   
-    │ Threads │ master       │ adaptive       │ adaptive vs master │                                
-    ├─────────┼──────────────┼────────────────┼────────────────────┤                        
-    │       1 │       11,739 │         11,520 │              -1.9% │                                                                                                                                                                                   
-    ├─────────┼──────────────┼────────────────┼────────────────────┤
-    │       2 │       21,880 │         22,160 │              +1.3% │
-    ├─────────┼──────────────┼────────────────┼────────────────────┤
-    │       4 │       41,510 │         39,779 │              -4.2% │
-    ├─────────┼──────────────┼────────────────┼────────────────────┤
-    │       8 │       67,245 │         64,519 │              -4.1% │
-    ├─────────┼──────────────┼────────────────┼────────────────────┤
-    │      16 │       60,863 │         65,620 │              +7.8% │
-    ├─────────┼──────────────┼────────────────┼────────────────────┤
-    │      32 │       57,827 │         72,347 │             +25.1% │
-    └─────────┴──────────────┴────────────────┴────────────────────┘
-  ```
-  
-  
-- **Use Box in InitialIterator to shrink pipeline stage iterator sizes**
-  Shrinks the size of InitialIterator by using a Box around its inner iterator. This reduces the size of the pipeline stage iterator enums, leading to smaller stack frames during execution and supporting longer pipelines.
-  
-  
+    

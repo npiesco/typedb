@@ -5,20 +5,24 @@
  */
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use answer::variable::Variable;
 use compiler::{
-    annotation::{function::EmptyAnnotatedFunctionSignatures, match_inference::infer_types},
+    ExecutorVariable, VariablePosition,
+    annotation::{
+        PipelineAnnotationContext, function::EmptyAnnotatedFunctionSignatures,
+        inference::match_inference::infer_types_for_test_only,
+    },
     executable::{
         function::ExecutableFunctionRegistry,
         match_::{
             instructions::{
+                CheckInstruction, CheckVertex, ConstraintInstruction, Inputs,
                 thing::{HasReverseInstruction, IndexedRelationInstruction},
                 type_::TypeListInstruction,
-                CheckInstruction, CheckVertex, ConstraintInstruction, Inputs,
             },
             planner::{
                 conjunction_executable::{CheckStep, ConjunctionExecutable, ExecutionStep, IntersectionStep},
@@ -27,28 +31,27 @@ use compiler::{
         },
         next_executable_id,
     },
-    ExecutorVariable, VariablePosition,
 };
 use concept::{
     thing::object::ObjectAPI,
-    type_::{annotation::AnnotationCardinality, relates::RelatesAnnotation, Ordering, OwnerAPI, PlayerAPI},
+    type_::{Ordering, OwnerAPI, PlayerAPI, annotation::AnnotationCardinality, relates::RelatesAnnotation},
 };
 use encoding::value::{label::Label, value::Value, value_type::ValueType};
 use executor::{
-    error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext, row::MaybeOwnedRow,
-    ExecutionInterrupt,
+    ExecutionInterrupt, error::ReadExecutionError, match_executor::MatchExecutor, pipeline::stage::ExecutionContext,
+    row::MaybeOwnedRow,
 };
 use ir::{
     pattern::{
-        constraint::{Comparator, IsaKind},
         Vertex,
+        constraint::{Comparator, IsaKind},
     },
-    pipeline::{block::Block, ParameterRegistry},
+    pipeline::{ParameterRegistry, block::Block},
     translation::PipelineTranslationContext,
 };
 use lending_iterator::LendingIterator;
 use resource::profile::{CommitProfile, QueryProfile, StorageCounters};
-use storage::{durability_client::WALClient, snapshot::CommittableSnapshot, MVCCStorage};
+use storage::{MVCCStorage, durability_client::WALClient, snapshot::CommittableSnapshot};
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;
 use typeql::common::Span;
@@ -333,23 +336,19 @@ fn traverse_index_from_unbound() {
     conjunction.constraints_mut().add_label(var_casting_character_type, CASTING_CHARACTER_LABEL.clone()).unwrap();
 
     let entry = builder.finish().unwrap();
-    let value_parameters = Arc::new(value_parameters);
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
+    let value_parameters = Arc::new(value_parameters);
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping(
         [var_movie, var_character, var_casting],
@@ -437,7 +436,7 @@ fn traverse_index_from_unbound() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager.clone(), value_parameters.clone());
+    let context = ExecutionContext::new(snapshot, thing_manager.clone(), Arc::default(), value_parameters.clone());
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> = iterator
@@ -526,7 +525,7 @@ fn traverse_index_from_unbound() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, value_parameters);
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), value_parameters);
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> = iterator
@@ -592,18 +591,14 @@ fn traverse_index_from_bound() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping(
@@ -703,7 +698,7 @@ fn traverse_index_from_bound() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::new(value_parameters));
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::new(value_parameters));
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> = iterator
@@ -758,18 +753,14 @@ fn traverse_index_bound_role_type_filtered_correctly() {
 
     let snapshot = storage.clone().open_snapshot_read();
     let (type_manager, thing_manager) = load_managers(storage.clone(), None);
-    let variable_registry = &translation_context.variable_registry;
-    let previous_stage_variable_annotations = &BTreeMap::new();
-    let block_annotations = infer_types(
+    let mut ctx = PipelineAnnotationContext::new(
         &snapshot,
-        &entry,
-        variable_registry,
         &type_manager,
-        previous_stage_variable_annotations,
         &EmptyAnnotatedFunctionSignatures,
-        false,
-    )
-    .unwrap();
+        &mut translation_context.variable_registry,
+        &value_parameters,
+    );
+    let block_annotations = infer_types_for_test_only(&mut ctx, &entry, false).unwrap();
     let entry_annotations = block_annotations.type_annotations_of(entry.conjunction()).unwrap();
 
     let (row_vars, variable_positions, mapping, named_variables) = position_mapping(
@@ -789,11 +780,13 @@ fn traverse_index_bound_role_type_filtered_correctly() {
         // $0 type casting:movie
         ExecutionStep::Intersection(IntersectionStep::new(
             mapping[&var_casting_movie_type],
-            vec![ConstraintInstruction::TypeList(TypeListInstruction::new(
-                var_casting_movie_type,
-                entry_annotations.vertex_annotations_of(&Vertex::Variable(var_casting_movie_type)).unwrap().clone(),
-            ))
-            .map(&mapping)],
+            vec![
+                ConstraintInstruction::TypeList(TypeListInstruction::new(
+                    var_casting_movie_type,
+                    entry_annotations.vertex_annotations_of(&Vertex::Variable(var_casting_movie_type)).unwrap().clone(),
+                ))
+                .map(&mapping),
+            ],
             vec![variable_positions[&var_casting_movie_type]],
             &named_variables,
             1,
@@ -874,7 +867,7 @@ fn traverse_index_bound_role_type_filtered_correctly() {
     )
     .unwrap();
 
-    let context = ExecutionContext::new(snapshot, thing_manager, Arc::new(value_parameters));
+    let context = ExecutionContext::new(snapshot, thing_manager, Arc::default(), Arc::new(value_parameters));
     let iterator = executor.into_iterator(context, ExecutionInterrupt::new_uninterruptible());
 
     let rows: Vec<Result<MaybeOwnedRow<'static>, Box<ReadExecutionError>>> = iterator

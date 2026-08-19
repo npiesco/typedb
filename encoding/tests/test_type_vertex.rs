@@ -6,29 +6,31 @@
 
 use std::sync::Arc;
 
+use diagnostics::metrics::FsyncMetrics;
 use durability::wal::WAL;
 use encoding::{
+    AsBytes, EncodingKeyspace, Keyable,
     error::EncodingError,
     graph::{
+        Typed,
         type_::{
             vertex::{PrefixedTypeVertexEncoding, TypeID, TypeVertex, TypeVertexEncoding},
             vertex_generator::TypeVertexGenerator,
         },
-        Typed,
     },
     layout::prefix::Prefix,
-    AsBytes, EncodingKeyspace, Keyable,
 };
 use resource::profile::CommitProfile;
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     key_value::StorageKeyReference,
-    recovery::checkpoint::Checkpoint,
+    recovery::checkpoint::CheckpointWriter,
     snapshot::{CommittableSnapshot, WritableSnapshot},
-    MVCCStorage,
 };
-use test_utils::{create_tmp_dir, init_logging};
+use test_utils::{create_tmp_storage_dir, init_logging};
 use test_utils_encoding::create_core_storage;
+use test_utils_storage::create_rocks_resources;
 
 pub struct MockEntityType {
     vertex: TypeVertex,
@@ -130,21 +132,34 @@ fn max_entity_type_vertexes() {
 #[test]
 fn loading_storage_assigns_next_vertex() {
     init_logging();
-    let storage_path = create_tmp_dir();
+    let storage_path = create_tmp_storage_dir();
     {
-        let wal = WAL::create(&storage_path).unwrap();
+        let wal = WAL::create(&storage_path, FsyncMetrics::disabled()).unwrap();
+        let resources = create_rocks_resources();
         let _ = Arc::new(
-            MVCCStorage::<WALClient>::create::<EncodingKeyspace>("storage", &storage_path, WALClient::new(wal))
-                .unwrap(),
+            MVCCStorage::<WALClient>::create::<EncodingKeyspace>(
+                "storage",
+                &storage_path,
+                WALClient::new(wal),
+                &resources,
+            )
+            .unwrap(),
         );
     }
     let create_till = 5;
 
     for i in 0..create_till {
-        let wal = WAL::load(&storage_path).unwrap();
+        let wal = WAL::load(&storage_path, FsyncMetrics::disabled()).unwrap();
+        let resources = create_rocks_resources();
         let storage = Arc::new(
-            MVCCStorage::<WALClient>::load::<EncodingKeyspace>("storage", &storage_path, WALClient::new(wal), &None)
-                .unwrap(),
+            MVCCStorage::<WALClient>::load::<EncodingKeyspace>(
+                "storage",
+                &storage_path,
+                WALClient::new(wal),
+                &None,
+                &resources,
+            )
+            .unwrap(),
         );
         let mut snapshot = storage.clone().open_snapshot_write();
         let generator = TypeVertexGenerator::new();
@@ -155,10 +170,17 @@ fn loading_storage_assigns_next_vertex() {
     }
 
     for i in 0..create_till {
-        let wal = WAL::load(&storage_path).unwrap();
+        let wal = WAL::load(&storage_path, FsyncMetrics::disabled()).unwrap();
+        let resources = create_rocks_resources();
         let storage = Arc::new(
-            MVCCStorage::<WALClient>::load::<EncodingKeyspace>("storage", &storage_path, WALClient::new(wal), &None)
-                .unwrap(),
+            MVCCStorage::<WALClient>::load::<EncodingKeyspace>(
+                "storage",
+                &storage_path,
+                WALClient::new(wal),
+                &None,
+                &resources,
+            )
+            .unwrap(),
         );
         let mut snapshot = storage.clone().open_snapshot_write();
         let generator = TypeVertexGenerator::new();
@@ -171,7 +193,8 @@ fn loading_storage_assigns_next_vertex() {
     // try with checkpoints
     let mut checkpoint = None;
     for i in 0..create_till {
-        let wal = WAL::load(&storage_path).unwrap();
+        let wal = WAL::load(&storage_path, FsyncMetrics::disabled()).unwrap();
+        let resources = create_rocks_resources();
         let storage = match checkpoint {
             None => Arc::new(
                 MVCCStorage::<WALClient>::load::<EncodingKeyspace>(
@@ -179,6 +202,7 @@ fn loading_storage_assigns_next_vertex() {
                     &storage_path,
                     WALClient::new(wal),
                     &None,
+                    &resources,
                 )
                 .unwrap(),
             ),
@@ -188,6 +212,7 @@ fn loading_storage_assigns_next_vertex() {
                     &storage_path,
                     WALClient::new(wal),
                     &Some(checkpoint),
+                    &resources,
                 )
                 .unwrap(),
             ),
@@ -200,17 +225,23 @@ fn loading_storage_assigns_next_vertex() {
         assert_eq!(i, vertex.type_id_().as_u16());
         snapshot.commit(&mut CommitProfile::DISABLED).unwrap();
 
-        let check = Checkpoint::new(&storage_path).unwrap();
+        let check = CheckpointWriter::new(&storage_path).unwrap();
         storage.checkpoint(&check).unwrap();
-        check.finish().unwrap();
-        checkpoint = Some(check);
+        checkpoint = Some(check.finish().unwrap());
     }
 
     for i in 0..create_till {
-        let wal = WAL::load(&storage_path).unwrap();
+        let wal = WAL::load(&storage_path, FsyncMetrics::disabled()).unwrap();
+        let resources = create_rocks_resources();
         let storage = Arc::new(
-            MVCCStorage::<WALClient>::load::<EncodingKeyspace>("storage", &storage_path, WALClient::new(wal), &None)
-                .unwrap(),
+            MVCCStorage::<WALClient>::load::<EncodingKeyspace>(
+                "storage",
+                &storage_path,
+                WALClient::new(wal),
+                &None,
+                &resources,
+            )
+            .unwrap(),
         );
         let mut snapshot = storage.clone().open_snapshot_write();
         let generator = TypeVertexGenerator::new();

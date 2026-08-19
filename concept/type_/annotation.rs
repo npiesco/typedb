@@ -6,7 +6,7 @@
 
 use std::{
     borrow::Cow,
-    cmp::{max, min, Ordering},
+    cmp::{Ordering, max, min},
     collections::HashSet,
     fmt,
     hash::Hash,
@@ -14,23 +14,34 @@ use std::{
     ops::Add,
 };
 
-use bytes::{byte_array::ByteArray, Bytes};
+use bytes::{Bytes, byte_array::ByteArray};
 use encoding::{
-    graph::type_::property::{TypeEdgePropertyEncoding, TypeVertexPropertyEncoding},
+    graph::{
+        definition::definition_key::DefinitionKey,
+        type_::{
+            edge::TypeEdgeEncoding,
+            property::{
+                FunctionProperty, FunctionPropertyEncoding, TypeEdgeProperty, TypeEdgePropertyEncoding,
+                TypeVertexProperty, TypeVertexPropertyEncoding,
+            },
+            vertex::TypeVertexEncoding,
+        },
+    },
     layout::infix::Infix,
-    value::{value::Value, value_type::ValueType, ValueEncodable},
+    value::{ValueEncodable, value::Value, value_type::ValueType},
 };
 use error::typedb_error;
+use macro_rules_attribute::derive;
 use regex::Regex;
-use resource::constants::snapshot::BUFFER_VALUE_INLINE;
+use resource::constants::snapshot::{BUFFER_KEY_INLINE, BUFFER_VALUE_INLINE};
 use serde::{Deserialize, Serialize};
 
 use crate::type_::{
-    constraint::{CapabilityConstraint, ConstraintDescription, TypeConstraint},
     Capability, KindAPI,
+    constraint::{CapabilityConstraint, ConstraintDescription, TypeConstraint},
 };
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, HasAnnotationCategoryDerive!)]
 pub enum Annotation {
     Abstract(AnnotationAbstract),
     Distinct(AnnotationDistinct),
@@ -42,6 +53,8 @@ pub enum Annotation {
     Cascade(AnnotationCascade),
     Range(AnnotationRange),
     Values(AnnotationValues),
+    Doc(AnnotationDoc),
+    Meta(AnnotationMeta),
     // TODO: Subkey
     // TODO: Replace
 }
@@ -59,6 +72,8 @@ impl fmt::Display for Annotation {
             Annotation::Cascade(annotation) => fmt::Display::fmt(annotation, f),
             Annotation::Range(annotation) => fmt::Display::fmt(annotation, f),
             Annotation::Values(annotation) => fmt::Display::fmt(annotation, f),
+            Annotation::Doc(annotation) => fmt::Display::fmt(annotation, f),
+            Annotation::Meta(annotation) => fmt::Display::fmt(annotation, f),
         }
     }
 }
@@ -402,7 +417,9 @@ impl fmt::Display for AnnotationRange {
             (Some(start), Some(end)) => write!(f, "@range({start}..{end})"),
             (Some(start), None) => write!(f, "@range({start}..)"),
             (None, Some(end)) => write!(f, "@range(..{end})"),
-            (None, None) => unreachable!("Empty range @range(..) should never be written to the schema - start or end should always be specified."),
+            (None, None) => unreachable!(
+                "Empty range @range(..) should never be written to the schema - start or end should always be specified."
+            ),
         }
     }
 }
@@ -509,22 +526,68 @@ impl fmt::Display for AnnotationValues {
     }
 }
 
-impl Annotation {
-    pub fn category(&self) -> AnnotationCategory {
-        match self {
-            Self::Abstract(_) => AnnotationCategory::Abstract,
-            Self::Distinct(_) => AnnotationCategory::Distinct,
-            Self::Independent(_) => AnnotationCategory::Independent,
-            Self::Unique(_) => AnnotationCategory::Unique,
-            Self::Key(_) => AnnotationCategory::Key,
-            Self::Cardinality(_) => AnnotationCategory::Cardinality,
-            Self::Regex(_) => AnnotationCategory::Regex,
-            Self::Cascade(_) => AnnotationCategory::Cascade,
-            Self::Range(_) => AnnotationCategory::Range,
-            Self::Values(_) => AnnotationCategory::Values,
-        }
+#[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
+pub struct AnnotationDoc {
+    // ##########################################################################
+    // ###### WARNING: any changes here may break backwards compatibility! ######
+    // ##########################################################################
+    pub doc: String,
+}
+
+impl AnnotationDoc {
+    pub const fn new(doc: String) -> Self {
+        Self { doc }
     }
 
+    pub const fn default() -> Self {
+        Self { doc: String::new() }
+    }
+
+    pub fn doc(&self) -> &str {
+        &self.doc
+    }
+}
+
+impl fmt::Display for AnnotationDoc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@doc({:?})", self.doc)
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct AnnotationMeta {
+    // ##########################################################################
+    // ###### WARNING: any changes here may break backwards compatibility! ######
+    // ##########################################################################
+    pub key: String,
+    pub value: String,
+}
+
+impl AnnotationMeta {
+    pub const fn new(key: String, value: String) -> Self {
+        Self { key, value }
+    }
+
+    pub const fn default(key: String) -> AnnotationMeta {
+        Self { key, value: String::new() }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for AnnotationMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "@meta({:?}, {:?})", self.key, self.value)
+    }
+}
+
+impl Annotation {
     pub fn to_type_constraints<T: KindAPI>(&self, source: T) -> HashSet<TypeConstraint<T>> {
         self.clone().into_type_constraints(source)
     }
@@ -548,7 +611,75 @@ impl Annotation {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+macro_rules! FromAnnotation {
+    (
+       $(#[$meta:meta])*
+       $vis:vis enum $Enum:ident {
+           $($Variant:ident($Inner:ty)),* $(,)?
+       }
+    ) => {
+        impl TryFrom<$crate::type_::annotation::Annotation> for $Enum {
+            type Error = $crate::type_::annotation::AnnotationError;
+            fn try_from(annotation: $crate::type_::annotation::Annotation) -> Result<Self, AnnotationError> {
+                match annotation {
+                    $($crate::type_::annotation::Annotation::$Variant(annotation) => Ok(Self::$Variant(annotation)),)*
+                    _ => ::paste::paste!(Err(Self::Error::[< Unsupported $Enum >] { category: annotation.category() })),
+                }
+            }
+        }
+
+        impl From<$Enum> for Annotation {
+            fn from(value: $Enum) -> Self {
+                match value {
+                    $($Enum::$Variant(annotation) => Self::$Variant(annotation),)*
+                }
+            }
+        }
+
+        FromAnnotation! { @cat $vis $Enum {} $($Variant)* }
+
+        impl TryFrom<$crate::type_::annotation::AnnotationCategory> for ::paste::paste!([<$Enum Category>]) {
+            type Error = $crate::type_::annotation::AnnotationError;
+            fn try_from(category: $crate::type_::annotation::AnnotationCategory) -> Result<Self, AnnotationError> {
+                #[allow(unused_imports, reason = "uninhabited annotation enums")]
+                use $crate::type_::annotation::AnnotationCategory;
+                match category {
+                    $(FromAnnotation!(@match-cat $Variant inner) => Ok(FromAnnotation!(@make-cat $Variant inner)),)*
+                    _ => ::paste::paste!(Err(Self::Error::[< Unsupported $Enum >] { category })),
+                }
+            }
+        }
+
+        impl std::fmt::Display for $Enum {
+            #[allow(unused_variables, reason = "`f` is unused for empty enums")]
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match *self {
+                    $($Enum::$Variant(ref annotation) => std::fmt::Display::fmt(annotation, f),)*
+                }
+            }
+        }
+    };
+
+    (@cat $vis:vis $Enum:ident { $($inner:tt)* } Meta $($tail:tt)*) => { FromAnnotation! { @cat $vis $Enum { $($inner)* Meta(String), } $($tail)* } };
+    (@cat $vis:vis $Enum:ident { $($inner:tt)* } $V:ident $($tail:tt)*) => { FromAnnotation! { @cat $vis $Enum { $($inner)* $V, } $($tail)* } };
+    (@cat $vis:vis $Enum:ident { $($inner:tt)* }) => {
+        ::paste::paste! {
+            #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+            $vis enum [<$Enum Category>] {
+                $($inner)*
+            }
+        }
+    };
+
+    (@match-cat Meta $key:ident) => { AnnotationCategory::Meta($key) };
+    (@match-cat $Variant:ident $_:ident) => { AnnotationCategory::$Variant };
+
+    (@make-cat Meta $key:ident) => { Self::Meta($key) };
+    (@make-cat $Variant:ident $_:ident) => { Self::$Variant };
+}
+pub(crate) use FromAnnotation;
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum AnnotationCategory {
     Abstract,
     Distinct,
@@ -560,27 +691,14 @@ pub enum AnnotationCategory {
     Cascade,
     Range,
     Values,
+    Doc,
+    Meta(String),
     // TODO: Subkey
     // TODO: Replace
 }
 
 impl AnnotationCategory {
-    const fn to_default(self) -> Annotation {
-        match self {
-            AnnotationCategory::Abstract => Annotation::Abstract(AnnotationAbstract),
-            AnnotationCategory::Distinct => Annotation::Distinct(AnnotationDistinct),
-            AnnotationCategory::Independent => Annotation::Independent(AnnotationIndependent),
-            AnnotationCategory::Unique => Annotation::Unique(AnnotationUnique),
-            AnnotationCategory::Key => Annotation::Key(AnnotationKey),
-            AnnotationCategory::Cardinality => Annotation::Cardinality(AnnotationCardinality::default()),
-            AnnotationCategory::Regex => Annotation::Regex(AnnotationRegex::default()),
-            AnnotationCategory::Cascade => Annotation::Cascade(AnnotationCascade),
-            AnnotationCategory::Range => Annotation::Range(AnnotationRange::default()),
-            AnnotationCategory::Values => Annotation::Values(AnnotationValues::default()),
-        }
-    }
-
-    pub fn declarable_alongside(&self, other: AnnotationCategory) -> bool {
+    pub fn declarable_alongside(&self, other: &AnnotationCategory) -> bool {
         match self {
             AnnotationCategory::Unique => !matches!(other, AnnotationCategory::Key),
             AnnotationCategory::Cardinality => !matches!(other, AnnotationCategory::Key),
@@ -591,7 +709,9 @@ impl AnnotationCategory {
             | AnnotationCategory::Regex
             | AnnotationCategory::Cascade
             | AnnotationCategory::Range
-            | AnnotationCategory::Values => true,
+            | AnnotationCategory::Values
+            | AnnotationCategory::Doc
+            | AnnotationCategory::Meta(_) => true,
         }
     }
 
@@ -607,7 +727,9 @@ impl AnnotationCategory {
             | AnnotationCategory::Cardinality
             | AnnotationCategory::Regex
             | AnnotationCategory::Range
-            | AnnotationCategory::Values => true,
+            | AnnotationCategory::Values
+            | AnnotationCategory::Doc
+            | AnnotationCategory::Meta(_) => true,
         }
     }
 
@@ -623,6 +745,8 @@ impl AnnotationCategory {
             AnnotationCategory::Cascade => typeql::token::Annotation::Cascade.as_str(),
             AnnotationCategory::Range => typeql::token::Annotation::Range.as_str(),
             AnnotationCategory::Values => typeql::token::Annotation::Values.as_str(),
+            AnnotationCategory::Doc => typeql::token::Annotation::Doc.as_str(),
+            AnnotationCategory::Meta(_) => typeql::token::Annotation::Meta.as_str(),
         }
     }
 }
@@ -635,32 +759,65 @@ impl fmt::Display for AnnotationCategory {
 
 impl fmt::Debug for AnnotationCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "@{}", self.name())
+        write!(f, "@{}", self.name())?;
+        if let Self::Meta(key) = self {
+            write!(f, "({:?})", key)?;
+        }
+        Ok(())
     }
 }
 
-pub trait DefaultFrom<FromType, ErrorType> {
-    fn try_getting_default(from: FromType) -> Result<Self, ErrorType>
-    where
-        Self: Sized;
+pub trait HasAnnotationCategory {
+    fn has_category(&self, category: &AnnotationCategory) -> bool;
+    fn category(&self) -> AnnotationCategory;
 }
 
-impl<T> DefaultFrom<AnnotationCategory, AnnotationError> for T
-where
-    T: TryFrom<Annotation, Error = AnnotationError>,
-{
-    // Note: creating default annotation from category is a workaround for creating new category types per Attribute/Entity/Relation/etc
-    fn try_getting_default(from: AnnotationCategory) -> Result<Self, AnnotationError> {
-        from.to_default().try_into()
-    }
+macro_rules! HasAnnotationCategoryDerive {
+    (
+       $(#[$meta:meta])*
+       $vis:vis enum $Enum:ident {
+           $($Variant:ident($Inner:ty)),* $(,)?
+       }
+    ) => {
+        impl $crate::type_::annotation::HasAnnotationCategory for $Enum{
+            fn has_category(&self, category: &$crate::type_::annotation::AnnotationCategory) -> bool {
+                use $crate::type_::annotation::AnnotationCategory;
+                #[allow(unreachable_patterns)]
+                match category {
+                    $(HasAnnotationCategoryDerive!(@match-cat $Variant inner) => HasAnnotationCategoryDerive!(@has-cat self $Variant inner),)*
+                    _ => false,
+                }
+            }
+
+            fn category(&self) -> $crate::type_::annotation::AnnotationCategory {
+                use $crate::type_::annotation::AnnotationCategory;
+                match self {
+                    $(HasAnnotationCategoryDerive!(@match-self self $Variant _inner) => HasAnnotationCategoryDerive!(@make-cat $Variant _inner),)*
+                }
+            }
+        }
+    };
+
+    (@match-cat Meta $key:ident) => { AnnotationCategory::Meta($key) };
+    (@match-cat $Variant:ident $_:ident) => { AnnotationCategory::$Variant };
+
+    (@has-cat $self:ident Meta $key:ident) => { matches!($self, Self::Meta(meta) if meta.key() == $key) };
+    (@has-cat $self:ident $Variant:ident $_:ident) => { matches!($self, Self::$Variant(_)) };
+
+    (@match-self $self:ident $Variant:ident $meta:ident) => { Self::$Variant($meta) };
+
+    (@make-cat Meta $meta:ident) => { AnnotationCategory::Meta($meta.key().to_owned()) };
+    (@make-cat $Variant:ident $_:ident) => { AnnotationCategory::$Variant };
 }
+pub(crate) use HasAnnotationCategoryDerive;
 
 macro_rules! empty_type_vertex_property_encoding {
     ($property:ident, $infix:ident) => {
         impl TypeVertexPropertyEncoding for $property {
             const INFIX: Infix = Infix::$infix;
 
-            fn from_value_bytes(value: &[u8]) -> $property {
+            fn from_key_value_bytes(key: &[u8], value: &[u8]) -> $property {
+                debug_assert!(key.is_empty());
                 debug_assert!(value.is_empty());
                 $property
             }
@@ -679,12 +836,12 @@ macro_rules! unreachable_type_vertex_property_encoding {
         impl TypeVertexPropertyEncoding for $property {
             const INFIX: Infix = Infix::$infix;
 
-            fn from_value_bytes(_: &[u8]) -> $property {
-                unreachable!("TypeVertexPropertyEncoding is not be implemented for {}", stringify!($property))
+            fn from_key_value_bytes(_: &[u8], _: &[u8]) -> $property {
+                unreachable!("TypeVertexPropertyEncoding is not to be implemented for {}", stringify!($property))
             }
 
             fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
-                unreachable!("TypeVertexPropertyEncoding is not be implemented for {}", stringify!($property))
+                unreachable!("TypeVertexPropertyEncoding is not to be implemented for {}", stringify!($property))
             }
         }
     };
@@ -699,13 +856,19 @@ empty_type_vertex_property_encoding!(AnnotationAbstract, PropertyAnnotationAbstr
 empty_type_vertex_property_encoding!(AnnotationIndependent, PropertyAnnotationIndependent);
 empty_type_vertex_property_encoding!(AnnotationCascade, PropertyAnnotationCascade);
 
+#[track_caller]
+fn decode_to_string(value: &[u8]) -> String {
+    std::str::from_utf8(value).unwrap().to_owned()
+}
+
 impl TypeVertexPropertyEncoding for AnnotationRegex {
     const INFIX: Infix = Infix::PropertyAnnotationRegex;
 
-    fn from_value_bytes(value: &[u8]) -> AnnotationRegex {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         // TODO this .unwrap() should be handled as an error
         // although it does indicate data corruption
-        AnnotationRegex::new(std::str::from_utf8(value).unwrap().to_owned())
+        AnnotationRegex::new(decode_to_string(value))
     }
 
     fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
@@ -715,7 +878,8 @@ impl TypeVertexPropertyEncoding for AnnotationRegex {
 
 impl TypeVertexPropertyEncoding for AnnotationRange {
     const INFIX: Infix = Infix::PropertyAnnotationRange;
-    fn from_value_bytes(value: &[u8]) -> Self {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         // TODO this .unwrap() should be handled as an error
         // although it does indicate data corruption
         bincode::deserialize(value).unwrap()
@@ -728,7 +892,8 @@ impl TypeVertexPropertyEncoding for AnnotationRange {
 
 impl TypeVertexPropertyEncoding for AnnotationValues {
     const INFIX: Infix = Infix::PropertyAnnotationValues;
-    fn from_value_bytes(value: &[u8]) -> Self {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         // TODO this .unwrap() should be handled as an error
         // although it does indicate data corruption
         bincode::deserialize(value).unwrap()
@@ -739,12 +904,42 @@ impl TypeVertexPropertyEncoding for AnnotationValues {
     }
 }
 
+impl TypeVertexPropertyEncoding for AnnotationDoc {
+    const INFIX: Infix = Infix::PropertyAnnotationDoc;
+
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
+        AnnotationDoc::new(decode_to_string(value))
+    }
+
+    fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
+        Some(Bytes::Array(ByteArray::copy(self.doc().as_bytes())))
+    }
+}
+
+impl TypeVertexPropertyEncoding for AnnotationMeta {
+    const INFIX: Infix = Infix::PropertyAnnotationMeta;
+
+    fn to_key(&self, vertex: impl TypeVertexEncoding) -> TypeVertexProperty {
+        <Self as TypeVertexPropertyEncoding>::build_key(vertex, self.key().as_bytes())
+    }
+
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        Self::new(decode_to_string(key), decode_to_string(value))
+    }
+
+    fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
+        Some(Bytes::Array(ByteArray::copy(self.value().as_bytes())))
+    }
+}
+
 macro_rules! empty_type_edge_property_encoder {
     ($property:ident, $infix:ident) => {
         impl TypeEdgePropertyEncoding for $property {
             const INFIX: Infix = Infix::$infix;
 
-            fn from_value_bytes(value: &[u8]) -> $property {
+            fn from_key_value_bytes(key: &[u8], value: &[u8]) -> $property {
+                debug_assert!(key.is_empty());
                 debug_assert!(value.is_empty());
                 $property
             }
@@ -763,7 +958,7 @@ macro_rules! unreachable_type_edge_property_encoder {
         impl TypeEdgePropertyEncoding for $property {
             const INFIX: Infix = Infix::$infix;
 
-            fn from_value_bytes(_value: &[u8]) -> $property {
+            fn from_key_value_bytes(_key: &[u8], _value: &[u8]) -> $property {
                 unreachable!("TypeEdgePropertyEncoding is not be implemented for {}", stringify!($property))
             }
 
@@ -784,7 +979,8 @@ empty_type_edge_property_encoder!(AnnotationKey, PropertyAnnotationKey);
 
 impl TypeEdgePropertyEncoding for AnnotationCardinality {
     const INFIX: Infix = Infix::PropertyAnnotationCardinality;
-    fn from_value_bytes(value: &[u8]) -> Self {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         // TODO this .unwrap() should be handled as an error
         // although it does indicate data corruption
         bincode::deserialize(value).unwrap()
@@ -797,7 +993,8 @@ impl TypeEdgePropertyEncoding for AnnotationCardinality {
 
 impl TypeEdgePropertyEncoding for AnnotationRegex {
     const INFIX: Infix = Infix::PropertyAnnotationRegex;
-    fn from_value_bytes(value: &[u8]) -> Self {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         // TODO this .unwrap() should be handled as an error
         // although it does indicate data corruption
         AnnotationRegex::new(std::str::from_utf8(value).unwrap().to_owned())
@@ -810,7 +1007,8 @@ impl TypeEdgePropertyEncoding for AnnotationRegex {
 
 impl TypeEdgePropertyEncoding for AnnotationRange {
     const INFIX: Infix = Infix::PropertyAnnotationRange;
-    fn from_value_bytes(value: &[u8]) -> Self {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         // TODO this .unwrap() should be handled as an error
         // although it does indicate data corruption
         bincode::deserialize(value).unwrap()
@@ -823,7 +1021,8 @@ impl TypeEdgePropertyEncoding for AnnotationRange {
 
 impl TypeEdgePropertyEncoding for AnnotationValues {
     const INFIX: Infix = Infix::PropertyAnnotationValues;
-    fn from_value_bytes(value: &[u8]) -> Self {
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
         // TODO this .unwrap() should be handled as an error
         // although it does indicate data corruption
         bincode::deserialize(value).unwrap()
@@ -834,18 +1033,86 @@ impl TypeEdgePropertyEncoding for AnnotationValues {
     }
 }
 
+impl TypeEdgePropertyEncoding for AnnotationDoc {
+    const INFIX: Infix = Infix::PropertyAnnotationDoc;
+
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
+        AnnotationDoc::new(std::str::from_utf8(value).unwrap().to_owned())
+    }
+
+    fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
+        Some(Bytes::Array(ByteArray::copy(self.doc().as_bytes())))
+    }
+}
+
+impl TypeEdgePropertyEncoding for AnnotationMeta {
+    const INFIX: Infix = Infix::PropertyAnnotationMeta;
+
+    fn to_key(&self, edge: impl TypeEdgeEncoding) -> TypeEdgeProperty {
+        <Self as TypeEdgePropertyEncoding>::build_key(edge, self.key().as_bytes())
+    }
+
+    fn is_decodable_from(key_bytes: Bytes<'static, BUFFER_KEY_INLINE>) -> bool {
+        key_bytes.length() > TypeEdgeProperty::LENGTH_NO_SUFFIX
+            && TypeEdgeProperty::decode(key_bytes).infix() == <Self as TypeVertexPropertyEncoding>::INFIX
+    }
+
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        Self::new(decode_to_string(key), decode_to_string(value))
+    }
+
+    fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
+        Some(Bytes::Array(ByteArray::copy(self.value().as_bytes())))
+    }
+}
+
+impl FunctionPropertyEncoding for AnnotationDoc {
+    const INFIX: Infix = Infix::PropertyAnnotationDoc;
+
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        debug_assert!(key.is_empty());
+        AnnotationDoc::new(std::str::from_utf8(value).unwrap().to_owned())
+    }
+
+    fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
+        Some(Bytes::Array(ByteArray::copy(self.doc().as_bytes())))
+    }
+}
+
+impl FunctionPropertyEncoding for AnnotationMeta {
+    const INFIX: Infix = Infix::PropertyAnnotationMeta;
+
+    fn to_key(&self, function_id: DefinitionKey) -> FunctionProperty {
+        <Self as FunctionPropertyEncoding>::build_key(function_id, self.key().as_bytes())
+    }
+
+    fn is_decodable_from(key_bytes: Bytes<'static, BUFFER_KEY_INLINE>) -> bool {
+        key_bytes.length() > FunctionProperty::LENGTH_NO_SUFFIX
+            && FunctionProperty::decode(key_bytes).infix() == <Self as TypeVertexPropertyEncoding>::INFIX
+    }
+
+    fn from_key_value_bytes(key: &[u8], value: &[u8]) -> Self {
+        Self::new(decode_to_string(key), decode_to_string(value))
+    }
+
+    fn to_value_bytes(&self) -> Option<Bytes<'static, BUFFER_VALUE_INLINE>> {
+        Some(Bytes::Array(ByteArray::copy(self.value().as_bytes())))
+    }
+}
+
 typedb_error! {
     pub AnnotationError(component = "Annotation", prefix = "ANN") {
-        UnsupportedAnnotationForEntityType(1, "Annotation '{category}' is not supported for entity types.", category: AnnotationCategory),
-        UnsupportedAnnotationForRelationType(2, "Annotation '{category}' is not supported for relation types.", category: AnnotationCategory),
-        UnsupportedAnnotationForAttributeType(3, "Annotation '{category}' is not supported for attribute types.", category: AnnotationCategory),
-        UnsupportedAnnotationForRoleType(4, "Annotation '{category}' is not supported for role types.", category: AnnotationCategory),
-        UnsupportedAnnotationForRelates(5, "Annotation '{category}' is not supported for relates.", category: AnnotationCategory),
-        UnsupportedAnnotationForPlays(6, "Annotation '{category}' is not supported for plays.", category: AnnotationCategory),
-        UnsupportedAnnotationForOwns(7, "Annotation '{category}' is not supported for owns.", category: AnnotationCategory),
-        UnsupportedAnnotationForAlias(8, "Annotation '{category}' is not supported for alias.", category: AnnotationCategory),
-        UnsupportedAnnotationForSub(9, "Annotation '{category}' is not supported for sub.", category: AnnotationCategory),
-        UnsupportedAnnotationForValueType(10, "Annotation '{category}' is not supported for value types.", category: AnnotationCategory),
+        UnsupportedEntityTypeAnnotation(1, "Annotation '{category}' is not supported for entity types.", category: AnnotationCategory),
+        UnsupportedRelationTypeAnnotation(2, "Annotation '{category}' is not supported for relation types.", category: AnnotationCategory),
+        UnsupportedAttributeTypeAnnotation(3, "Annotation '{category}' is not supported for attribute types.", category: AnnotationCategory),
+        UnsupportedRoleTypeAnnotation(4, "Annotation '{category}' is not supported for role types.", category: AnnotationCategory),
+        UnsupportedRelatesAnnotation(5, "Annotation '{category}' is not supported for relates.", category: AnnotationCategory),
+        UnsupportedPlaysAnnotation(6, "Annotation '{category}' is not supported for plays.", category: AnnotationCategory),
+        UnsupportedOwnsAnnotation(7, "Annotation '{category}' is not supported for owns.", category: AnnotationCategory),
+        UnsupportedAliasAnnotation(8, "Annotation '{category}' is not supported for alias.", category: AnnotationCategory),
+        UnsupportedSubAnnotation(9, "Annotation '{category}' is not supported for sub.", category: AnnotationCategory),
+        UnsupportedValueTypeAnnotation(10, "Annotation '{category}' is not supported for value types.", category: AnnotationCategory),
     }
 }
 
@@ -854,17 +1121,16 @@ mod serialize_annotation {
 
     use bytes::Bytes;
     use encoding::value::{
-        boolean_bytes::BooleanBytes, date_bytes::DateBytes, date_time_bytes::DateTimeBytes,
+        ValueEncodable, boolean_bytes::BooleanBytes, date_bytes::DateBytes, date_time_bytes::DateTimeBytes,
         date_time_tz_bytes::DateTimeTZBytes, decimal_bytes::DecimalBytes, double_bytes::DoubleBytes,
         duration_bytes::DurationBytes, integer_bytes::IntegerBytes, string_bytes::StringBytes, value::Value,
-        value_type::ValueTypeCategory, ValueEncodable,
+        value_type::ValueTypeCategory,
     };
     use resource::constants::encoding::AD_HOC_BYTES_INLINE;
     use serde::{
-        de,
+        Deserialize, Deserializer, Serialize, Serializer, de,
         de::{MapAccess, SeqAccess, Visitor},
         ser::SerializeStruct,
-        Deserialize, Deserializer, Serialize, Serializer,
     };
 
     use crate::type_::annotation::{AnnotationRange, AnnotationValues};

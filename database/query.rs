@@ -5,22 +5,22 @@
  */
 use std::{sync::Arc, time::Instant};
 
-use compiler::{query_structure::PipelineStructure, VariablePosition};
+use compiler::{VariablePosition, query_structure::PipelineStructure};
 use concept::{thing::thing_manager::ThingManager, type_::type_manager::TypeManager};
 use executor::{
+    ExecutionInterrupt,
     batch::Batch,
     document::ConceptDocument,
     pipeline::stage::{ExecutionContext, StageIterator},
-    ExecutionInterrupt,
 };
 use function::function_manager::FunctionManager;
 use ir::pipeline::ParameterRegistry;
 use itertools::{Either, Itertools};
 use options::QueryOptions;
-use query::{error::QueryError, query_manager::QueryManager};
+use query::{error::QueryError, given_rows::GivenRows, query_manager::QueryManager};
 use storage::{durability_client::WALClient, snapshot::WritableSnapshot};
-use tracing::{event, Level};
-use typeql::query::SchemaQuery;
+use tracing::{Level, event};
+use typeql::query::{Pipeline, SchemaQuery};
 
 use crate::{
     transaction::{TransactionSchema, TransactionWrite},
@@ -62,7 +62,7 @@ pub fn execute_schema_query(
                 &type_manager,
                 &thing_manager,
                 &function_manager,
-                query,
+                &query,
                 &source_query,
             )
         }
@@ -72,7 +72,8 @@ pub fn execute_schema_query(
 pub fn execute_write_query_in_schema(
     transaction: TransactionSchema<WALClient>,
     query_options: QueryOptions,
-    pipeline: typeql::query::Pipeline,
+    query_pipeline: Arc<Pipeline>,
+    given_rows: Option<impl GivenRows>,
     source_query: String,
     interrupt: ExecutionInterrupt,
 ) -> (TransactionSchema<WALClient>, WriteQueryResult) {
@@ -91,10 +92,11 @@ pub fn execute_write_query_in_schema(
         Arc::try_unwrap(snapshot).unwrap_or_else(|_| panic!("Expected unique ownership of snapshot")),
         &type_manager,
         thing_manager.clone(),
-        &function_manager,
+        function_manager.clone(),
         &query_manager,
         query_options,
-        &pipeline,
+        query_pipeline,
+        given_rows,
         &source_query,
         interrupt,
     );
@@ -116,7 +118,8 @@ pub fn execute_write_query_in_schema(
 pub fn execute_write_query_in_write(
     transaction: TransactionWrite<WALClient>,
     query_options: QueryOptions,
-    pipeline: typeql::query::Pipeline,
+    query_pipeline: Arc<Pipeline>,
+    given_rows: Option<impl GivenRows>,
     source_query: String,
     interrupt: ExecutionInterrupt,
 ) -> (TransactionWrite<WALClient>, WriteQueryResult) {
@@ -135,10 +138,11 @@ pub fn execute_write_query_in_write(
         Arc::try_unwrap(snapshot).unwrap_or_else(|_| panic!("Expected unique ownership of snapshot")),
         &type_manager,
         thing_manager.clone(),
-        &function_manager,
+        function_manager.clone(),
         &query_manager,
         query_options,
-        &pipeline,
+        query_pipeline,
+        given_rows,
         &source_query,
         interrupt,
     );
@@ -161,10 +165,11 @@ pub(crate) fn execute_write_query_in<Snapshot: WritableSnapshot + 'static>(
     snapshot: Snapshot,
     type_manager: &TypeManager,
     thing_manager: Arc<ThingManager>,
-    function_manager: &FunctionManager,
+    function_manager: Arc<FunctionManager>,
     query_manager: &QueryManager,
     query_options: QueryOptions,
-    pipeline: &typeql::query::Pipeline,
+    query_pipeline: Arc<Pipeline>,
+    given_rows: Option<impl GivenRows>,
     source_query: &str,
     interrupt: ExecutionInterrupt,
 ) -> (Snapshot, WriteQueryResult) {
@@ -174,7 +179,8 @@ pub(crate) fn execute_write_query_in<Snapshot: WritableSnapshot + 'static>(
         type_manager,
         thing_manager,
         function_manager,
-        pipeline,
+        &query_pipeline,
+        given_rows,
         source_query,
     );
     let pipeline = match result {
@@ -198,21 +204,13 @@ pub(crate) fn execute_write_query_in<Snapshot: WritableSnapshot + 'static>(
             }
         };
 
-        let mut documents = Vec::new();
-        for next in iterator {
-            match next {
-                Ok(document) => documents.push(document),
-                Err(typedb_source) => {
-                    return (
-                        Arc::into_inner(snapshot).unwrap(),
-                        Err(Box::new(QueryError::WritePipelineExecution {
-                            source_query: source_query.to_string(),
-                            typedb_source,
-                        })),
-                    )
-                }
-            }
-        }
+        let result = match iterator.collect::<Result<Vec<_>, _>>() {
+            Ok(documents) => Ok(WriteQueryAnswer::new_documents(query_options, (parameters, documents))),
+            Err(err) => Err(Box::new(QueryError::WritePipelineExecution {
+                source_query: source_query.to_string(),
+                typedb_source: err,
+            })),
+        };
         if query_profile.is_enabled() {
             let micros = Instant::now().duration_since(start_time).as_micros();
             event!(
@@ -222,10 +220,7 @@ pub(crate) fn execute_write_query_in<Snapshot: WritableSnapshot + 'static>(
                 query_profile
             );
         }
-        (
-            Arc::into_inner(snapshot).unwrap(),
-            Ok(WriteQueryAnswer::new_documents(query_options, (parameters, documents))),
-        )
+        (Arc::into_inner(snapshot).unwrap(), result)
     } else {
         let named_outputs = pipeline.rows_positions().unwrap();
         let pipeline_structure = pipeline.pipeline_structure().cloned();

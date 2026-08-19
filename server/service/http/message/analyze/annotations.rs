@@ -18,10 +18,10 @@ use query::analyse::{FetchStructureAnnotations, FetchStructureAnnotationsFields,
 use serde::{Deserialize, Serialize};
 use storage::snapshot::ReadableSnapshot;
 
-use super::structure::{encode_analyzed_pipeline, AnalyzedFunctionResponse};
+use super::structure::{AnalyzedFunctionResponse, encode_analyzed_pipeline};
 use crate::service::http::message::query::concept::{
-    encode_attribute_type, encode_entity_type, encode_relation_type, encode_role_type, encode_value_type,
-    AttributeTypeResponse, EntityTypeResponse, RelationTypeResponse, RoleTypeResponse,
+    AttributeTypeResponse, EntityTypeResponse, RelationTypeResponse, RoleTypeResponse, encode_attribute_type,
+    encode_entity_type, encode_relation_type, encode_role_type, encode_value_type,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -267,19 +267,27 @@ pub mod bdd {
     use std::collections::HashMap;
 
     use compiler::query_structure::{QueryStructureConjunctionID, QueryStructureStage};
-    use itertools::Itertools;
+use itertools::Itertools;
 
-    use super::{FetchStructureAnnotationsResponse, FunctionReturnAnnotationsResponse, SingleTypeAnnotationResponse, TypeAnnotationResponse, ConjunctionAnnotationsResponse, VariableAnnotationsResponse};
-    use crate::service::http::message::analyze::{
-        bdd::{
-            functor_macros,
-            functor_macros::{encode_functor_impl, impl_functor_for, impl_functor_for_multi},
-            FunctorContext, FunctorEncoded,
-        },
-        structure::StructureConstraint,
-        AnalysedQueryResponse,
-    };
-    use crate::service::http::message::analyze::structure::{AnalyzedFunctionResponse, AnalyzedPipelineResponse};
+    use super::{ConjunctionAnnotationsResponse, FetchStructureAnnotationsResponse, FunctionReturnAnnotationsResponse, SingleTypeAnnotationResponse, TypeAnnotationResponse, VariableAnnotationsResponse};
+use crate::service::http::message::analyze::structure::{AnalyzedFunctionResponse, AnalyzedGivenResponse, AnalyzedPipelineResponse};
+use crate::service::http::message::analyze::{
+    bdd::{
+        functor_macros,
+        functor_macros::{encode_functor_impl, impl_functor_for, impl_functor_for_multi},
+        FunctorContext, FunctorEncoded,
+    },
+    structure::StructureConstraint,
+    AnalysedQueryResponse,
+};
+
+    pub fn encode_pipeline_given_annotations_as_functor(pipeline: &AnalyzedPipelineResponse, given: &AnalyzedGivenResponse) -> String {
+        let AnalyzedGivenResponse { variable_annotations, .. } = given;
+        encode_functor_impl!(
+            &FunctorContext { pipeline },
+            Given { variable_annotations, }
+        )
+    }
 
     pub fn encode_pipeline_annotations_as_functor(pipeline: &AnalyzedPipelineResponse) -> String {
         PipelineAnnotationsToEncode.encode_as_functor(&FunctorContext { pipeline })

@@ -19,7 +19,7 @@ use concept::{
         },
         constraint::{ConstraintCategory as TypeDBConstraintCategory, ConstraintDescription as TypeDBConstraint},
         object_type::ObjectType,
-        type_manager::{validation::SchemaValidationError, TypeManager},
+        type_manager::{TypeManager, validation::SchemaValidationError},
     },
 };
 use cucumber::Parameter;
@@ -882,6 +882,24 @@ impl FromStr for Optional {
             "?" => Self::True,
             "" => Self::False,
             invalid => return Err(format!("Invalid `Optional`: {invalid}")),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Parameter)]
+#[param(name = "with_given", regex = "(| with given rows)")]
+pub enum WithGiven {
+    False,
+    True,
+}
+
+impl FromStr for WithGiven {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            " with given rows" => Self::True,
+            "" => Self::False,
+            invalid => return Err(format!("Invalid `WithGiven`: {invalid}")),
         })
     }
 }

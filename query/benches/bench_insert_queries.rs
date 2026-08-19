@@ -17,23 +17,23 @@ use std::{
 use answer::variable_value::VariableValue;
 use concept::{
     thing::thing_manager::ThingManager,
-    type_::{type_manager::TypeManager, Ordering, OwnerAPI, PlayerAPI},
+    type_::{Ordering, OwnerAPI, PlayerAPI, type_manager::TypeManager},
 };
-use criterion::{criterion_group, criterion_main, profiler::Profiler, Criterion, SamplingMode};
+use criterion::{Criterion, SamplingMode, criterion_group, criterion_main, profiler::Profiler};
 use encoding::{
     graph::definition::definition_key_generator::DefinitionKeyGenerator,
     value::{label::Label, value_type::ValueType},
 };
-use executor::{pipeline::stage::StageIterator, ExecutionInterrupt};
+use executor::{ExecutionInterrupt, pipeline::stage::StageIterator};
 use function::function_manager::FunctionManager;
 use lending_iterator::LendingIterator;
 use pprof::ProfilerGuard;
-use query::{error::QueryError, query_cache::QueryCache, query_manager::QueryManager};
+use query::{error::QueryError, given_rows::GivenRowsSimple, query_cache::QueryCache, query_manager::QueryManager};
 use resource::profile::{CommitProfile, StorageCounters};
 use storage::{
+    MVCCStorage,
     durability_client::WALClient,
     snapshot::{CommittableSnapshot, WritableSnapshot},
-    MVCCStorage,
 };
 use test_utils::init_logging;
 use test_utils_concept::{load_managers, setup_concept_storage};
@@ -122,10 +122,18 @@ fn execute_insert<Snapshot: WritableSnapshot + 'static>(
     query_str: &str,
 ) -> Result<(Vec<HashMap<String, VariableValue<'static>>>, Snapshot), (Box<QueryError>, Snapshot)> {
     let typeql_insert = typeql::parse_query(query_str).unwrap().into_structure().into_pipeline();
-    let function_manager = FunctionManager::new(Arc::new(DefinitionKeyGenerator::new()), None);
+    let function_manager = Arc::new(FunctionManager::new(Arc::new(DefinitionKeyGenerator::new()), None));
 
     let pipeline = query_manager
-        .prepare_write_pipeline(snapshot, type_manager, thing_manager, &function_manager, &typeql_insert, query_str)
+        .prepare_write_pipeline(
+            snapshot,
+            type_manager,
+            thing_manager,
+            function_manager,
+            &typeql_insert,
+            None::<GivenRowsSimple>,
+            query_str,
+        )
         .map_err(|(snapshot, err)| (err, snapshot))?;
     let outputs = pipeline.rows_positions().unwrap().clone();
     let (iter, ctx) =

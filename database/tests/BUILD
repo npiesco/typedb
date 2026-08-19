@@ -13,12 +13,32 @@ rust_test(
     ]),
     deps = [
         "//common/logger",
+        "//common/options",
         "//database",
+        "//diagnostics",
+        "//durability",
         "//encoding",
         "//storage",
+        "//storage/tests:test_utils_storage",
         "//util/test:test_utils",
 
         "@crates//:rocksdb",
+        "@crates//:tracing",
+    ]
+)
+
+rust_test(
+    name = "test_import",
+    srcs = glob([
+        "import.rs",
+    ]),
+    deps = [
+        "//common/logger",
+        "//common/options",
+        "//database",
+        "//diagnostics",
+        "//util/test:test_utils",
+
         "@crates//:tracing",
     ]
 )
@@ -32,6 +52,7 @@ rust_test(
         "//common/logger",
         "//common/options",
         "//database",
+        "//diagnostics",
         "//encoding",
         "//storage",
         "//util/test:test_utils",
@@ -42,11 +63,64 @@ rust_test(
     ]
 )
 
+rust_test(
+    name = "test_statistics_synchronization",
+    srcs = glob([
+        "statistics_synchronization.rs",
+    ]),
+    deps = [
+        "//common/options",
+        "//database",
+        "//diagnostics",
+        "//executor",
+        "//query",
+        "//storage",
+        "//util/test:test_utils",
+
+        "@typeql//rust:typeql",
+    ]
+)
+
+rust_test(
+    name = "test_transaction_isolation",
+    srcs = glob([
+        "test_transaction_isolation.rs",
+    ]),
+    deps = [
+        "//common/options",
+        "//database",
+        "//diagnostics",
+        "//encoding",
+        "//executor",
+        "//query",
+        "//storage",
+        "//util/test:test_utils",
+
+        "@typeql//rust:typeql",
+    ]
+)
+
+rust_test(
+    name = "test_diagnostics_posthog_pii",
+    srcs = glob([
+        "diagnostics_posthog_pii.rs",
+    ]),
+    deps = [
+        "//diagnostics",
+
+        "@crates//:serde_json",
+    ]
+)
+
 rustfmt_test(
     name = "rustfmt_test",
     targets = [
         ":test_database",
+        ":test_import",
         ":test_transaction",
+        ":test_statistics_synchronization",
+        ":test_transaction_isolation",
+        ":test_diagnostics_posthog_pii",
     ],
     size = "small",
 )

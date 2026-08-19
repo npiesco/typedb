@@ -6,44 +6,45 @@
 
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
-use answer::{variable::Variable, variable_value::VariableValue, Concept, Thing};
+use answer::{Concept, Thing, variable::Variable, variable_value::VariableValue};
 use compiler::{
+    VariablePosition,
     executable::{
         fetch::executable::{
             ExecutableFetch, ExecutableFetchListSubFetch, FetchObjectInstruction, FetchSomeInstruction,
         },
-        function::{executable::ExecutableFunction, ExecutableFunctionRegistry},
+        function::{ExecutableFunctionRegistry, executable::ExecutableFunction},
         next_executable_id,
     },
-    VariablePosition,
 };
 use concept::{
     error::ConceptReadError,
     thing::{has::Has, object::ObjectAPI, thing_manager::ThingManager},
-    type_::{attribute_type::AttributeType, OwnerAPI, TypeAPI},
+    type_::{OwnerAPI, TypeAPI, attribute_type::AttributeType},
 };
 use encoding::value::label::Label;
 use error::{typedb_error, unimplemented_feature};
+use function::function_manager::FunctionManager;
 use ir::{pattern::ParameterID, pipeline::ParameterRegistry};
 use lending_iterator::LendingIterator;
-use resource::profile::{QueryProfile, StageProfile, StorageCounters};
+use resource::profile::{QueryProfile, StepProfile, StorageCounters};
 use storage::snapshot::ReadableSnapshot;
 
 use crate::{
-    batch::FixedBatch,
+    ExecutionInterrupt, Provenance,
+    batch::{Batch, FixedBatch},
     document::{ConceptDocument, DocumentLeaf, DocumentList, DocumentMap, DocumentNode},
     error::ReadExecutionError,
     pipeline::{
+        PipelineExecutionError,
         pipeline::{Pipeline, PipelineError},
         stage::{ExecutionContext, StageAPI},
-        PipelineExecutionError,
     },
     read::{
         pattern_executor::PatternExecutor, step_executor::create_executors_for_function,
         tabled_functions::TabledFunctions,
     },
     row::MaybeOwnedRow,
-    ExecutionInterrupt, Provenance,
 };
 
 macro_rules! exactly_one_or_return_err {
@@ -73,20 +74,23 @@ impl<Snapshot: ReadableSnapshot + 'static> FetchStageExecutor<Snapshot> {
         context: ExecutionContext<Snapshot>,
         interrupt: ExecutionInterrupt,
     ) -> (impl Iterator<Item = Result<ConceptDocument, Box<PipelineExecutionError>>>, ExecutionContext<Snapshot>) {
-        let ExecutionContext { snapshot, thing_manager, parameters, profile } = context.clone();
+        let ExecutionContext { snapshot, thing_manager, function_manager, parameters, profile } = context.clone();
         let executable = self.executable;
         let functions = self.functions;
         let stage_profile = profile.profile_stage(|| String::from("Fetch"), executable.executable_id);
+        let pattern_profile = stage_profile.create_or_get_pattern(|| String::from("Fetch pattern"));
+        let step = pattern_profile.extend_or_get_step(0, || String::from("Root fetch"));
         let documents_iterator = previous_iterator
             .map_static(move |row_result| match row_result {
                 Ok(row) => execute_fetch(
                     &executable,
                     snapshot.clone(),
                     thing_manager.clone(),
+                    function_manager.clone(),
                     parameters.clone(),
                     functions.clone(),
                     profile.clone(),
-                    stage_profile.clone(),
+                    &step,
                     row.as_reference(),
                     interrupt.clone(),
                 )
@@ -102,26 +106,27 @@ fn execute_fetch(
     fetch: &ExecutableFetch,
     snapshot: Arc<impl ReadableSnapshot + 'static>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
-    stage_profile: Arc<StageProfile>,
+    step: &StepProfile,
     row: MaybeOwnedRow<'_>,
     interrupt: ExecutionInterrupt,
 ) -> Result<ConceptDocument, FetchExecutionError> {
-    let step = stage_profile.extend_or_get(0, || String::from("Root fetch"));
     let measurement = step.start_measurement();
     let node = execute_object(
         &fetch.object_instruction,
         snapshot,
         thing_manager,
+        function_manager,
         parameters,
         functions,
         query_profile,
         row,
         interrupt,
     )?;
-    measurement.end(&step, 1, 1);
+    measurement.end(step, 1, 1);
     Ok(ConceptDocument { root: node })
 }
 
@@ -129,6 +134,7 @@ fn execute_fetch_some(
     fetch_some: &FetchSomeInstruction,
     snapshot: Arc<impl ReadableSnapshot + 'static>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions_registry: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
@@ -143,6 +149,7 @@ fn execute_fetch_some(
         FetchSomeInstruction::SingleFunction(function, variable_positions) => execute_single_function(
             snapshot,
             thing_manager,
+            function_manager,
             parameters,
             functions_registry,
             query_profile,
@@ -151,19 +158,22 @@ fn execute_fetch_some(
             variable_positions,
             function,
         ),
+        FetchSomeInstruction::Label(ty) => Ok(DocumentNode::Leaf(DocumentLeaf::Concept(Concept::Type(*ty)))),
         FetchSomeInstruction::Object(object) => execute_object(
             object,
             snapshot,
             thing_manager,
+            function_manager,
             parameters,
             functions_registry,
-            query_profile.clone(),
+            query_profile,
             row,
             interrupt,
         ),
         FetchSomeInstruction::ListFunction(function, variable_positions) => execute_list_function(
             snapshot,
             thing_manager,
+            function_manager,
             parameters,
             functions_registry,
             query_profile,
@@ -175,6 +185,7 @@ fn execute_fetch_some(
         FetchSomeInstruction::ListSubFetch(subfetch) => execute_list_subfetch(
             snapshot,
             thing_manager,
+            function_manager,
             parameters,
             functions_registry,
             query_profile,
@@ -217,6 +228,7 @@ fn execute_single_attribute(
 fn execute_single_function(
     snapshot: Arc<impl ReadableSnapshot + 'static>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions_registry: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
@@ -225,9 +237,10 @@ fn execute_single_function(
     variable_positions: &HashMap<Variable, VariablePosition>,
     function: &ExecutableFunction,
 ) -> Result<DocumentNode, FetchExecutionError> {
-    let (mut pattern_executor, execution_context) = prepare_single_function_execution(
+    let (mut pattern_executor, context) = prepare_single_function_execution(
         snapshot,
         thing_manager,
+        function_manager,
         parameters,
         functions_registry.clone(),
         query_profile,
@@ -239,7 +252,7 @@ fn execute_single_function(
 
     let batch = exactly_one_or_return_err!(
         pattern_executor
-            .compute_next_batch(&execution_context, &mut interrupt, &mut tabled_functions)
+            .compute_next_batch(&context, &mut interrupt, &mut tabled_functions)
             .map_err(|err| FetchExecutionError::ReadExecution { typedb_source: Box::new(err) })?,
         FetchExecutionError::FetchSingleFunctionNotSingle { func_name: "func".to_string() } // TODO: Can we get function name here?
     );
@@ -276,6 +289,7 @@ fn execute_object(
     fetch_object: &FetchObjectInstruction,
     snapshot: Arc<impl ReadableSnapshot + 'static>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
@@ -288,6 +302,7 @@ fn execute_object(
                 entries,
                 snapshot,
                 thing_manager,
+                function_manager,
                 parameters,
                 functions,
                 query_profile,
@@ -305,6 +320,7 @@ fn execute_object(
 fn execute_list_function(
     snapshot: Arc<impl ReadableSnapshot + 'static>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions_registry: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
@@ -313,9 +329,10 @@ fn execute_list_function(
     variable_positions: &HashMap<Variable, VariablePosition>,
     function: &ExecutableFunction,
 ) -> Result<DocumentNode, FetchExecutionError> {
-    let (mut pattern_executor, execution_context) = prepare_single_function_execution(
+    let (mut pattern_executor, context) = prepare_single_function_execution(
         snapshot,
         thing_manager,
+        function_manager,
         parameters,
         functions_registry.clone(),
         query_profile,
@@ -328,7 +345,7 @@ fn execute_list_function(
     let mut nodes = Vec::new();
     // TODO: We could create an iterator over rows in a single call here instead
     while let Some(batch) = pattern_executor
-        .compute_next_batch(&execution_context, &mut interrupt, &mut tabled_functions)
+        .compute_next_batch(&context, &mut interrupt, &mut tabled_functions)
         .map_err(|err| FetchExecutionError::ReadExecution { typedb_source: Box::new(err) })?
     {
         for row in batch {
@@ -344,6 +361,7 @@ fn execute_list_function(
 fn execute_list_subfetch(
     snapshot: Arc<impl ReadableSnapshot + 'static>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions_registry: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
@@ -352,41 +370,27 @@ fn execute_list_subfetch(
     executable_subfetch: &ExecutableFetchListSubFetch,
 ) -> Result<DocumentNode, FetchExecutionError> {
     let ExecutableFetchListSubFetch { input_position_mapping, variable_registry, stages, fetch } = executable_subfetch;
-
-    let pipeline = if input_position_mapping.is_empty() {
-        Pipeline::build_read_pipeline(
-            snapshot,
-            thing_manager,
-            variable_registry.variable_names(),
-            None,
-            functions_registry,
-            stages,
-            Some(fetch.clone()),
-            parameters,
-            None,
-            query_profile,
-        )
-    } else {
-        let max_position = input_position_mapping.values().max().map(|pos| pos.as_usize()).unwrap();
-        let mut initial_row = vec![VariableValue::None; max_position + 1];
+    let width = input_position_mapping.values().max().map(|pos| pos.as_usize() as u32 + 1).unwrap_or(0);
+    let mut initial_batch = Batch::new(width, 1);
+    initial_batch.append(|mut write_to| {
         input_position_mapping.iter().for_each(|(parent_row_position, local_row_position)| {
-            initial_row[local_row_position.as_usize()] =
-                row[parent_row_position.as_usize()].as_reference().into_owned();
+            write_to.set(*local_row_position, row[parent_row_position.as_usize()].as_reference().into_owned());
         });
-        let initial_row = MaybeOwnedRow::new_owned(initial_row, row.multiplicity(), Provenance::INITIAL);
-        Pipeline::build_read_pipeline(
-            snapshot,
-            thing_manager,
-            variable_registry.variable_names(),
-            None,
-            functions_registry,
-            stages,
-            Some(fetch.clone()),
-            parameters,
-            Some(initial_row),
-            query_profile,
-        )
-    }
+    });
+    let pipeline = Pipeline::build_read_pipeline(
+        snapshot,
+        thing_manager,
+        function_manager,
+        variable_registry.variable_names(),
+        None,
+        functions_registry,
+        None,
+        stages,
+        Some(fetch.clone()),
+        parameters,
+        initial_batch,
+        query_profile,
+    )
     .map_err(|typedb_source| FetchExecutionError::Pipeline { typedb_source })?;
 
     let (iterator, _context) = pipeline
@@ -550,6 +554,7 @@ fn prepare_attribute_type_has_iterator<'a>(
 fn prepare_single_function_execution<Snapshot: ReadableSnapshot + 'static>(
     snapshot: Arc<Snapshot>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions_registry: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
@@ -565,17 +570,18 @@ fn prepare_single_function_execution<Snapshot: ReadableSnapshot + 'static>(
     let args = MaybeOwnedRow::new_owned(args, row.multiplicity(), Provenance::INITIAL);
 
     let step_executors =
-        create_executors_for_function(&snapshot, &thing_manager, &functions_registry, &query_profile, function)
+        create_executors_for_function(&snapshot, &thing_manager, &functions_registry, query_profile, function)
             .map_err(|err| FetchExecutionError::ConceptRead { typedb_source: err })?;
     let mut pattern_executor = PatternExecutor::new(next_executable_id(), step_executors);
     pattern_executor.prepare(FixedBatch::from(args));
-    Ok((pattern_executor, Arc::new(ExecutionContext::new(snapshot, thing_manager, parameters))))
+    Ok((pattern_executor, Arc::new(ExecutionContext::new(snapshot, thing_manager, function_manager, parameters))))
 }
 
 fn execute_object_entries(
     entries: &HashMap<ParameterID, FetchSomeInstruction>,
     snapshot: Arc<impl ReadableSnapshot + 'static>,
     thing_manager: Arc<ThingManager>,
+    function_manager: Arc<FunctionManager>,
     parameters: Arc<ParameterRegistry>,
     functions: Arc<ExecutableFunctionRegistry>,
     query_profile: Arc<QueryProfile>,
@@ -590,6 +596,7 @@ fn execute_object_entries(
                 fetch_some,
                 snapshot.clone(),
                 thing_manager.clone(),
+                function_manager.clone(),
                 parameters.clone(),
                 functions.clone(),
                 query_profile.clone(),

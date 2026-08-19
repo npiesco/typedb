@@ -13,21 +13,23 @@ use typeql::{
 };
 
 use crate::{
+    RepresentationError,
     pattern::{
+        AssignedVariable, ParameterID, Vertex,
         constraint::ConstraintsBuilder,
         expression::{
             BuiltinConceptFunctionID, BuiltinValueFunctionCall, BuiltinValueFunctionID, Expression, ExpressionTree,
             ExpressionTreeNodeId, ListConstructor, ListIndex, ListIndexRange, Operation, Operator,
         },
-        ParameterID, Vertex,
     },
     pipeline::function_signature::FunctionSignatureIndex,
     translation::{
-        constraints::{register_typeql_var, split_out_inline_expressions},
+        constraints::{
+            register_type_label, register_type_scoped_label, register_typeql_var, split_out_inline_expressions,
+        },
         literal::translate_literal,
         tokens::checked_identifier,
     },
-    RepresentationError,
 };
 
 pub(super) fn add_typeql_expression(
@@ -109,6 +111,18 @@ fn build_recursive(
             let right_id = build_recursive(function_index, constraints, &range.to, tree)?;
             Expression::ListIndexRange(ListIndexRange::new(list_variable, left_id, right_id, range.span()))
         }
+        typeql::Expression::Label(label) => {
+            let type_variable = constraints.create_anonymous_variable(label.span())?;
+            let as_label = register_type_label(constraints, label)?;
+            constraints.add_label(type_variable, as_label)?;
+            Expression::Variable(type_variable)
+        }
+        typeql::Expression::ScopedLabel(scoped_label) => {
+            let type_variable = constraints.create_anonymous_variable(scoped_label.span())?;
+            let as_label = register_type_scoped_label(constraints, scoped_label)?;
+            constraints.add_label(type_variable, as_label)?;
+            Expression::Variable(type_variable)
+        }
     };
     Ok(tree.add(expression))
 }
@@ -132,7 +146,7 @@ fn add_builtin_function_call(
     function_index: &impl FunctionSignatureIndex,
     constraints: &mut ConstraintsBuilder<'_, '_>,
     builtin_id: BuiltinConceptFunctionID,
-    assigned: Vec<Variable>,
+    assigned: Vec<AssignedVariable>,
     args: &[typeql::Expression],
     source_span: Option<Span>,
 ) -> Result<(), Box<RepresentationError>> {
@@ -141,11 +155,11 @@ fn add_builtin_function_call(
     Ok(())
 }
 
-pub fn add_user_defined_function_call(
+fn add_user_defined_function_call(
     function_index: &impl FunctionSignatureIndex,
     constraints: &mut ConstraintsBuilder<'_, '_>,
     function_name: &str,
-    assigned: Vec<Variable>,
+    assigned: Vec<AssignedVariable>,
     args: &[typeql::Expression],
     source_span: Option<Span>,
 ) -> Result<(), Box<RepresentationError>> {
@@ -161,6 +175,21 @@ pub fn add_user_defined_function_call(
     };
     constraints.add_function_binding(assigned, &callee, arguments, function_name, source_span)?;
     Ok(())
+}
+
+pub(crate) fn add_function_call(
+    function_index: &impl FunctionSignatureIndex,
+    constraints: &mut ConstraintsBuilder<'_, '_>,
+    function_name: &str,
+    assigned: Vec<AssignedVariable>,
+    args: &[typeql::Expression],
+    source_span: Option<Span>,
+) -> Result<(), Box<RepresentationError>> {
+    if let Some(std_function_id) = BuiltinConceptFunctionID::from_str(function_name) {
+        add_builtin_function_call(function_index, constraints, std_function_id, assigned, args, source_span)
+    } else {
+        add_user_defined_function_call(function_index, constraints, function_name, assigned, args, source_span)
+    }
 }
 
 fn build_function(
@@ -188,7 +217,7 @@ fn build_function(
                 function_index,
                 constraints,
                 to_builtin_concept_function_id(builtin, &function_call.args)?,
-                vec![assign],
+                vec![AssignedVariable::new_required(assign)],
                 &function_call.args,
                 function_call.span(),
             )?;
@@ -196,11 +225,11 @@ fn build_function(
         }
         FunctionName::Identifier(identifier) => {
             let assign = constraints.create_anonymous_variable(identifier.span())?;
-            add_user_defined_function_call(
+            add_function_call(
                 function_index,
                 constraints,
                 checked_identifier(identifier)?,
-                vec![assign],
+                vec![AssignedVariable::new_required(assign)],
                 &function_call.args,
                 function_call.span(),
             )?;
@@ -314,13 +343,13 @@ pub mod tests {
     use itertools::Itertools;
 
     use crate::{
-        pattern::{
-            expression::{Expression, Operation, Operator},
-            Vertex,
-        },
-        pipeline::{block::Block, function_signature::HashMapFunctionSignatureIndex, ParameterRegistry},
-        translation::{match_::translate_match, PipelineTranslationContext},
         RepresentationError,
+        pattern::{
+            Vertex,
+            expression::{Expression, Operation, Operator},
+        },
+        pipeline::{ParameterRegistry, block::Block, function_signature::HashMapFunctionSignatureIndex},
+        translation::{PipelineTranslationContext, match_::translate_match},
     };
 
     fn parse_query_get_match(

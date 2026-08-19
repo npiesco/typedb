@@ -6,17 +6,17 @@
 
 #![deny(unused_must_use)]
 
-use bytes::{byte_array::ByteArray, Bytes};
+use bytes::{Bytes, byte_array::ByteArray};
 use encoding::{
+    AsBytes, Keyable,
     graph::{
         definition::{
-            definition_key::DefinitionKey, definition_key_generator::DefinitionKeyGenerator,
-            r#struct::StructDefinition, DefinitionValueEncoding,
+            DefinitionValueEncoding, definition_key::DefinitionKey, definition_key_generator::DefinitionKeyGenerator,
+            r#struct::StructDefinition,
         },
         type_::index::NameToStructDefinitionIndex,
     },
     value::value_type::ValueType,
-    AsBytes, Keyable,
 };
 use resource::{
     constants::snapshot::BUFFER_VALUE_INLINE,
@@ -45,7 +45,7 @@ fn define_struct<Snapshot: WritableSnapshot>(
 fn get_struct_key(snapshot: &impl ReadableSnapshot, name: String) -> Option<DefinitionKey> {
     let index_key = NameToStructDefinitionIndex::build(name.as_str());
     let bytes = snapshot.get(index_key.into_storage_key().as_reference(), StorageCounters::DISABLED).unwrap();
-    bytes.map(|value| DefinitionKey::new(Bytes::Array(value)))
+    bytes.map(|value| DefinitionKey::decode(Bytes::Array(value)))
 }
 
 fn get_struct_definition(snapshot: &impl ReadableSnapshot, definition_key: &DefinitionKey) -> StructDefinition {

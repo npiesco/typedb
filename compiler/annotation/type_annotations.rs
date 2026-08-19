@@ -9,8 +9,8 @@ use std::{
     sync::Arc,
 };
 
-use answer::{variable::Variable, Type};
-use ir::pattern::{conjunction::Conjunction, constraint::Constraint, Scope, ScopeId, Vertex};
+use answer::{Type, variable::Variable};
+use ir::pattern::{Scope, ScopeId, Vertex, conjunction::Conjunction, constraint::Constraint};
 
 use crate::annotation::expression::compiled_expression::ExpressionValueType;
 
@@ -70,6 +70,16 @@ impl TypeAnnotations {
         TypeAnnotations { vertex: variables, constraints, value_type_annotations: None }
     }
 
+    pub fn new_with_value_annotations(
+        variables: BTreeMap<Vertex<Variable>, Arc<BTreeSet<Type>>>,
+        constraints: HashMap<Constraint<Variable>, ConstraintTypeAnnotations>,
+        value_type_annotations: BTreeMap<Vertex<Variable>, ExpressionValueType>,
+    ) -> Self {
+        let mut this = Self::new(variables, constraints);
+        this.value_type_annotations = Some(value_type_annotations);
+        this
+    }
+
     pub fn vertex_annotations(&self) -> &BTreeMap<Vertex<Variable>, Arc<BTreeSet<Type>>> {
         &self.vertex
     }
@@ -78,12 +88,18 @@ impl TypeAnnotations {
         self.vertex.get(vertex)
     }
 
-    pub(super) fn vertex_annotations_mut(&mut self) -> &mut BTreeMap<Vertex<Variable>, Arc<BTreeSet<Type>>> {
+    pub(crate) fn vertex_annotations_mut(&mut self) -> &mut BTreeMap<Vertex<Variable>, Arc<BTreeSet<Type>>> {
         &mut self.vertex
     }
 
     pub fn value_annotations(&self) -> &BTreeMap<Vertex<Variable>, ExpressionValueType> {
         self.value_type_annotations.as_ref().expect("Expected value annotations")
+    }
+
+    pub(crate) fn value_type_annotations_mut(
+        &mut self,
+    ) -> Option<&mut BTreeMap<Vertex<Variable>, ExpressionValueType>> {
+        self.value_type_annotations.as_mut()
     }
 
     pub fn value_type_annotations_of(&self, vertex: &Vertex<Variable>) -> Option<&ExpressionValueType> {

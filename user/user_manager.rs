@@ -14,6 +14,7 @@ use system::{
     repositories::{user_repository, user_repository::SystemDBError},
     util::transaction_util::TransactionUtil,
 };
+use uuid::Uuid;
 
 use crate::errors::{UserCreateError, UserDeleteError, UserGetError, UserUpdateError};
 
@@ -35,7 +36,7 @@ impl UserManager {
         self.transaction_util.read_transaction(|tx| {
             user_repository::get(tx, username).map_err(|query_error| match query_error {
                 SystemDBError::IllegalQueryInput { .. } => UserGetError::IllegalUsername {},
-                SystemDBError::EmptyUpdate { .. } => UserGetError::Unexpected {},
+                SystemDBError::EmptyUpdate { .. } | SystemDBError::QueryFailed { .. } => UserGetError::Unexpected {},
             })
         })
     }
@@ -44,30 +45,36 @@ impl UserManager {
         self.get(username).map(|opt| opt.is_some())
     }
 
-    pub fn create(&self, user: &User, credential: &Credential) -> Result<(), UserCreateError> {
-        match self.contains(&user.name) {
-            Ok(contains) => {
-                if contains {
-                    return Err(UserCreateError::UserAlreadyExist {});
-                }
-            }
-            Err(user_get_err) => {
-                return match user_get_err {
-                    UserGetError::IllegalUsername { .. } => Err(UserCreateError::IllegalUsername {}),
-                    UserGetError::Unexpected { .. } => Err(UserCreateError::Unexpected {}),
-                }
-            }
+    pub fn create(
+        &self,
+        user: &User,
+        credential: &Credential,
+        user_uuid: Uuid,
+        credential_uuid: Uuid,
+    ) -> Result<(), UserCreateError> {
+        if self.contains(&user.name)? {
+            return Err(UserCreateError::UserAlreadyExist {});
         }
         let create_result = self
             .transaction_util
-            .write_transaction(|snapshot, type_mgr, thing_mgr, fn_mgr, query_mgr, _dbb, _tx_opts| {
-                user_repository::create(snapshot, &type_mgr, thing_mgr.clone(), &fn_mgr, &query_mgr, user, credential)
+            .write_transaction(|snapshot, type_mgr, thing_mgr, fn_mgr, query_mgr, _db, _tx_opts| {
+                user_repository::create(
+                    snapshot,
+                    &type_mgr,
+                    thing_mgr.clone(),
+                    fn_mgr.clone(),
+                    &query_mgr,
+                    user,
+                    credential,
+                    user_uuid,
+                    credential_uuid,
+                )
             })
             .1;
         match create_result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_query_error)) => Err(UserCreateError::IllegalUsername {}),
-            Err(_commit_error) => Err(UserCreateError::Unexpected {}),
+            Ok(Err(_)) => Err(UserCreateError::IllegalUsername {}),
+            Err(_) => Err(UserCreateError::Unexpected {}),
         }
     }
 
@@ -77,6 +84,10 @@ impl UserManager {
         user: &Option<User>,
         credential: &Option<Credential>,
     ) -> Result<(), UserUpdateError> {
+        if !self.contains(username)? {
+            return Err(UserUpdateError::UserNotFound {});
+        }
+
         let update_result = self
             .transaction_util
             .write_transaction(|snapshot, type_mgr, thing_mgr, fn_mgr, query_mgr, _db, _tx_opts| {
@@ -84,7 +95,7 @@ impl UserManager {
                     snapshot,
                     &type_mgr,
                     thing_mgr.clone(),
-                    &fn_mgr,
+                    fn_mgr.clone(),
                     &query_mgr,
                     username,
                     user,
@@ -94,8 +105,8 @@ impl UserManager {
             .1;
         match update_result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_query_error)) => Err(UserUpdateError::IllegalUsername {}),
-            Err(_commit_error) => Err(UserUpdateError::Unexpected {}),
+            Ok(Err(_)) => Err(UserUpdateError::IllegalUsername {}),
+            Err(_) => Err(UserUpdateError::Unexpected {}),
         }
     }
 
@@ -103,29 +114,20 @@ impl UserManager {
         if username == DEFAULT_USER_NAME {
             return Err(UserDeleteError::DefaultUserCannotBeDeleted {});
         }
-        match self.contains(username) {
-            Ok(contains) => {
-                if !contains {
-                    return Err(UserDeleteError::UserDoesNotExist {});
-                }
-            }
-            Err(user_get_err) => {
-                return match user_get_err {
-                    UserGetError::IllegalUsername { .. } => Err(UserDeleteError::IllegalUsername {}),
-                    UserGetError::Unexpected { .. } => Err(UserDeleteError::Unexpected {}),
-                }
-            }
+        if !self.contains(username)? {
+            return Err(UserDeleteError::UserNotFound {});
         }
+
         let delete_result = self
             .transaction_util
             .write_transaction(|snapshot, type_mgr, thing_mgr, fn_mgr, query_mgr, _db, _tx_opts| {
-                user_repository::delete(snapshot, &type_mgr, thing_mgr.clone(), &fn_mgr, &query_mgr, username)
+                user_repository::delete(snapshot, &type_mgr, thing_mgr.clone(), fn_mgr.clone(), &query_mgr, username)
             })
             .1;
         match delete_result {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_query_error)) => Err(UserDeleteError::IllegalUsername {}),
-            Err(_commit_error) => Err(UserDeleteError::Unexpected {}),
+            Ok(Err(_)) => Err(UserDeleteError::IllegalUsername {}),
+            Err(_) => Err(UserDeleteError::Unexpected {}),
         }
     }
 }

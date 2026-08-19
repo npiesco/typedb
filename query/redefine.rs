@@ -9,13 +9,13 @@ use concept::{
     error::{ConceptReadError, ConceptWriteError},
     thing::thing_manager::ThingManager,
     type_::{
-        annotation::{Annotation, AnnotationError},
+        KindAPI, Ordering, TypeAPI,
+        annotation::{Annotation, AnnotationError, HasAnnotationCategory},
         attribute_type::AttributeType,
         owns::Owns,
         plays::Plays,
         relates::Relates,
         type_manager::TypeManager,
-        KindAPI, Ordering, TypeAPI,
     },
 };
 use encoding::{
@@ -23,32 +23,31 @@ use encoding::{
     value::{label::Label, value_type::ValueType},
 };
 use error::{typedb_error, unimplemented_feature};
-use function::{function::SchemaFunction, function_manager::FunctionManager, FunctionError};
-use ir::{pipeline::VariableRegistry, translation::tokens::translate_annotation, LiteralParseError};
+use function::{FunctionError, function::SchemaFunction, function_manager::FunctionManager};
+use ir::{LiteralParseError, pipeline::VariableRegistry, translation::tokens::translate_annotation};
 use resource::profile::StorageCounters;
 use storage::snapshot::{ReadableSnapshot, WritableSnapshot};
 use typeql::{
-    common::{error::TypeQLError, Span, Spanned},
+    Definable, TypeRef, TypeRefAny,
+    common::{Span, Spanned, error::TypeQLError},
     query::schema::Redefine,
     schema::definable::{
-        function::Function,
-        type_::{capability::Relates as TypeQLRelates, Capability, CapabilityBase},
         Struct, Type,
+        function::Function,
+        type_::{Capability, CapabilityBase, capability::Relates as TypeQLRelates},
     },
     token::Keyword,
-    Definable, TypeRef, TypeRefAny,
 };
 
 use crate::{
     definable_resolution::{
-        filter_variants, get_struct_field_value_type_optionality, resolve_attribute_type, resolve_relates,
-        resolve_role_type, resolve_struct_definition_key, resolve_typeql_type, resolve_value_type,
-        type_ref_to_label_and_ordering, type_to_object_type, SymbolResolutionError,
+        SymbolResolutionError, filter_variants, get_struct_field_value_type_optionality, resolve_attribute_type,
+        resolve_relates, resolve_role_type, resolve_struct_definition_key, resolve_typeql_type, resolve_value_type,
+        type_ref_to_label_and_ordering, type_to_object_type,
     },
     definable_status::{
-        get_capability_annotation_status, get_owns_status, get_plays_status, get_relates_status,
-        get_struct_field_status, get_sub_status, get_type_annotation_status, get_value_type_status, DefinableStatus,
-        DefinableStatusMode,
+        DefinableStatus, DefinableStatusMode, get_capability_annotation_status, get_owns_status, get_plays_status,
+        get_relates_status, get_struct_field_status, get_sub_status, get_type_annotation_status, get_value_type_status,
     },
 };
 
@@ -81,17 +80,19 @@ pub(crate) fn execute(
     type_manager: &TypeManager,
     thing_manager: &ThingManager,
     function_manager: &FunctionManager,
-    redefine: Redefine,
+    redefine: &Redefine,
     storage_counters: StorageCounters,
 ) -> Result<(), RedefineError> {
     if redefine.definables.is_empty() {
         return Ok(());
     }
     let redefined_structs = process_struct_redefinitions(snapshot, type_manager, thing_manager, &redefine.definables)?;
+    let renamed_roles = process_role_type_renamings(snapshot, type_manager, &redefine.definables)?;
+    let renamed_types = process_type_renamings(snapshot, type_manager, &redefine.definables)?;
     let redefined_types =
         process_type_redefinitions(snapshot, type_manager, thing_manager, &redefine.definables, storage_counters)?;
     let redefined_functions = process_function_redefinitions(snapshot, function_manager, &redefine.definables)?;
-    if !redefined_structs && !redefined_types && !redefined_functions {
+    if !redefined_structs && !renamed_roles && !renamed_types && !redefined_types && !redefined_functions {
         Err(RedefineError::NothingRedefined {})
     } else {
         Ok(())
@@ -107,6 +108,66 @@ fn process_struct_redefinitions(
     let mut anything_redefined = false;
     filter_variants!(Definable::Struct : definables).try_for_each(|struct_| {
         redefine_struct_fields(snapshot, type_manager, thing_manager, &mut anything_redefined, struct_)
+    })?;
+    Ok(anything_redefined)
+}
+
+fn process_role_type_renamings(
+    snapshot: &mut impl WritableSnapshot,
+    type_manager: &TypeManager,
+    definables: &[Definable],
+) -> Result<bool, RedefineError> {
+    let mut anything_redefined = false;
+    filter_variants!(Definable::RoleTypeRename : definables).try_for_each(|declaration| {
+        let from = Label::build_scoped(
+            checked_identifier(&declaration.from.name.ident)?,
+            checked_identifier(&declaration.from.scope.ident)?,
+            declaration.from.scope.span(),
+        );
+        let to = Label::parse_from(checked_identifier(&declaration.to.ident)?, declaration.to.span());
+        let role_type = resolve_role_type(snapshot, type_manager, &from)
+            .map_err(|source| RedefineError::DefinitionResolution { typedb_source: source })?;
+
+        debug_assert!(to.scope.is_none());
+        role_type.set_name(snapshot, type_manager, to.name.as_str()).map_err(|typedb_source| {
+            RedefineError::TypeRenameError { from, to, source_span: declaration.span(), typedb_source }
+        })?;
+        anything_redefined = true;
+        Ok(())
+    })?;
+    Ok(anything_redefined)
+}
+
+fn process_type_renamings(
+    snapshot: &mut impl WritableSnapshot,
+    type_manager: &TypeManager,
+    definables: &[Definable],
+) -> Result<bool, RedefineError> {
+    let mut anything_redefined = false;
+    filter_variants!(Definable::TypeRename : definables).try_for_each(|declaration| {
+        let from = Label::parse_from(checked_identifier(&declaration.from.ident)?, declaration.from.span());
+        let to = Label::parse_from(checked_identifier(&declaration.to.ident)?, declaration.to.span());
+        let type_ = resolve_typeql_type(snapshot, type_manager, &from)
+            .map_err(|source| RedefineError::DefinitionResolution { typedb_source: source })?;
+
+        match type_ {
+            TypeEnum::Entity(entity_type) => entity_type.set_label(snapshot, type_manager, &to),
+            TypeEnum::Relation(relation_type) => relation_type.set_label(snapshot, type_manager, &to),
+            TypeEnum::Attribute(attribute_type) => attribute_type.set_label(snapshot, type_manager, &to),
+            TypeEnum::RoleType(_) => {
+                debug_assert!(false, "Should be unreachable with an unscoped role");
+                let source_span = to.source_span();
+                return Err(RedefineError::ThingTypeRenameResolvedToRole { label: from, source_span });
+            }
+        }
+        .map_err(|typedb_source| RedefineError::TypeRenameError {
+            from,
+            to,
+            source_span: declaration.span(),
+            typedb_source,
+        })?;
+        anything_redefined = true;
+        Ok(())
     })?;
     Ok(anything_redefined)
 }
@@ -303,7 +364,7 @@ fn redefine_type_annotations(
                             type_: label.to_owned(),
                             annotation: annotation.clone(),
                             source_span: type_declaration.span(),
-                            typedb_source: AnnotationError::UnsupportedAnnotationForAttributeType {
+                            typedb_source: AnnotationError::UnsupportedAttributeTypeAnnotation {
                                 category: annotation.category(),
                             },
                         });
@@ -405,7 +466,7 @@ fn redefine_sub(
 }
 
 fn redefine_sub_annotations(typeql_capability: &Capability) -> Result<(), RedefineError> {
-    verify_no_annotations_for_capability!(typeql_capability, AnnotationError::UnsupportedAnnotationForSub, category)
+    verify_no_annotations_for_capability!(typeql_capability, AnnotationError::UnsupportedSubAnnotation, category)
 }
 
 fn redefine_value_type(
@@ -504,9 +565,7 @@ fn redefine_value_type_annotations(
             if !converted.is_value_type_annotation() {
                 return Err(RedefineError::IllegalCapabilityAnnotation {
                     source_span: typeql_capability.span(),
-                    typedb_source: AnnotationError::UnsupportedAnnotationForValueType {
-                        category: annotation.category(),
-                    },
+                    typedb_source: AnnotationError::UnsupportedValueTypeAnnotation { category: annotation.category() },
                     annotation,
                 });
             }
@@ -656,13 +715,13 @@ fn redefine_relates_specialise(
                     return Err(RedefineError::UnexpectedSpecialiseScopedLabel {
                         label: format!("{}", scoped),
                         source_span: scoped.span(),
-                    })
+                    });
                 }
                 TypeRef::Variable(variable) => {
                     return Err(RedefineError::UnexpectedSpecialiseVariable {
                         variable: variable.name().unwrap_or(VariableRegistry::UNNAMED_VARIABLE_DISPLAY_NAME).to_owned(),
                         source_span: variable.span(),
-                    })
+                    });
                 }
             },
             TypeRefAny::List(list) => {
@@ -694,7 +753,7 @@ fn redefine_relates_specialise(
                         .name()
                         .to_string(),
                     source_span: typeql_relates.span(),
-                })
+                });
             }
             DefinableStatus::ExistsSame(_) => {
                 return Err(RedefineError::RelatesSpecialiseRemainsSame {
@@ -714,7 +773,7 @@ fn redefine_relates_specialise(
                         .name()
                         .to_string(),
                     source_span: typeql_relates.span(),
-                })
+                });
             }
             DefinableStatus::ExistsDifferent(_) => {}
         };
@@ -932,11 +991,11 @@ fn redefine_function(
     anything_redefined: &mut bool,
     function_declaration: &Function,
 ) -> Result<SchemaFunction, RedefineError> {
-    let function = function_manager.redefine_function(snapshot, function_declaration).map_err(|source| {
+    let function = function_manager.redefine_function(snapshot, function_declaration).map_err(|typedb_source| {
         RedefineError::FunctionRedefinition {
             name: function_declaration.signature.ident.as_str_unchecked().to_owned(),
             source_span: function_declaration.span(),
-            typedb_source: Box::new(source),
+            typedb_source,
         }
     })?;
     *anything_redefined = true;
@@ -997,7 +1056,7 @@ fn type_convert_and_validate_annotation_redefinition_need<T: KindAPI>(
     })?;
 
     let definition_status =
-        get_type_annotation_status(snapshot, type_manager, type_, &converted, annotation.category())
+        get_type_annotation_status(snapshot, type_manager, type_, &converted, &annotation.category())
             .map_err(|source| RedefineError::UnexpectedConceptRead { typedb_source: source })?;
     match definition_status {
         DefinableStatus::DoesNotExist => Err(RedefineError::TypeAnnotationNotDefined {
@@ -1328,6 +1387,20 @@ typedb_error! {
             39,
             "The reserved keyword '{identifier}' cannot be used as an identifier.",
             identifier: typeql::Identifier,
+            source_span: Option<Span>,
+        ),
+        TypeRenameError(
+            40,
+            "Renaming the type '{from}' to '{to}' failed.",
+            from: Label,
+            to: Label,
+            source_span: Option<Span>,
+            typedb_source: Box<ConceptWriteError>,
+        ),
+        ThingTypeRenameResolvedToRole(
+            41,
+            "When resolving the type to rename, the unscoped label '{label}' resolved to a role-type.",
+            label: Label,
             source_span: Option<Span>,
         ),
     }

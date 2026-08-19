@@ -31,15 +31,19 @@ rust_library(
         "@crates//:chrono",
         "@crates//:serde"
     ],
+    proc_macro_deps = [
+        "@crates//:paste",
+    ],
 )
 
 rust_test(
     name = "test_crate_compiler",
     crate = ":compiler",
     deps = [
+        "//diagnostics",
         "//durability",
+        "//storage/tests:test_utils_storage",
         "//util/test:test_utils",
-        "//resource",
     ]
 )
 

@@ -11,20 +11,20 @@ use std::{borrow::Cow, collections::HashMap, ops::Bound};
 use concept::{
     error::ConceptReadError,
     thing::{
+        ThingAPI,
         attribute::Attribute,
         entity::Entity,
         object::{Object, ObjectAPI},
         relation::Relation,
-        ThingAPI,
     },
     type_::{
+        Ordering, OwnerAPI, PlayerAPI,
         annotation::{AnnotationCardinality, AnnotationDistinct, AnnotationIndependent, AnnotationUnique},
         attribute_type::AttributeTypeAnnotation,
         object_type::ObjectType,
         owns::OwnsAnnotation,
         relates::RelatesAnnotation,
         type_manager::TypeManager,
-        Ordering, OwnerAPI, PlayerAPI,
     },
 };
 use encoding::{
@@ -41,7 +41,7 @@ use itertools::Itertools;
 use resource::profile::{CommitProfile, StorageCounters};
 use storage::{
     durability_client::WALClient,
-    snapshot::{CommittableSnapshot, ReadSnapshot, ReadableSnapshot, SchemaSnapshot, WritableSnapshot, WriteSnapshot},
+    snapshot::{CommittableSnapshot, ReadSnapshot, SchemaSnapshot, WritableSnapshot, WriteSnapshot},
 };
 use test_utils_concept::{load_managers, setup_concept_storage};
 use test_utils_encoding::create_core_storage;

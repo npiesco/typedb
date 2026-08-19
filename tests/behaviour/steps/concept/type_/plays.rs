@@ -6,7 +6,11 @@
 
 use std::sync::Arc;
 
-use concept::type_::{annotation, constraint::Constraint, plays::PlaysAnnotation, Capability, PlayerAPI, TypeAPI};
+use concept::type_::{
+    Capability, PlayerAPI, TypeAPI,
+    annotation::{self, HasAnnotationCategory},
+    constraint::Constraint,
+};
 use cucumber::gherkin::Step;
 use itertools::Itertools;
 use macro_rules_attribute::apply;
@@ -14,9 +18,9 @@ use resource::profile::StorageCounters;
 
 use super::thing_type::get_as_object_type;
 use crate::{
-    generic_step,
+    Context, generic_step,
     transaction_context::{with_read_tx, with_schema_tx},
-    unused_step, util, when_then, Context,
+    unused_step, util, when_then,
 };
 
 #[apply(generic_step)]
@@ -372,6 +376,7 @@ pub async fn get_plays_declared_annotation_categories_contains(
     annotation_category: params::AnnotationCategory,
 ) {
     let player_type = get_as_object_type(context, kind.into_typedb(), type_label);
+    let annotation_category = annotation_category.into_typedb();
     with_read_tx!(context, |tx| {
         let role_type =
             tx.type_manager.get_role_type(tx.snapshot.as_ref(), &role_label.into_typedb()).unwrap().unwrap();
@@ -380,8 +385,7 @@ pub async fn get_plays_declared_annotation_categories_contains(
             .get_annotations_declared(tx.snapshot.as_ref(), &tx.type_manager)
             .unwrap()
             .iter()
-            .map(|annotation| <PlaysAnnotation as Into<annotation::Annotation>>::into(annotation.clone()).category())
-            .contains(&annotation_category.into_typedb());
+            .any(|annotation| annotation.has_category(&annotation_category));
         assert_eq!(contains_or_doesnt.expected_contains(), actual_contains);
     });
 }

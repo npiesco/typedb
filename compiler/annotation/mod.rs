@@ -4,20 +4,30 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use concept::error::ConceptReadError;
-use encoding::value::{label::Label, value_type::ValueTypeCategory};
+use answer::variable::Variable;
+use concept::{
+    error::ConceptReadError,
+    type_::{TypeAPI, type_manager::TypeManager},
+};
+use encoding::value::{
+    label::Label,
+    value_type::{ValueType, ValueTypeCategory},
+};
 use error::typedb_error;
 use expression::ExpressionCompileError;
+use ir::pipeline::{ParameterRegistry, VariableRegistry, function_signature::FunctionID};
+use storage::snapshot::ReadableSnapshot;
 use typeql::common::Span;
+
+use crate::annotation::{expression::compiled_expression::ExpressionValueType, function::AnnotatedFunctionSignatures};
 
 pub mod expression;
 pub mod fetch;
 pub mod function;
-pub mod match_inference;
+pub mod inference;
 pub mod pipeline;
 pub mod type_annotations;
 pub mod type_inference;
-mod type_seeder;
 pub(crate) mod write_type_check;
 
 typedb_error!(
@@ -91,7 +101,7 @@ typedb_error!(
         UnsupportedValueTypeForReducer(
             15,
             "The input variable to the reducer had an unsupported value-type: '{value_type}'",
-            reducer: String,
+            reducer: &'static str,
             variable: String,
             value_type: ValueTypeCategory,
             source_span: Option<Span>,
@@ -107,12 +117,34 @@ typedb_error!(
         ReducerInputVariableIsList(
             17,
             "The input variable '{variable}' to the reducer '{reducer}' was a list.",
-            reducer: String,
+            reducer: &'static str,
             variable: String,
             source_span: Option<Span>,
         ),
+        CouldNotResolveGivenRowDeclaredType(
+            18,
+            "An error occurred when trying to resolve the type of the given rows at index: {index}.",
+            index: usize,
+            source_span: Option<Span>,
+            typedb_source: TypeInferenceError
+        ),
+        ValueTypeMismatch(
+            19,
+            "The argument to the function {function_id} is expected to have value type '{expected}', found '{actual}'.",
+            function_id: FunctionID,
+            expected: ValueType,
+            actual: ExpressionValueType,
+            source_span: Option<Span>,
+        ),
+        Internal(100, "Internal error: {message}", message: String),
     }
 );
+
+impl From<Box<ConceptReadError>> for AnnotationError {
+    fn from(value: Box<ConceptReadError>) -> Self {
+        Self::ConceptRead { typedb_source: value }
+    }
+}
 
 typedb_error!(
     pub FunctionAnnotationError(component = "Function type inference", prefix = "FIN") {
@@ -217,26 +249,105 @@ typedb_error!(
     }
 );
 
+pub struct PipelineAnnotationContext<'a, Snapshot: ReadableSnapshot> {
+    pub(crate) snapshot: &'a Snapshot,
+    pub(crate) type_manager: &'a TypeManager,
+    pub(crate) annotated_function_signatures: &'a dyn AnnotatedFunctionSignatures,
+    pub(crate) variable_registry: &'a mut VariableRegistry,
+    pub(crate) parameters: &'a ParameterRegistry,
+}
+
+impl<'a, Snapshot: ReadableSnapshot> PipelineAnnotationContext<'a, Snapshot> {
+    pub fn new(
+        snapshot: &'a Snapshot,
+        type_manager: &'a TypeManager,
+        annotated_function_signatures: &'a dyn AnnotatedFunctionSignatures,
+        variable_registry: &'a mut VariableRegistry,
+        parameters: &'a ParameterRegistry,
+    ) -> Self {
+        Self { snapshot, type_manager, annotated_function_signatures, variable_registry, parameters }
+    }
+
+    pub(crate) fn to_parts_mut(
+        &mut self,
+    ) -> (AnnotationContext<'a, Snapshot>, &mut VariableRegistry, &ParameterRegistry) {
+        let Self { snapshot, type_manager, annotated_function_signatures, variable_registry, parameters } = self;
+        (AnnotationContext::new(snapshot, type_manager, *annotated_function_signatures), variable_registry, parameters)
+    }
+
+    pub(crate) fn name_for_error(&self, variable: Variable) -> String {
+        self.variable_registry.get_variable_name_or_unnamed(variable).to_owned()
+    }
+
+    pub(crate) fn label_for_error(&self, type_: impl TypeAPI) -> Result<String, TypeInferenceError> {
+        match type_.get_label(self.snapshot, self.type_manager) {
+            Ok(label) => Ok(label.scoped_name().as_str().to_string()),
+            Err(typedb_source) => Err(TypeInferenceError::ConceptRead { typedb_source }),
+        }
+    }
+
+    pub(crate) fn type_label_for_error(&self, type_: answer::Type) -> Result<String, TypeInferenceError> {
+        match type_.get_label(self.snapshot, self.type_manager) {
+            Ok(label) => Ok(label.scoped_name().as_str().to_string()),
+            Err(typedb_source) => Err(TypeInferenceError::ConceptRead { typedb_source }),
+        }
+    }
+}
+
+pub(crate) struct AnnotationContext<'a, Snapshot: ReadableSnapshot> {
+    pub(crate) snapshot: &'a Snapshot,
+    pub(crate) type_manager: &'a TypeManager,
+    pub(crate) annotated_function_signatures: &'a dyn AnnotatedFunctionSignatures,
+}
+
+impl<'a, Snapshot: ReadableSnapshot> AnnotationContext<'a, Snapshot> {
+    pub(crate) fn new(
+        snapshot: &'a Snapshot,
+        type_manager: &'a TypeManager,
+        annotated_function_signatures: &'a dyn AnnotatedFunctionSignatures,
+    ) -> Self {
+        Self { snapshot, type_manager, annotated_function_signatures }
+    }
+
+    pub(crate) fn for_pipeline(
+        &self,
+        variable_registry: &'a mut VariableRegistry,
+        parameters: &'a ParameterRegistry,
+    ) -> PipelineAnnotationContext<'a, Snapshot> {
+        PipelineAnnotationContext::new(
+            self.snapshot,
+            self.type_manager,
+            self.annotated_function_signatures,
+            variable_registry,
+            parameters,
+        )
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
+    #![allow(const_item_mutation, reason = "`&mut CommitProfile::DISABLED` is a dummy")]
+
     use std::sync::Arc;
 
     use concept::{
         thing::{statistics::Statistics, thing_manager::ThingManager},
         type_::type_manager::TypeManager,
     };
-    use durability::{wal::WAL, DurabilitySequenceNumber};
+    use diagnostics::metrics::FsyncMetrics;
+    use durability::{DurabilitySequenceNumber, wal::WAL};
     use encoding::{
+        EncodingKeyspace,
         graph::{
             definition::definition_key_generator::DefinitionKeyGenerator,
             thing::vertex_generator::ThingVertexGenerator, type_::vertex_generator::TypeVertexGenerator,
         },
-        EncodingKeyspace,
     };
-    use storage::{durability_client::WALClient, MVCCStorage};
-    use test_utils::{create_tmp_dir, init_logging, TempDir};
+    use storage::{MVCCStorage, durability_client::WALClient};
+    use test_utils::{TempDir, create_tmp_storage_dir, init_logging};
+    use test_utils_storage::create_rocks_resources;
 
-    use crate::annotation::match_inference::{
+    use crate::annotation::inference::match_inference::{
         NestedTypeInferenceGraphDisjunction, TypeInferenceEdge, TypeInferenceGraph,
     };
 
@@ -272,11 +383,17 @@ pub mod tests {
 
     pub(crate) fn setup_storage() -> (TempDir, Arc<MVCCStorage<WALClient>>) {
         init_logging();
-        let storage_path = create_tmp_dir();
-        let wal = WAL::create(&storage_path).unwrap();
+        let storage_path = create_tmp_storage_dir();
+        let wal = WAL::create(&storage_path, FsyncMetrics::disabled()).unwrap();
+        let resources = create_rocks_resources();
         let storage = Arc::new(
-            MVCCStorage::<WALClient>::create::<EncodingKeyspace>("storage", &storage_path, WALClient::new(wal))
-                .unwrap(),
+            MVCCStorage::<WALClient>::create::<EncodingKeyspace>(
+                "storage",
+                &storage_path,
+                WALClient::new(wal),
+                &resources,
+            )
+            .unwrap(),
         );
         (storage_path, storage)
     }
@@ -301,8 +418,8 @@ pub mod tests {
         use concept::{
             thing::thing_manager::ThingManager,
             type_::{
-                annotation::AnnotationAbstract, attribute_type::AttributeTypeAnnotation,
-                entity_type::EntityTypeAnnotation, type_manager::TypeManager, Ordering, OwnerAPI, PlayerAPI,
+                Ordering, OwnerAPI, PlayerAPI, annotation::AnnotationAbstract, attribute_type::AttributeTypeAnnotation,
+                entity_type::EntityTypeAnnotation, type_manager::TypeManager,
             },
         };
         use encoding::value::{label::Label, value_type::ValueType};

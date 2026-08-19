@@ -9,23 +9,27 @@ use std::collections::{HashMap, HashSet};
 use answer::variable::Variable;
 use ir::{
     pattern::{constraint::Constraint, nested_pattern::NestedPattern},
-    pipeline::{block::Block, VariableRegistry},
+    pipeline::{VariableRegistry, block::Block},
 };
 use typeql::common::Span;
 
 use crate::{
+    VariablePosition,
     annotation::type_annotations::{BlockAnnotations, TypeAnnotations},
     executable::{
+        WriteCompilationError,
         insert::{
-            executable::{add_inserted_concepts, get_thing_position, prepare_output_row_schema, resolve_links_roles},
-            instructions::ConceptInstruction,
             VariableSource,
+            executable::{
+                add_inserted_concepts, concept_instructions_map_to_vec, get_thing_position, prepare_output_row_schema,
+                resolve_links_roles,
+            },
+            instructions::ConceptInstruction,
         },
         next_executable_id,
         update::instructions::{ConnectionInstruction, Has, Links},
-        WriteCompilationError,
     },
-    filter_variants, VariablePosition,
+    filter_variants,
 };
 
 #[derive(Debug)]
@@ -52,7 +56,7 @@ pub fn compile(
     source_span: Option<Span>,
 ) -> Result<UpdateExecutable, Box<WriteCompilationError>> {
     let mut variable_positions = input_variables.clone();
-    let attributes_inserts = add_inserted_concepts(
+    let attributes_inserts_map = add_inserted_concepts(
         block.conjunction(),
         block_annotations,
         variable_registry,
@@ -68,6 +72,18 @@ pub fn compile(
         variable_registry,
         input_variables,
     )?;
+
+    let unsafely_used_optional_variable = block
+        .conjunction()
+        .constraints()
+        .iter()
+        .flat_map(|constraint| constraint.ids())
+        .find(|var| variable_registry.is_variable_optional(*var));
+
+    if let Some(var) = unsafely_used_optional_variable {
+        let variable = variable_registry.get_variable_name_or_unnamed(var).to_owned();
+        return Err(Box::new(WriteCompilationError::OptionalVariableUsedOutsideTry { source_span, variable }));
+    }
 
     let mut optional_updates = Vec::with_capacity(block.conjunction().nested_patterns().len());
     for nested_pattern in block.conjunction().nested_patterns() {
@@ -86,6 +102,7 @@ pub fn compile(
         )?);
     }
 
+    let attributes_inserts = concept_instructions_map_to_vec(attributes_inserts_map);
     Ok(UpdateExecutable {
         executable_id: next_executable_id(),
         concept_instructions: attributes_inserts,
@@ -111,7 +128,7 @@ impl OptionalUpdate {
         input_variables: &HashMap<Variable, VariablePosition>,
         stage_source_span: Option<Span>,
     ) -> Result<Self, Box<WriteCompilationError>> {
-        let concept_instructions = add_inserted_concepts(
+        let concept_instruction_map = add_inserted_concepts(
             optional.conjunction(),
             block_annotations,
             variable_registry,
@@ -135,6 +152,8 @@ impl OptionalUpdate {
             .flat_map(|constraint| constraint.ids())
             .filter_map(|id| input_variables.get(&id).copied())
             .collect();
+
+        let concept_instructions = concept_instructions_map_to_vec(concept_instruction_map);
 
         Ok(Self { concept_instructions, connection_instructions, required_input_variables })
     }

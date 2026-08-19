@@ -6,31 +6,24 @@ features = {}
 
 [package]
 	name = "test_utils_concept"
-	edition = "2021"
+	edition = "2024"
 	version = "0.0.0"
 
 [lib]
 	path = "test_utils_concept.rs"
+	crate-type = ["lib"]
 
 [dependencies]
 
 	[dependencies.durability]
-		path = "../../durability"
-		features = []
-		default-features = false
+		workspace = true
 
 	[dependencies.concept]
-		path = "../../concept"
-		features = []
-		default-features = false
+		workspace = true
 
 	[dependencies.storage]
-		path = "../../storage"
-		features = []
-		default-features = false
+		workspace = true
 
 	[dependencies.encoding]
-		path = "../../encoding"
-		features = []
-		default-features = false
+		workspace = true
 

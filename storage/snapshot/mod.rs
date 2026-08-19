@@ -5,8 +5,8 @@
  */
 
 pub use snapshot::{
-    CommittableSnapshot, ReadSnapshot, ReadableSnapshot, SchemaSnapshot, SnapshotError, SnapshotGetError,
-    WritableSnapshot, WriteSnapshot,
+    CommittableSnapshot, PreloadedRangesSnapshot, ReadSnapshot, ReadableSnapshot, SchemaSnapshot, SnapshotError,
+    SnapshotGetError, WritableSnapshot, WriteSnapshot,
 };
 
 pub mod buffer;
@@ -14,4 +14,5 @@ pub mod iterator;
 pub mod lock;
 pub(crate) mod pool;
 mod snapshot;
+pub mod snapshot_id;
 pub mod write;

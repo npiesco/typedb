@@ -6,18 +6,18 @@
 
 use std::{fmt, mem, ops::Range};
 
-use bytes::{byte_array::ByteArray, util::HexBytesFormatter, Bytes};
+use bytes::{Bytes, byte_array::ByteArray, util::HexBytesFormatter};
 use resource::constants::snapshot::BUFFER_KEY_INLINE;
 use storage::{key_value::StorageKeyReference, keyspace::KeyspaceSet};
 
 use crate::{
+    AsBytes, EncodingKeyspace, Keyable, Prefixed,
     graph::{
+        Typed,
         thing::ThingVertex,
         type_::vertex::{TypeID, TypeVertex},
-        Typed,
     },
     layout::prefix::{Prefix, PrefixID},
-    AsBytes, EncodingKeyspace, Keyable, Prefixed,
 };
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, Ord, PartialOrd)]
@@ -74,6 +74,14 @@ impl ObjectVertex {
         Self::LENGTH
     }
 
+    pub fn is_entity(&self) -> bool {
+        self.prefix == Prefix::VertexEntity
+    }
+
+    pub fn is_relation(&self) -> bool {
+        self.prefix == Prefix::VertexRelation
+    }
+
     const fn range_object_id() -> Range<usize> {
         Self::RANGE_TYPE_ID.end..Self::RANGE_TYPE_ID.end + ObjectID::LENGTH
     }
@@ -108,7 +116,7 @@ impl ThingVertex for ObjectVertex {
 
     fn decode(bytes: &[u8]) -> ObjectVertex {
         debug_assert_eq!(bytes.len(), Self::LENGTH);
-        let prefix = Prefix::from_prefix_id(PrefixID { byte: bytes[0] });
+        let prefix = Prefix::from_prefix_id(PrefixID { byte: bytes[0] }).expect("Unrecognized prefix byte");
         let type_id = TypeID::decode(bytes[Self::RANGE_TYPE_ID].try_into().unwrap());
         let object_id = ObjectID::decode(bytes[Self::range_object_id()].try_into().unwrap());
         Self { prefix, type_id, object_id }

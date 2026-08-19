@@ -10,10 +10,12 @@ use lending_iterator::LendingIterator;
 use storage::snapshot::ReadableSnapshot;
 
 use crate::{
+    ExecutionInterrupt, Provenance,
     batch::{FixedBatch, FixedBatchRowIterator},
     error::ReadExecutionError,
     pipeline::stage::ExecutionContext,
     read::{
+        BranchIndex, ExecutorIndex,
         control_instruction::{
             CollectingStage, ControlInstruction, ExecuteDisjunctionBranch, ExecuteImmediate, ExecuteInlinedFunction,
             ExecuteNegation, ExecuteOptional, ExecuteStreamModifier, ExecuteTabledCall, MapBatchToRowsForNested,
@@ -24,10 +26,8 @@ use crate::{
         suspension::{NestedPatternSuspension, PatternSuspension, QueryPatternSuspensions, TabledCallSuspension},
         tabled_call_executor::TabledCallResult,
         tabled_functions::{TabledFunctionPatternExecutorState, TabledFunctions},
-        BranchIndex, ExecutorIndex,
     },
     row::MaybeOwnedRow,
-    ExecutionInterrupt, Provenance,
 };
 
 #[derive(Debug)]
@@ -209,12 +209,22 @@ impl PatternExecutor {
                         last_seen_table_size,
                     )?;
                 }
-                ControlInstruction::CollectingStage(CollectingStage { index, mut collector }) => {
-                    let inner = executors[*index].unwrap_collecting_stage().pattern_mut();
+                ControlInstruction::CollectingStage(CollectingStage {
+                    index,
+                    mut collector,
+                    profile: step_profile,
+                }) => {
+                    let collecting_stage = executors[*index].unwrap_collecting_stage();
+                    let measurement = step_profile.start_measurement();
+                    let storage_counters = step_profile.storage_counters();
+                    let inner = collecting_stage.pattern_mut();
+                    let mut batches = 0;
                     while let Some(batch) = inner.compute_next_batch(context, interrupt, tabled_functions)? {
-                        collector.accept(context, batch);
+                        collector.accept(context, batch, &storage_counters);
+                        batches += 1;
                     }
-                    let iterator = collector.into_iterator(context);
+                    let iterator = collector.into_iterator(context, step_profile.storage_counters());
+                    measurement.end(&step_profile, batches, iterator.initial_len() as u64);
                     self.control_stack.push(StreamCollected { index, iterator }.into());
                 }
                 ControlInstruction::StreamCollected(StreamCollected { index, mut iterator }) => {
@@ -265,7 +275,8 @@ impl PatternExecutor {
                 StepExecutors::CollectingStage(collecting_stage) => {
                     collecting_stage.prepare(batch);
                     let collector = collecting_stage.create_collector();
-                    self.control_stack.push(CollectingStage { index: next_index, collector }.into());
+                    let profile = collecting_stage.step_profile(&context.profile);
+                    self.control_stack.push(CollectingStage { index: next_index, collector, profile }.into());
                 }
                 StepExecutors::ReshapeForReturn(_) => {
                     self.control_stack.push(ReshapeForReturn { index: next_index, to_reshape: batch }.into());
@@ -343,6 +354,7 @@ impl PatternExecutor {
                 let context_with_function_parameters = ExecutionContext::new_with_profile(
                     context.snapshot.clone(),
                     context.thing_manager.clone(),
+                    context.function_manager.clone(),
                     parameters.clone(),
                     context.profile.clone(),
                 );

@@ -14,9 +14,13 @@ use encoding::{
     value::{label::Label, value_type::ValueType},
 };
 use error::typedb_error;
-use storage::{sequence_number::SequenceNumber, MVCCStorage};
+use storage::{
+    MVCCStorage, durability_client::DurabilityClient, keyspace::KeyspaceSet, sequence_number::SequenceNumber,
+    snapshot::iterator::SnapshotIteratorError,
+};
 
 use crate::type_::{
+    Independent, KindAPI, Ordering, OwnerAPI, PlayerAPI,
     attribute_type::AttributeType,
     constraint::{CapabilityConstraint, Constraint, ConstraintCategory, TypeConstraint},
     entity_type::EntityType,
@@ -26,16 +30,18 @@ use crate::type_::{
     relates::{Relates, RelatesAnnotation},
     relation_type::RelationType,
     role_type::RoleType,
-    type_manager::type_cache::{
-        kind_cache::{
-            AttributeTypeCache, CommonTypeCache, EntityTypeCache, ObjectCache, OwnsCache, PlaysCache, RelatesCache,
-            RelationTypeCache, RoleTypeCache,
+    sub::{Sub, SubAnnotation},
+    type_manager::{
+        preload_schema_from,
+        type_cache::{
+            kind_cache::{
+                AttributeTypeCache, CommonTypeCache, EntityTypeCache, ObjectCache, OwnsCache, PlaysCache, RelatesCache,
+                RelationTypeCache, RoleTypeCache,
+            },
+            selection::{self, CacheGetter, HasCommonTypeCache, HasObjectCache},
+            struct_definition_cache::StructDefinitionCache,
         },
-        selection,
-        selection::{CacheGetter, HasCommonTypeCache, HasObjectCache},
-        struct_definition_cache::StructDefinitionCache,
     },
-    Independent, KindAPI, Ordering, OwnerAPI, PlayerAPI,
 };
 
 // TODO: could/should we slab allocate the schema cache?
@@ -81,16 +87,15 @@ selection::impl_has_object_cache!(EntityTypeCache, EntityType);
 selection::impl_has_object_cache!(RelationTypeCache, RelationType);
 
 impl TypeCache {
-    // If creation becomes slow, We should restore pre-fetching of the schema
-    //  with a single pass on disk (as it was in 1f339733feaf4542e47ff604462f107d2ade1f1a)
     pub fn new<D>(
         storage: Arc<MVCCStorage<D>>,
         open_sequence_number: SequenceNumber,
-    ) -> Result<Self, TypeCacheCreateError> {
-        // note: since we will parse out many heterogenous properties/edges from the schema, we will scan once into a vector,
-        //       then go through it again to pull out the type information.
-
-        let snapshot = storage.open_snapshot_read_at(open_sequence_number);
+    ) -> Result<Self, TypeCacheCreateError>
+    where
+        D: DurabilityClient,
+    {
+        let snapshot = preload_schema_from(&storage.clone().open_snapshot_read_at(open_sequence_number))
+            .map_err(|source| TypeCacheCreateError::SnapshotIterate { source })?;
 
         let entity_type_caches = EntityTypeCache::create(&snapshot);
         let relation_type_caches = RelationTypeCache::create(&snapshot);
@@ -469,6 +474,25 @@ impl TypeCache {
         &AttributeType::get_cache(self, attribute_type).value_type
     }
 
+    pub(crate) fn get_sub_entity_type_annotations_declared(&self, sub: Sub<EntityType>) -> &HashSet<SubAnnotation> {
+        &EntityType::get_cache(self, sub.subtype()).common_type_cache.sub_annotations_declared
+    }
+
+    pub(crate) fn get_sub_relation_type_annotations_declared(&self, sub: Sub<RelationType>) -> &HashSet<SubAnnotation> {
+        &RelationType::get_cache(self, sub.subtype()).common_type_cache.sub_annotations_declared
+    }
+
+    pub(crate) fn get_sub_attribute_type_annotations_declared(
+        &self,
+        sub: Sub<AttributeType>,
+    ) -> &HashSet<SubAnnotation> {
+        &AttributeType::get_cache(self, sub.subtype()).common_type_cache.sub_annotations_declared
+    }
+
+    pub(crate) fn get_sub_role_type_annotations_declared(&self, sub: Sub<RoleType>) -> &HashSet<SubAnnotation> {
+        &RoleType::get_cache(self, sub.subtype()).common_type_cache.sub_annotations_declared
+    }
+
     pub(crate) fn get_owns_annotations_declared(&self, owns: Owns) -> &HashSet<OwnsAnnotation> {
         &self.owns.get(&owns).unwrap().common_capability_cache.annotations_declared
     }
@@ -505,5 +529,6 @@ impl TypeCache {
 typedb_error! {
     pub TypeCacheCreateError(component = "TypeCache create", prefix = "TCC") {
         Empty(1, ""),
+        SnapshotIterate(2, "Failed to load schema keyspace into the type cache.", source: Arc<SnapshotIteratorError>),
     }
 }

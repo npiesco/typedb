@@ -11,24 +11,26 @@ use encoding::value::label::Label;
 use error::typedb_error;
 use primitive::maybe_owns::MaybeOwns;
 use typeql::{
+    Expression, TypeRef, TypeRefAny, Variable as TypeQLVariable,
     common::{Span, Spanned},
     expression::{FunctionCall, FunctionName},
     query::stage::{
+        Fetch as TypeQLFetch,
         fetch::{
             FetchAttribute, FetchList as TypeQLFetchList, FetchObject as TypeQLFetchObject,
             FetchObjectBody as TypeQLFetchObjectBody, FetchSingle as TypeQLFetchSingle, FetchSingle,
             FetchSome as TypeQLFetchSome, FetchStream,
         },
-        Fetch as TypeQLFetch,
     },
     schema::definable::function::{FunctionBlock, SingleSelector},
     value::StringLiteral,
-    Expression, TypeRef, TypeRefAny, Variable as TypeQLVariable,
 };
 
 use crate::{
-    pattern::ParameterID,
+    RepresentationError,
+    pattern::{AssignedVariable, ParameterID, expression::BuiltinConceptFunctionID},
     pipeline::{
+        FunctionReadError, FunctionRepresentationError, ParameterRegistry,
         block::{Block, BlockBuilder, BlockBuilderContext},
         fetch::{
             FetchListAttributeAsList, FetchListAttributeFromList, FetchListSubFetch, FetchObject, FetchSingleAttribute,
@@ -36,21 +38,19 @@ use crate::{
         },
         function::{Function, FunctionBody, ReturnOperation},
         function_signature::{FunctionSignature, FunctionSignatureIndex},
-        FunctionReadError, ParameterRegistry,
     },
     translation::{
-        expression::{add_user_defined_function_call, build_expression},
+        PipelineTranslationContext,
+        expression::{add_function_call, build_expression},
         fetch::FetchRepresentationError::{
             AnonymousVariableEncountered, InvalidAttributeLabelEncountered, NamedVariableEncountered,
             VariableNotAvailable,
         },
         function::translate_function_block,
         literal::FromTypeQLLiteral,
-        pipeline::{translate_pipeline_stages, TranslatedStage},
+        pipeline::{TranslatedStage, translate_pipeline_stages},
         tokens::checked_identifier,
-        PipelineTranslationContext,
     },
-    RepresentationError,
 };
 
 pub(super) fn translate_fetch(
@@ -155,9 +155,10 @@ fn translate_fetch_list(
         FetchStream::SubQueryFetch(stages) => {
             // clone context, since we don't want the inline function to affect the parent context
             let mut local_context = parent_context.clone();
-            let (translated_stages, subfetch) =
+            let (_translated_given, translated_stages, subfetch) =
                 translate_pipeline_stages(function_index, &mut local_context, value_parameters, stages)
                     .map_err(|err| FetchRepresentationError::SubFetchRepresentation { typedb_source: err })?;
+            debug_assert!(_translated_given.is_none());
             if let Some(subfetch) = subfetch {
                 let input_variables = find_sub_fetch_inputs(parent_context, &translated_stages, &subfetch);
                 Ok(FetchSome::ListSubFetch(FetchListSubFetch {
@@ -173,8 +174,12 @@ fn translate_fetch_list(
         FetchStream::SubQueryFunctionBlock(block) => {
             // clone context, since we don't want the inline function to affect the parent context
             let mut local_context = parent_context.clone();
-            let body = translate_function_block(function_index, &mut local_context, value_parameters, block)
-                .map_err(|err| FetchRepresentationError::FunctionRepresentation { declaration: block.clone() })?;
+            let body = translate_function_block(function_index, &mut local_context, value_parameters, block).map_err(
+                |typedb_source| FetchRepresentationError::FunctionRepresentation {
+                    declaration: block.clone(),
+                    typedb_source,
+                },
+            )?;
             if !body.return_operation.is_scalar()
                 && !matches!(body.return_operation, ReturnOperation::ReduceReducer(_, _))
             {
@@ -235,12 +240,18 @@ fn translate_fetch_single(
             Expression::ListIndexRange(_) => {
                 Err(Box::new(FetchRepresentationError::Unimplemented { description: "list index range".to_string() }))
             }
+            Expression::Label(label) => Ok(FetchSome::Label(parse_label(label)?)),
+            Expression::ScopedLabel(scoped_label) => Ok(FetchSome::Label(parse_scoped_label(scoped_label)?)),
         },
         FetchSingle::FunctionBlock(block) => {
             // clone context, since we don't want the inline function to affect the parent context
             let mut local_context = parent_context.clone();
-            let body = translate_function_block(function_index, &mut local_context, value_parameters, block)
-                .map_err(|err| FetchRepresentationError::FunctionRepresentation { declaration: block.clone() })?;
+            let body = translate_function_block(function_index, &mut local_context, value_parameters, block).map_err(
+                |typedb_source| FetchRepresentationError::FunctionRepresentation {
+                    declaration: block.clone(),
+                    typedb_source,
+                },
+            )?;
             if body.return_operation().is_stream() {
                 return Err(Box::new(FetchRepresentationError::ExpectedSingleFunctionBlock {
                     declaration: block.clone(),
@@ -264,26 +275,30 @@ fn translate_fetch_single(
 fn extract_fetch_attribute(fetch_attribute: &FetchAttribute) -> Result<(bool, Label), Box<FetchRepresentationError>> {
     match &fetch_attribute.attribute {
         TypeRefAny::Type(type_ref) => match &type_ref {
-            TypeRef::Label(label) => {
-                let checked_label = checked_identifier(&label.ident).map_err(|typedb_source| {
-                    Box::new(FetchRepresentationError::SubFetchRepresentation { typedb_source })
-                })?;
-                Ok((false, Label::parse_from(checked_label, label.span())))
-            }
+            TypeRef::Label(label) => Ok((false, parse_label(label)?)),
             TypeRef::Scoped(_) => Err(Box::new(InvalidAttributeLabelEncountered { declaration: type_ref.clone() })),
             TypeRef::Variable(_) => Err(Box::new(NamedVariableEncountered { declaration: type_ref.clone() })),
         },
         TypeRefAny::List(list) => match &list.inner {
-            TypeRef::Label(label) => {
-                let checked_label = checked_identifier(&label.ident).map_err(|typedb_source| {
-                    Box::new(FetchRepresentationError::SubFetchRepresentation { typedb_source })
-                })?;
-                Ok((true, Label::parse_from(checked_label, label.span())))
-            }
+            TypeRef::Label(label) => Ok((true, parse_label(label)?)),
             TypeRef::Scoped(_) => Err(Box::new(InvalidAttributeLabelEncountered { declaration: list.inner.clone() })),
             TypeRef::Variable(_) => Err(Box::new(NamedVariableEncountered { declaration: list.inner.clone() })),
         },
     }
+}
+
+fn parse_label(label: &typeql::Label) -> Result<Label, Box<FetchRepresentationError>> {
+    let checked_label = checked_identifier(&label.ident)
+        .map_err(|typedb_source| Box::new(FetchRepresentationError::SubFetchRepresentation { typedb_source }))?;
+    Ok(Label::parse_from(checked_label, label.span()))
+}
+
+fn parse_scoped_label(scoped_label: &typeql::ScopedLabel) -> Result<Label, Box<FetchRepresentationError>> {
+    let name = checked_identifier(&scoped_label.name.ident)
+        .map_err(|typedb_source| Box::new(FetchRepresentationError::SubFetchRepresentation { typedb_source }))?;
+    let scope = checked_identifier(&scoped_label.scope.ident)
+        .map_err(|typedb_source| Box::new(FetchRepresentationError::SubFetchRepresentation { typedb_source }))?;
+    Ok(Label::build_scoped(name, scope, scoped_label.span()))
 }
 
 // translate an expression that produces a single output (not a stream)
@@ -322,7 +337,7 @@ fn translate_inline_user_function_call_single(
     function_name: &str,
 ) -> Result<FetchSome, Box<FetchRepresentationError>> {
     let (local_context, stage, assign_vars, signature) =
-        translate_inline_user_function_call(context, value_parameters, function_index, call, function_name)?;
+        translate_inline_function_call(context, value_parameters, function_index, call, function_name)?;
     if signature.return_is_stream {
         Err(Box::new(FetchRepresentationError::ExpectedSingleInlineFunctionCall { declaration: call.clone() }))
     } else {
@@ -342,7 +357,7 @@ fn translate_inline_user_function_call_stream(
     function_name: &str,
 ) -> Result<FetchSome, Box<FetchRepresentationError>> {
     let (local_context, stage, assign_vars, _) =
-        translate_inline_user_function_call(context, value_parameters, function_index, call, function_name)?;
+        translate_inline_function_call(context, value_parameters, function_index, call, function_name)?;
     let parameters = value_parameters.clone();
     let return_ = ReturnOperation::Stream(assign_vars, call.span());
     let body = FunctionBody::new(vec![stage], return_);
@@ -350,7 +365,7 @@ fn translate_inline_user_function_call_stream(
     Ok(FetchSome::ListFunction(create_anonymous_function(local_context, parameters, args, body)))
 }
 
-fn translate_inline_user_function_call<'a>(
+fn translate_inline_function_call<'a>(
     context: &mut PipelineTranslationContext,
     value_parameters: &mut ParameterRegistry,
     function_index: &'a impl FunctionSignatureIndex,
@@ -360,16 +375,20 @@ fn translate_inline_user_function_call<'a>(
     (PipelineTranslationContext, TranslatedStage, Vec<Variable>, MaybeOwns<'a, FunctionSignature>),
     Box<FetchRepresentationError>,
 > {
-    let signature = function_index
-        .get_function_signature(function_name)
-        .map_err(|err| FetchRepresentationError::FunctionRetrieval {
-            name: function_name.to_owned(),
-            typedb_source: err,
-        })?
-        .ok_or_else(|| FetchRepresentationError::FunctionNotFound {
-            name: function_name.to_owned(),
-            declaration: call.clone(),
-        })?;
+    let signature = if let Some(std_function_id) = BuiltinConceptFunctionID::from_str(function_name) {
+        MaybeOwns::Owned(std_function_id.signature())
+    } else {
+        function_index
+            .get_function_signature(function_name)
+            .map_err(|err| FetchRepresentationError::FunctionRetrieval {
+                name: function_name.to_owned(),
+                typedb_source: err,
+            })?
+            .ok_or_else(|| FetchRepresentationError::FunctionNotFound {
+                name: function_name.to_owned(),
+                declaration: call.clone(),
+            })?
+    };
 
     if signature.returns.len() > 1 {
         return Err(Box::new(FetchRepresentationError::ExpectedScalarInlineFunctionCall { declaration: call.clone() }));
@@ -385,23 +404,22 @@ fn translate_inline_user_function_call<'a>(
         value_parameters,
     );
     let mut builder = Block::builder(builder_context);
-
+    let mut conjunction = builder.conjunction_mut();
     let mut assign_vars = Vec::new();
     for _ in &signature.returns {
         assign_vars.push(
-            builder
-                .conjunction_mut()
+            conjunction
                 .constraints_mut()
                 .create_anonymous_variable(None)
                 .map_err(|err| FetchRepresentationError::ExpressionAsMatchRepresentation { typedb_source: err })?,
         );
     }
 
-    add_user_defined_function_call(
+    add_function_call(
         function_index,
-        &mut builder.conjunction_mut().constraints_mut(),
+        &mut conjunction.constraints_mut(),
         function_name,
-        assign_vars.clone(),
+        assign_vars.iter().map(|var| AssignedVariable::new_required(*var)).collect(),
         &call.args,
         call.span(),
     )
@@ -420,14 +438,14 @@ fn add_expression(
     builder: &mut BlockBuilder<'_>,
     typeql_expression: &Expression,
 ) -> Result<Variable, Box<FetchRepresentationError>> {
-    let mut conjunction_builder = builder.conjunction_mut();
-    let assign_var = conjunction_builder
+    let mut conjunction = builder.conjunction_mut();
+    let assign_var = conjunction
         .constraints_mut()
         .create_anonymous_variable(None)
         .map_err(|err| FetchRepresentationError::ExpressionAsMatchRepresentation { typedb_source: err })?;
-    let expression = build_expression(function_index, &mut conjunction_builder.constraints_mut(), typeql_expression)
+    let expression = build_expression(function_index, &mut conjunction.constraints_mut(), typeql_expression)
         .map_err(|err| FetchRepresentationError::ExpressionRepresentation { typedb_source: err })?;
-    let _ = conjunction_builder
+    let _ = conjunction
         .constraints_mut()
         .add_assignment(assign_var, expression, typeql_expression.span())
         .map_err(|err| FetchRepresentationError::ExpressionAsMatchRepresentation { typedb_source: err })?;
@@ -440,7 +458,7 @@ fn create_anonymous_function(
     args: Vec<Variable>,
     body: FunctionBody,
 ) -> Function {
-    Function::new("_generated_fetch_inline_function_", context, parameters, args, None, None, body)
+    Function::new("_generated_fetch_inline_function_", context, parameters, args, None, None, body, Vec::new())
 }
 
 // Given a function body, and the _parent_ translation context, we can reconstruct which are arguments
@@ -497,7 +515,7 @@ fn try_get_variable(
 ) -> Result<Variable, Box<FetchRepresentationError>> {
     let name = match variable {
         TypeQLVariable::Anonymous { .. } => {
-            return Err(Box::new(AnonymousVariableEncountered { declaration: variable.clone() }))
+            return Err(Box::new(AnonymousVariableEncountered { declaration: variable.clone() }));
         }
         TypeQLVariable::Named { .. } => variable.name().unwrap(),
     };
@@ -563,7 +581,8 @@ typedb_error! {
         FunctionRepresentation(
             10,
             "Failed to build inline function representation.",
-            declaration: FunctionBlock
+            declaration: FunctionBlock,
+            typedb_source: Box<FunctionRepresentationError>
         ),
         ExpectedSingleFunctionBlock(
             11,

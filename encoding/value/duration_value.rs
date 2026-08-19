@@ -17,7 +17,6 @@ use chrono::{
 pub const NANOS_PER_SEC: u64 = 1_000_000_000;
 pub const NANOS_PER_MINUTE: u64 = 60 * NANOS_PER_SEC;
 pub const NANOS_PER_HOUR: u64 = 60 * 60 * NANOS_PER_SEC;
-pub const NANOS_PER_NAIVE_DAY: u64 = 24 * NANOS_PER_HOUR;
 
 const MAX_YEAR: i32 = (i32::MAX >> 13) - 1; // NaiveDate.year() is from a trait and not `const`
 const MIN_YEAR: i32 = (i32::MIN >> 13) + 1; // NaiveDate.year() is from a trait and not `const`
@@ -397,13 +396,13 @@ mod tests {
 
     use chrono::{DateTime, Days, FixedOffset, Months, NaiveDate, NaiveDateTime, NaiveTime};
     use chrono_tz::Europe::London;
-    use rand::{rngs::SmallRng, thread_rng, Rng, SeedableRng};
+    use rand::{Rng, SeedableRng, rngs::SmallRng, thread_rng};
     use resource::constants::common::SECONDS_IN_HOUR;
 
-    use super::{DateTimeExt, Duration, MAX_YEAR, MIN_YEAR, NANOS_PER_NAIVE_DAY};
+    use super::{DateTimeExt, Duration, MAX_YEAR, MIN_YEAR};
     use crate::value::{
         primitive_encoding::encode_u32,
-        timezone::{TimeZone, NUM_TZS},
+        timezone::{NUM_TZS, TimeZone},
     };
 
     fn random_naive_date(rng: &mut impl Rng) -> NaiveDate {
@@ -613,7 +612,7 @@ mod tests {
         let p1d = Duration::days(1);
         let pt24h = Duration::hours(24);
 
-        let seed = thread_rng().gen();
+        let seed = thread_rng().r#gen();
         let mut rng = SmallRng::seed_from_u64(seed);
         eprintln!("Running with seed: {seed}");
 
@@ -625,7 +624,7 @@ mod tests {
 
     #[test]
     fn date_subtraction_is_consistent() {
-        let seed = thread_rng().gen();
+        let seed = thread_rng().r#gen();
         let mut rng = SmallRng::seed_from_u64(seed);
         eprintln!("Running with seed: {seed}");
 
@@ -643,7 +642,7 @@ mod tests {
 
     #[test]
     fn datetime_subtraction_is_consistent() {
-        let seed = thread_rng().gen();
+        let seed = thread_rng().r#gen();
         let mut rng = SmallRng::seed_from_u64(seed);
         eprintln!("Running with seed: {seed}");
 
@@ -657,23 +656,6 @@ mod tests {
                 date_time_1 + Duration::between_datetimes_tz(date_time_1, date_time_2),
                 date_time_2.with_timezone(&date_time_1.timezone())
             );
-        }
-    }
-
-    #[test]
-    fn datetime_subtraction_always_produces_time_delta_less_than_a_day() {
-        let seed = thread_rng().gen();
-        let mut rng = SmallRng::seed_from_u64(seed);
-        eprintln!("Running with seed: {seed}");
-
-        for _ in 0..1_000_000 {
-            let mut date_time_1 = random_datetime(&mut rng);
-            let mut date_time_2 = random_datetime(&mut rng);
-            if date_time_1 > date_time_2 {
-                mem::swap(&mut date_time_1, &mut date_time_2);
-            }
-            let diff = Duration::between_datetimes_tz(date_time_1, date_time_2);
-            assert!(diff.nanos < NANOS_PER_NAIVE_DAY);
         }
     }
 

@@ -4,6 +4,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+#![allow(clippy::identity_op, reason = "One hour is more clear as 1 * SECONDS_IN_HOUR")]
+
 pub mod common {
     pub const SECONDS_IN_MINUTE: u64 = 60;
     pub const MINUTES_IN_HOUR: u64 = 60;
@@ -16,22 +18,33 @@ pub mod common {
     pub const SECONDS_IN_MONTH: u64 = SECONDS_IN_DAY * DAYS_IN_MONTH;
     pub const SECONDS_IN_YEAR: u64 = SECONDS_IN_DAY * DAYS_IN_YEAR;
 
+    pub const KB: u64 = 1024;
+    pub const MB: u64 = 1024 * KB;
+    pub const GB: u64 = 1024 * MB;
+
     pub const ERROR_QUERY_POINTER_LINES_BEFORE: usize = 2;
     pub const ERROR_QUERY_POINTER_LINES_AFTER: usize = 2;
+
+    pub const STUDIO_URL: &str = "https://studio.typedb.com";
+
+    /// Unix mode-bit patterns
+    pub const PERMISSION_BITS_ALL: u32 = 0o777;
+    pub const PERMISSION_BITS_OWNER_RW: u32 = 0o600;
 }
 
 pub mod server {
     use std::time::Duration;
 
     use crate::{
-        constants::common::{SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_YEAR},
-        server_info::ServerInfo,
+        constants::common::{GB, SECONDS_IN_HOUR, SECONDS_IN_MINUTE, SECONDS_IN_YEAR},
+        distribution_info::DistributionInfo,
     };
 
-    const DISTRIBUTION: &str = "TypeDB CE";
+    pub const DISTRIBUTION: &str = "TypeDB CE";
     const VERSION: &str = include_str!("../VERSION");
     const ASCII_LOGO: &str = include_str!("typedb-ascii.txt");
-    pub const SERVER_INFO: ServerInfo = ServerInfo { logo: ASCII_LOGO, distribution: DISTRIBUTION, version: VERSION };
+    pub const DISTRIBUTION_INFO: DistributionInfo =
+        DistributionInfo { logo: ASCII_LOGO, distribution: DISTRIBUTION, version: VERSION };
     pub const DEFAULT_CONFIG_PATH: &str = "config.yml";
 
     #[macro_export]
@@ -43,6 +56,12 @@ pub mod server {
     pub const SYSTEM_FILE_PREFIX: &str = system_file_prefix!();
 
     pub const GRPC_CONNECTION_KEEPALIVE: Duration = Duration::from_secs(2 * SECONDS_IN_HOUR);
+
+    pub const GRPC_MAX_MESSAGE_SIZE: usize = GB as usize;
+
+    pub const HTTP_MAX_MESSAGE_SIZE: usize = GB as usize;
+  
+    pub const MAX_CONCURRENT_IMPORTS: usize = 8;
 
     // TODO: Maybe we start moving these options to separate crates?
     pub const DEFAULT_PREFETCH_SIZE: usize = 32;
@@ -58,6 +77,9 @@ pub mod server {
 
     pub const PERF_COUNTERS_ENABLED: bool = true;
 
+    pub const ADMIN_DEFAULT_SOCKET_FILENAME: &str = "admin.sock";
+    pub const ADMIN_DEFAULT_WINDOWS_PIPE_NAME: &str = "typedb_admin";
+    pub const ADMIN_SOCKET_FILE_MODE: u32 = super::common::PERMISSION_BITS_OWNER_RW;
     pub const MONITORING_DEFAULT_PORT: u16 = 4104;
 
     pub const SERVER_ID_FILE_NAME: &str = concat!(system_file_prefix!(), "server_id");
@@ -77,12 +99,13 @@ pub mod server {
     pub const DEFAULT_AUTHENTICATION_TOKEN_EXPIRATION: Duration =
         Duration::from_secs(DEFAULT_AUTHENTICATION_TOKEN_EXPIRATION_SECONDS);
 
-    pub const DATABASE_METRICS_UPDATE_INTERVAL: Duration = Duration::from_secs(10 * SECONDS_IN_MINUTE);
-
     pub const DEFAULT_USER_NAME: &str = "admin";
     pub const DEFAULT_USER_PASSWORD: &str = "password";
     pub const DEFAULT_DATA_DIR: &str = "data";
     pub const DEFAULT_LOG_DIR: &str = "log";
+
+    pub const DATABASE_METRICS_UPDATE_INTERVAL: Duration = Duration::from_secs(15);
+    pub const SYSTEM_METRICS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
     pub const SENTRY_REPORTING_URI: &str =
         "https://3d710295c75c81492e57e1997d9e01e1@o4506315929812992.ingest.sentry.io/4506316048629760";
@@ -93,8 +116,11 @@ pub mod database {
 
     // anything lower than 2.0 will cause too much replanning
     // anything over 8.0 often does not plan frequently enough, as the data scales
+    pub const QUERY_PLAN_CACHE_FLUSH_STATIC_SMOOTH_THRESHOLD: u64 = 100;
     pub const QUERY_PLAN_CACHE_FLUSH_ANY_STATISTIC_CHANGE_FRACTION: f64 = 3.0;
     pub const QUERY_PLAN_CACHE_SIZE: u64 = 100;
+    pub const QUERY_PARSE_CACHE_SIZE: u64 = 200;
+    pub const QUERY_TRANSLATION_CACHE_SIZE: u64 = 200;
     pub const STATISTICS_DURABLE_WRITE_CHANGE_COUNT: u64 = 10_000;
     pub const STATISTICS_DURABLE_WRITE_SEQ_NUMBERS: usize = 1_000;
     pub const STATISTICS_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
@@ -114,6 +140,10 @@ pub mod concept {
     pub const RELATION_INDEX_THRESHOLD: u64 = 5;
 }
 
+pub mod query {
+    pub const MAX_PIPELINE_STAGES: usize = 1000;
+}
+
 pub mod traversal {
     pub const CONSTANT_CONCEPT_LIMIT: usize = 1000;
     pub const FIXED_BATCH_ROWS_MAX: u32 = 64;
@@ -131,8 +161,6 @@ pub mod storage {
     pub const WAL_SYNC_INTERVAL_MICROSECONDS: u64 = 1000;
     pub const WATERMARK_WAIT_INTERVAL_MICROSECONDS: u64 = 50;
     pub const COMMIT_WAIT_FOR_FSYNC: bool = true;
-
-    pub const ROCKSDB_CACHE_SIZE_MB: u64 = 1024;
 }
 
 pub mod encoding {
@@ -161,7 +189,7 @@ pub mod diagnostics {
     // The key is write-only and safe to expose
     pub const POSTHOG_API_KEY: &str = "phc_pYoyROZCtNDL8obeJfLZ8cP0UKzIAxmd0JcQQ03i07T";
 
-    pub const REPORT_INTERVAL: Duration = Duration::from_secs(1 * SECONDS_IN_HOUR);
+    pub const REPORT_INTERVAL: Duration = Duration::from_secs(2 * SECONDS_IN_HOUR);
     pub const REPORT_INTERVAL_MIN_DELAY: Duration = Duration::from_secs(20 * SECONDS_IN_MINUTE);
     pub const REPORT_ONCE_DELAY: Duration = Duration::from_secs(1 * SECONDS_IN_HOUR);
 

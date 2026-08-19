@@ -9,19 +9,20 @@ use std::{
     hash::Hash,
     path::{Path, PathBuf},
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
     },
     time::Duration,
 };
 
 use chrono::{Timelike, Utc};
-use concurrency::TokioIntervalRunner;
-use error::{typedb_error, TypeDBError};
+use concurrency::{IntervalTaskParameters, TokioTaskSpawner};
+use error::{TypeDBError, typedb_error};
 use hyper::{
+    Body, Client, Request,
     client::HttpConnector,
     header::{CONNECTION, CONTENT_TYPE},
-    http, Body, Client, Request,
+    http,
 };
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use logger::{debug, trace};
@@ -34,7 +35,7 @@ use resource::constants::{
     },
 };
 
-use crate::{hash_string_consistently, Diagnostics};
+use crate::{Diagnostics, hash_string_consistently};
 
 #[derive(Debug)]
 pub struct Reporter {
@@ -42,7 +43,7 @@ pub struct Reporter {
     diagnostics: Arc<Diagnostics>,
     data_directory: PathBuf,
     is_posthog_enabled: Arc<AtomicBool>,
-    _reporting_job: Arc<Mutex<Option<TokioIntervalRunner>>>,
+    background_tasks: TokioTaskSpawner,
 }
 
 impl Reporter {
@@ -51,13 +52,14 @@ impl Reporter {
         diagnostics: Arc<Diagnostics>,
         data_directory: PathBuf,
         is_enabled: bool,
+        background_tasks: TokioTaskSpawner,
     ) -> Self {
         Self {
             deployment_id,
             diagnostics,
             data_directory,
             is_posthog_enabled: Arc::new(AtomicBool::new(is_enabled)),
-            _reporting_job: Arc::new(Mutex::new(None)),
+            background_tasks,
         }
     }
 
@@ -74,7 +76,7 @@ impl Reporter {
         let is_posthog_enabled = self.is_posthog_enabled.clone();
         let diagnostics = self.diagnostics.clone();
 
-        let reporting_job = TokioIntervalRunner::new_with_initial_delay(
+        self.background_tasks.spawn_interval(
             move || {
                 let is_posthog_enabled = is_posthog_enabled.clone();
                 let diagnostics = diagnostics.clone();
@@ -82,11 +84,8 @@ impl Reporter {
                     Self::report(is_posthog_enabled, false, diagnostics).await;
                 }
             },
-            REPORT_INTERVAL,
-            self.calculate_initial_delay(),
-            true,
+            IntervalTaskParameters::new_with_delay(REPORT_INTERVAL, self.calculate_initial_delay(), true),
         );
-        *self._reporting_job.lock().expect("Expected reporting job exclusive lock acquisition") = Some(reporting_job);
     }
 
     fn report_once_if_needed(&self) {
@@ -221,24 +220,25 @@ impl Reporter {
 
     // Delay is calculated based on deployment id (same for every server in the same deployment)
     fn calculate_initial_delay(&self) -> Duration {
-        let report_interval_secs = REPORT_INTERVAL.as_secs();
-        assert!(report_interval_secs == 3600, "Modify the algorithm if you change the interval!");
+        let report_interval_mins = REPORT_INTERVAL.as_secs() / SECONDS_IN_MINUTE;
+        assert!(report_interval_mins == 120, "Modify the algorithm if you change the interval!");
 
-        let current_minute = Utc::now().minute() as u64;
-        let scheduled_minute =
-            hash_string_consistently(&self.deployment_id) % (report_interval_secs / SECONDS_IN_MINUTE);
+        let current_minute_in_interval =
+            Utc::now().time().num_seconds_from_midnight() as u64 / SECONDS_IN_MINUTE % report_interval_mins;
+        let scheduled_minute_in_interval = hash_string_consistently(&self.deployment_id) % report_interval_mins;
 
-        let mut delay_secs = if current_minute > scheduled_minute {
-            report_interval_secs - current_minute * SECONDS_IN_MINUTE + scheduled_minute * SECONDS_IN_MINUTE
+        let mut delay = if current_minute_in_interval > scheduled_minute_in_interval {
+            REPORT_INTERVAL - Duration::from_secs(current_minute_in_interval * SECONDS_IN_MINUTE)
+                + Duration::from_secs(scheduled_minute_in_interval * SECONDS_IN_MINUTE)
         } else {
-            (scheduled_minute - current_minute) * SECONDS_IN_MINUTE
+            Duration::from_secs((scheduled_minute_in_interval - current_minute_in_interval) * SECONDS_IN_MINUTE)
         };
 
-        if delay_secs < REPORT_INTERVAL_MIN_DELAY.as_secs() {
+        if delay < REPORT_INTERVAL_MIN_DELAY {
             // Skip this interval's report if the delay is too short to avoid CI reports
-            delay_secs += REPORT_INTERVAL.as_secs();
+            delay += REPORT_INTERVAL;
         }
-        Duration::from_secs(delay_secs)
+        delay
     }
 
     fn report_inner_error(error: DiagnosticsReporterError) {
