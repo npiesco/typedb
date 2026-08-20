@@ -623,9 +623,17 @@ impl Server {
     }
 
     fn install_default_encryption_provider() -> Result<(), ServerOpenError> {
-        tokio_rustls::rustls::crypto::ring::default_provider()
-            .install_default()
-            .map_err(|_| ServerOpenError::HttpTlsUnsetDefaultCryptoProvider {})
+        if tokio_rustls::rustls::crypto::ring::default_provider().install_default().is_ok() {
+            return Ok(());
+        }
+        // The default provider is process-global and can only be installed
+        // once, so a second install attempt fails even though the process is
+        // correctly configured. Only report an error if none is installed.
+        if tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_some() {
+            Ok(())
+        } else {
+            Err(ServerOpenError::HttpTlsUnsetDefaultCryptoProvider {})
+        }
     }
 
     pub fn server_state(&self) -> Arc<ServerState> {

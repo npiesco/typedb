@@ -59,11 +59,6 @@ fn build_query_packet(sql: &str) -> Vec<u8> {
     packet
 }
 
-/// Build a raw Terminate message: 'X' + 4-byte length (4)
-fn build_terminate_packet() -> Vec<u8> {
-    vec![MSG_TERMINATE, 0, 0, 0, 4]
-}
-
 /// Read exactly one wire protocol message from the stream.
 /// Returns (type_byte, payload) where payload does NOT include the type byte or length.
 fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {

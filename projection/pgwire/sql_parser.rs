@@ -459,6 +459,11 @@ fn convert_binary_op(op: BinaryOperator) -> Result<ComparisonOp, SqlParseError> 
 
 fn expr_to_literal(expr: Expr) -> Result<LiteralValue, SqlParseError> {
     match expr {
+        // `COLLATE` only selects the collation a comparison uses; the literal
+        // it qualifies is unchanged. DuckDB attaches one to every string
+        // predicate it pushes down.
+        Expr::Collate { expr, .. } => expr_to_literal(*expr),
+        Expr::Nested(inner) => expr_to_literal(*inner),
         Expr::Value(val_with_span) => match val_with_span.value {
             Value::SingleQuotedString(s) => Ok(LiteralValue::String(s)),
             Value::Number(n, _) => {

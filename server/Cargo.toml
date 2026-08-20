@@ -215,3 +215,7 @@
 	path = "service/pgwire_e2e_test.rs"
 	name = "test_pgwire_e2e"
 
+[[test]]
+	path = "service/pgwire_clients_test.rs"
+	name = "test_pgwire_clients"
+

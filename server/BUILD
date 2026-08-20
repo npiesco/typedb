@@ -137,7 +137,10 @@ rust_test(
 
 rust_test(
     name = "test_pgwire_e2e",
-    srcs = ["service/pgwire_e2e_test.rs"],
+    srcs = [
+        "service/pgwire_e2e_test.rs",
+        "service/pgwire_harness.rs",
+    ],
     data = [":config.yml"],
     deps = [
         ":server",

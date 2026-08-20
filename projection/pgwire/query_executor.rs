@@ -348,7 +348,7 @@ fn is_pg_catalog_table(table: &str) -> bool {
 }
 
 fn execute_special_duckdb_query(catalog: &dyn ProjectionCatalog, sql: &str) -> Option<QueryOutcome> {
-    let normalized = normalize_sql(sql);
+    let normalized = normalize_sql_for_matching(sql);
 
     if normalized == "select oid, nspname from pg_namespace order by oid" {
         let columns = vec![pg_catalog_oid_col("oid"), pg_catalog_text_col("nspname")];
@@ -381,21 +381,20 @@ fn execute_special_duckdb_query(catalog: &dyn ProjectionCatalog, sql: &str) -> O
         return Some(QueryOutcome::Result(QueryResult { columns, rows: vec![], command_tag: None }));
     }
 
+    // Composite (row) types. TypeDB projections never define one, so the answer
+    // is always empty; only the row description has to line up with the query.
     if normalized.contains("from pg_type t")
         && normalized.contains("join pg_catalog.pg_namespace n")
-        && normalized.contains("join pg_class")
-        && normalized.contains("join pg_attribute")
         && normalized.contains("join pg_type sub_type")
-        && normalized.contains("pg_class.relkind = 'c'")
-        && normalized.contains("t.typtype = 'c'")
+        && normalized.contains("t.typtype='c'")
     {
-        let columns = vec![
-            pg_catalog_oid_col("oid"),
-            pg_catalog_oid_col("id"),
-            pg_catalog_text_col("type"),
-            pg_catalog_text_col("attname"),
-            pg_catalog_text_col("typname"),
-        ];
+        let columns = leading_select_output_names(&normalized)
+            .iter()
+            .map(|name| match name.as_str() {
+                "oid" | "id" => pg_catalog_oid_col(name),
+                _ => pg_catalog_text_col(name),
+            })
+            .collect();
         return Some(QueryOutcome::Result(QueryResult { columns, rows: vec![], command_tag: None }));
     }
 
@@ -439,20 +438,8 @@ fn execute_special_dbt_query(sql: &str) -> Option<QueryOutcome> {
 }
 
 fn execute_duckdb_table_introspection(catalog: &dyn ProjectionCatalog, normalized_sql: &str) -> QueryOutcome {
-    let columns = vec![
-        pg_catalog_oid_col("namespace_id"),
-        pg_catalog_text_col("relname"),
-        pg_catalog_int4_col("relpages"),
-        pg_catalog_text_col("attname"),
-        pg_catalog_text_col("type_name"),
-        pg_catalog_int4_col("type_modifier"),
-        pg_catalog_int4_col("ndim"),
-        pg_catalog_int4_col("attnum"),
-        pg_catalog_bool_col("notnull"),
-        pg_catalog_oid_col("constraint_id"),
-        pg_catalog_text_col("constraint_type"),
-        pg_catalog_text_col("constraint_key"),
-    ];
+    let names = leading_select_output_names(normalized_sql);
+    let columns = names.iter().map(|name| duckdb_introspection_column(name)).collect();
 
     let schema_filter = extract_duckdb_introspection_filter(normalized_sql, "pg_namespace.nspname='");
     let relation_filter = extract_duckdb_introspection_filter(normalized_sql, "relname='");
@@ -469,20 +456,14 @@ fn execute_duckdb_table_introspection(catalog: &dyn ProjectionCatalog, normalize
             }
 
             for (index, column) in projection.columns.iter().enumerate() {
-                rows.push(vec![
-                    Some("2200".into()),
-                    Some(projection.name.clone()),
-                    None,
-                    Some(column.name.clone()),
-                    Some(pg_type_name(column.type_oid).to_string()),
-                    Some("-1".into()),
-                    Some("0".into()),
-                    Some((index + 1).to_string()),
-                    Some("f".into()),
-                    None,
-                    None,
-                    None,
-                ]);
+                rows.push(duckdb_introspection_row(
+                    &names,
+                    "2200",
+                    &projection.name,
+                    &column.name,
+                    pg_type_name(column.type_oid),
+                    index + 1,
+                ));
             }
         }
     }
@@ -498,24 +479,56 @@ fn execute_duckdb_table_introspection(catalog: &dyn ProjectionCatalog, normalize
         }
 
         for (index, (column_name, type_oid)) in relation.columns.iter().enumerate() {
-            rows.push(vec![
-                Some(relation.namespace_id.to_string()),
-                Some(relation.name.to_string()),
-                None,
-                Some((*column_name).to_string()),
-                Some(pg_type_name(*type_oid).to_string()),
-                Some("-1".into()),
-                Some("0".into()),
-                Some((index + 1).to_string()),
-                Some("f".into()),
-                None,
-                None,
-                None,
-            ]);
+            rows.push(duckdb_introspection_row(
+                &names,
+                &relation.namespace_id.to_string(),
+                relation.name,
+                column_name,
+                pg_type_name(*type_oid),
+                index + 1,
+            ));
         }
     }
 
     QueryOutcome::Result(QueryResult { columns, rows, command_tag: None })
+}
+
+fn duckdb_introspection_column(name: &str) -> ColumnDescription {
+    match name {
+        "namespace_id" | "constraint_id" => pg_catalog_oid_col(name),
+        "relpages" | "type_modifier" | "ndim" | "attnum" => pg_catalog_int4_col(name),
+        "notnull" => pg_catalog_bool_col(name),
+        _ => pg_catalog_text_col(name),
+    }
+}
+
+/// Build one introspection row in the order the client asked for its columns.
+///
+/// Columns this facade has no answer for — including any the client added in a
+/// newer release — are reported as NULL rather than shifting the row.
+fn duckdb_introspection_row(
+    names: &[String],
+    namespace_id: &str,
+    relname: &str,
+    attname: &str,
+    type_name: &str,
+    attnum: usize,
+) -> Vec<Option<String>> {
+    names
+        .iter()
+        .map(|name| match name.as_str() {
+            "namespace_id" => Some(namespace_id.to_string()),
+            "relname" => Some(relname.to_string()),
+            "attname" => Some(attname.to_string()),
+            "type_name" => Some(type_name.to_string()),
+            "type_schema" => Some("pg_catalog".to_string()),
+            "type_modifier" => Some("-1".to_string()),
+            "ndim" => Some("0".to_string()),
+            "attnum" => Some(attnum.to_string()),
+            "notnull" => Some("f".to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 struct DuckdbVirtualRelation {
@@ -609,6 +622,76 @@ fn pg_type_name(type_oid: PgOid) -> &'static str {
 
 fn normalize_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
+/// Normalized form used to fingerprint client-generated catalog SQL.
+///
+/// On top of [`normalize_sql`] this removes whitespace around `=`, so a client
+/// that reformats `a = 'b'` as `a='b'` between releases does not silently
+/// disable a matcher and fall through to the general-purpose parser.
+fn normalize_sql_for_matching(sql: &str) -> String {
+    let normalized = normalize_sql(sql);
+    let mut compacted = String::with_capacity(normalized.len());
+    for part in normalized.split('=') {
+        if !compacted.is_empty() {
+            compacted.push('=');
+        }
+        compacted.push_str(if compacted.is_empty() { part.trim_end() } else { part.trim() });
+    }
+    compacted
+}
+
+/// Output column names of the leading `SELECT` list in `normalized_sql`.
+///
+/// Catalog introspection SQL emitted by BI clients gains columns between
+/// releases. Deriving the row description from the query itself keeps a canned
+/// answer aligned with whatever the client actually asked for, instead of
+/// silently returning a differently-shaped result the client then misreads.
+fn leading_select_output_names(normalized_sql: &str) -> Vec<String> {
+    let Some(after_select) = normalized_sql.strip_prefix("select ") else { return Vec::new() };
+
+    let mut depth = 0usize;
+    let mut end = after_select.len();
+    for (index, ch) in after_select.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            'f' if depth == 0 && after_select[index..].starts_with("from ") => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    let mut item_start = 0usize;
+    let list = &after_select[..end];
+    for (index, ch) in list.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                names.push(select_item_output_name(&list[item_start..index]));
+                item_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    names.push(select_item_output_name(&list[item_start..]));
+    names.into_iter().filter(|name| !name.is_empty()).collect()
+}
+
+/// The name a single select-list item is reported under: its alias if it has
+/// one, otherwise the trailing segment of a qualified reference.
+fn select_item_output_name(item: &str) -> String {
+    let item = item.trim();
+    let base = match item.rfind(" as ") {
+        Some(index) => &item[index + 4..],
+        None => item.rsplit(' ').next().unwrap_or(item),
+    };
+    base.trim().rsplit('.').next().unwrap_or(base).trim_matches('"').to_string()
 }
 
 enum OutputColumn {
