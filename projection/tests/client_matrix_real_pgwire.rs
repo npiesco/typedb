@@ -264,8 +264,14 @@ async fn duckdb_attach_scan_filter_and_detach_succeeds() {
     let stdout = String::from_utf8_lossy(&run.value.output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&run.value.output.stderr).into_owned();
 
-    assert!(run.value.database_file_created, "DuckDB combined smoke should run against a file-backed temporary database.");
-    assert!(run.value.temp_dir_removed, "DuckDB combined smoke should remove its temporary database directory after the run.");
+    assert!(
+        run.value.database_file_created,
+        "DuckDB combined smoke should run against a file-backed temporary database."
+    );
+    assert!(
+        run.value.temp_dir_removed,
+        "DuckDB combined smoke should remove its temporary database directory after the run."
+    );
     assert!(
         run.value.output.status.code() == Some(0),
         "DuckDB attach/scan/filter/detach should succeed in the combined client matrix target.\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}\nserver_errors:\n{}\nquery_batches:\n{:#?}",

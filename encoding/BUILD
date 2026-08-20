@@ -23,6 +23,7 @@ package(default_visibility = [
     "//function:__subpackages__",
     "//inference:__subpackages__",
     "//ir:__subpackages__",
+    "//projection:__subpackages__",
     "//server:__subpackages__",
     "//traversal:__subpackages__",
     "//query:__subpackages__",

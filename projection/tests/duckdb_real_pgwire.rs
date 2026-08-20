@@ -479,7 +479,8 @@ async fn duckdb_can_query_active_session_row_through_pg_stat_activity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duckdb_can_query_active_server_port_through_pg_settings() {
-    let run = run_duckdb_sql_and_capture("SELECT setting FROM typedb.pg_catalog.pg_settings WHERE name = 'port';").await;
+    let run =
+        run_duckdb_sql_and_capture("SELECT setting FROM typedb.pg_catalog.pg_settings WHERE name = 'port';").await;
 
     assert!(
         run.status_code == Some(0),

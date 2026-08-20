@@ -373,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn listener_shutdown_stops_accept_loop() {
-        let (listener, addr) = start_listener().await;
+        let (listener, _addr) = start_listener().await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server = tokio::spawn(async move { listener.run(shutdown_rx).await });
@@ -476,7 +476,6 @@ mod tests {
 
         // Should get AuthenticationOk then ReadyForQuery eventually.
         let mut got_auth_ok = false;
-        let mut got_ready = false;
         loop {
             let (msg_type, payload) = client_read_message(&mut client).await.unwrap();
             if msg_type == b'R' {
@@ -486,12 +485,10 @@ mod tests {
                 }
             }
             if msg_type == MSG_READY_FOR_QUERY {
-                got_ready = true;
                 break;
             }
         }
-        assert!(got_auth_ok, "Should have received AuthenticationOk");
-        assert!(got_ready, "Should have reached ReadyForQuery");
+        assert!(got_auth_ok, "Should have received AuthenticationOk before ReadyForQuery");
 
         client.write_all(&build_terminate()).await.unwrap();
         client.flush().await.unwrap();

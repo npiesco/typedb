@@ -226,16 +226,7 @@ pub fn execute_query_with_session(
                 }
                 // Unknown schema → treat as regular table lookup (will fail if not found).
             } else if is_pg_catalog_table(table) {
-                return execute_pg_catalog(
-                    catalog,
-                    table,
-                    columns,
-                    where_clause,
-                    order_by,
-                    *limit,
-                    *offset,
-                    session,
-                );
+                return execute_pg_catalog(catalog, table, columns, where_clause, order_by, *limit, *offset, session);
             }
             execute_select(catalog, table, columns, where_clause, order_by, *limit, *offset)
         }
@@ -1247,7 +1238,10 @@ fn project_virtual_query_outcome(outcome: QueryOutcome, select_cols: &[SelectCol
     }
 }
 
-fn project_virtual_query_result(result: QueryResult, select_cols: &[SelectColumn]) -> Result<QueryResult, QueryOutcome> {
+fn project_virtual_query_result(
+    result: QueryResult,
+    select_cols: &[SelectColumn],
+) -> Result<QueryResult, QueryOutcome> {
     let QueryResult { columns, rows, command_tag } = result;
     let (projected_columns, output_columns) = resolve_virtual_columns(&columns, select_cols)?;
     let projected_rows = rows
@@ -1282,7 +1276,8 @@ fn resolve_virtual_columns(
                 }
             }
             SelectColumn::Named { name, alias } => {
-                let Some(index) = available_columns.iter().position(|column| column.name.eq_ignore_ascii_case(name)) else {
+                let Some(index) = available_columns.iter().position(|column| column.name.eq_ignore_ascii_case(name))
+                else {
                     return Err(QueryOutcome::Error {
                         severity: "ERROR".into(),
                         code: "42703".into(),

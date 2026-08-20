@@ -319,8 +319,6 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
 
-    const SAMPLE_QUERY: &str = "match $e isa employee; fetch { name: $e.name; };";
-
     // ── Define: happy paths ──────────────────────────────────────
 
     #[test]
