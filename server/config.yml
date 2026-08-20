@@ -16,6 +16,8 @@ server:
     pgwire:
         enabled: false
         address: 0.0.0.0:5432
+        # How often projections are re-materialized from the database.
+        refresh-interval-seconds: 1
 
     authentication:
         token-expiration-seconds: 5000

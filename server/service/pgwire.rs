@@ -14,9 +14,10 @@
 //! * [`TypeDBSourceQueryExecutor`] — runs a projection's TypeQL `fetch`
 //!   source query inside a real read transaction and flattens each answer
 //!   document into positional Postgres text cells.
-//! * [`CatalogQueryHandler`] — keeps one projection store plus materialized
-//!   catalog per TypeDB database, applies projection DDL, and refreshes a
-//!   catalog from the database before serving reads from it.
+//! * [`DatabaseChangeDetector`] — reports how far a database's write-ahead log
+//!   has advanced, so the refresher only re-materializes after real commits.
+//! * [`CatalogQueryHandler`] — keeps one projection store, materialized catalog
+//!   and background refresher per TypeDB database, and applies projection DDL.
 
 use std::{
     collections::HashMap,
@@ -27,7 +28,9 @@ use database::transaction::TransactionRead;
 use executor::ExecutionInterrupt;
 use options::TransactionOptions;
 use projection::{
+    background_refresher::{BackgroundRefresher, RefreshDecision},
     catalog::MaterializedCatalog,
+    change_detector::{ChangeDetector, ChangeEvent},
     materializer::{Materializer, SourceQueryExecutor},
     pgwire::{
         authenticator::PgAuthenticator,
@@ -35,11 +38,13 @@ use projection::{
         query_executor::{execute_raw_query_batch_with_session, execute_raw_query_with_session},
     },
     projection_store::ProjectionStore,
+    refresh_policy::{ProjectionRefreshConfig, RefreshPolicy},
     schema_parser::{ProjectionStatement, parse_projection_ddl},
 };
 use query::query_cache::ParsedQuery;
 use resource::profile::StorageCounters;
-use storage::durability_client::WALClient;
+use storage::{durability_client::WALClient, snapshot::ReadableSnapshot};
+use tracing::{Level, event};
 
 use crate::{
     service::http::message::query::{GivenRowsHttp, document::encode_document},
@@ -194,18 +199,68 @@ impl SourceQueryExecutor for TypeDBSourceQueryExecutor {
     }
 }
 
+// ── DatabaseChangeDetector ─────────────────────────────────────────
+
+/// Reports write-ahead-log progress for a single database.
+///
+/// The WAL itself is private to the `database` crate, so progress is observed
+/// through the sequence number a freshly opened read snapshot is pinned to.
+/// That yields watermark granularity rather than one event per commit record:
+/// a cycle that sees the watermark advance reports one change event carrying
+/// the new watermark. The detector therefore never invents a commit that did
+/// not happen and never misses one that did.
+///
+/// Schema commits advance the same counter as data commits, so every advance is
+/// reported as a data change. That is the conservative direction — it can only
+/// cause an extra refresh, never a stale projection.
+#[derive(Debug)]
+pub struct DatabaseChangeDetector {
+    server_state: Arc<ServerState>,
+    database_name: String,
+}
+
+impl DatabaseChangeDetector {
+    pub fn new(server_state: Arc<ServerState>, database_name: impl Into<String>) -> Self {
+        Self { server_state, database_name: database_name.into() }
+    }
+}
+
+impl ChangeDetector for DatabaseChangeDetector {
+    fn poll_changes(&self, after_sequence_number: u64) -> Result<Vec<ChangeEvent>, String> {
+        let watermark = self.current_watermark()?;
+        Ok(if watermark > after_sequence_number { vec![ChangeEvent::data(watermark)] } else { Vec::new() })
+    }
+
+    fn current_watermark(&self) -> Result<u64, String> {
+        let server_state = self.server_state.clone();
+        let lookup_name = self.database_name.clone();
+        let database = block_on_runtime(async move { server_state.databases().get(&lookup_name).await })
+            .map_err(|err| format!("{err:?}"))?
+            .ok_or_else(|| format!("database '{}' not found", self.database_name))?;
+        let transaction = TransactionRead::<WALClient>::open(database, TransactionOptions::default())
+            .map_err(|err| format!("could not open read transaction: {err:?}"))?;
+        let watermark = transaction.snapshot.open_sequence_number().number();
+        transaction.close();
+        Ok(watermark)
+    }
+}
+
 // ── CatalogQueryHandler ────────────────────────────────────────────
 
-/// Per-database projection definitions plus their materialized rows.
+/// Per-database projection definitions, their materialized rows, and the
+/// refresher that keeps those rows current.
 #[derive(Debug)]
 struct DatabaseCatalog {
     store: ProjectionStore,
     catalog: MaterializedCatalog,
+    refresher: Arc<Mutex<BackgroundRefresher>>,
 }
 
 impl DatabaseCatalog {
-    fn new() -> Self {
-        Self { store: ProjectionStore::new(), catalog: MaterializedCatalog::new() }
+    fn new(database_name: &str) -> Self {
+        let catalog = MaterializedCatalog::new();
+        let refresher = BackgroundRefresher::new(Materializer::new(catalog.clone(), database_name));
+        Self { store: ProjectionStore::new(), catalog, refresher: Arc::new(Mutex::new(refresher)) }
     }
 }
 
@@ -213,12 +268,53 @@ impl DatabaseCatalog {
 #[derive(Debug)]
 pub struct CatalogQueryHandler {
     databases: Mutex<HashMap<String, DatabaseCatalog>>,
+    server_state: Arc<ServerState>,
     executor: TypeDBSourceQueryExecutor,
+    refresh_policy: RefreshPolicy,
 }
 
 impl CatalogQueryHandler {
+    /// Projections are refreshed whenever the database's WAL has advanced,
+    /// which the pgwire refresh loop checks on its configured interval.
     pub fn new(server_state: Arc<ServerState>) -> Self {
-        Self { databases: Mutex::new(HashMap::new()), executor: TypeDBSourceQueryExecutor::new(server_state) }
+        Self {
+            databases: Mutex::new(HashMap::new()),
+            server_state: server_state.clone(),
+            executor: TypeDBSourceQueryExecutor::new(server_state),
+            refresh_policy: RefreshPolicy::Eager,
+        }
+    }
+
+    /// Run one poll-and-refresh cycle across every database holding projections.
+    ///
+    /// Databases are collected under a short-lived lock so a slow refresh of one
+    /// database cannot block sessions reading another. A projection that fails
+    /// to refresh keeps serving its last good rows and is reported, so a broken
+    /// source query cannot silently freeze a table.
+    pub fn run_refresh_cycle(&self) {
+        let refreshers: Vec<(String, Arc<Mutex<BackgroundRefresher>>)> = {
+            let databases = self.databases.lock().unwrap();
+            databases.iter().map(|(name, entry)| (name.clone(), entry.refresher.clone())).collect()
+        };
+        for (database_name, refresher) in refreshers {
+            let detector = DatabaseChangeDetector::new(self.server_state.clone(), database_name.clone());
+            let outcome = refresher.lock().unwrap().run_cycle(&detector, &self.executor);
+            match outcome {
+                Ok(cycle) => {
+                    for (projection, decision) in cycle.decisions {
+                        if let RefreshDecision::Failed(err) = decision {
+                            event!(
+                                Level::WARN,
+                                "Could not refresh projection '{projection}' of database '{database_name}': {err}"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    event!(Level::WARN, "Could not poll database '{database_name}' for projection changes: {err}")
+                }
+            }
+        }
     }
 
     fn error(message: impl Into<String>) -> QueryOutcome {
@@ -235,10 +331,11 @@ impl CatalogQueryHandler {
     }
 
     /// Apply projection DDL, materializing immediately on `define` so the
-    /// projection is queryable as soon as the statement returns.
+    /// projection is queryable as soon as the statement returns, and enrolling
+    /// it with the refresher so it tracks the database from then on.
     fn apply_ddl(&self, statement: ProjectionStatement, database_name: &str) -> QueryOutcome {
         let mut databases = self.databases.lock().unwrap();
-        let entry = databases.entry(database_name.to_string()).or_insert_with(DatabaseCatalog::new);
+        let entry = databases.entry(database_name.to_string()).or_insert_with(|| DatabaseCatalog::new(database_name));
 
         match statement {
             ProjectionStatement::Define(definition) => {
@@ -247,8 +344,28 @@ impl CatalogQueryHandler {
                     return Self::error(err.to_string());
                 }
                 entry.catalog.register(definition);
-                let materializer = Materializer::new(entry.catalog.clone(), database_name.to_string());
-                match materializer.refresh_one(&name, &self.executor) {
+
+                let detector = DatabaseChangeDetector::new(self.server_state.clone(), database_name);
+                let watermark = match detector.current_watermark() {
+                    Ok(watermark) => watermark,
+                    Err(err) => {
+                        let _ = entry.store.undefine(&name);
+                        entry.catalog.deregister(&name);
+                        return Self::error(err);
+                    }
+                };
+
+                let materialized = {
+                    let mut refresher = entry.refresher.lock().unwrap();
+                    refresher.register(ProjectionRefreshConfig::new(&name, self.refresh_policy.clone()));
+                    let outcome = refresher.force_refresh(&name, &self.executor, watermark);
+                    if outcome.is_err() {
+                        refresher.unregister(&name);
+                    }
+                    outcome
+                };
+
+                match materialized {
                     Ok(_) => Self::ddl_ok("DEFINE PROJECTION"),
                     Err(err) => {
                         let _ = entry.store.undefine(&name);
@@ -262,24 +379,22 @@ impl CatalogQueryHandler {
                     return Self::error(err.to_string());
                 }
                 entry.catalog.deregister(&name);
+                entry.refresher.lock().unwrap().unregister(&name);
                 Self::ddl_ok("UNDEFINE PROJECTION")
             }
         }
     }
 
-    /// Resolve the catalog a session reads from, re-materializing it first so
-    /// reads observe data committed since the projection was defined.
+    /// Resolve the catalog a session reads from.
+    ///
+    /// Rows are kept current by the background refresher, so a read is a plain
+    /// lookup and never pays for re-materializing every projection.
     fn session_catalog(&self, session: &SessionContext) -> MaterializedCatalog {
-        let database_name = session.current_database.clone();
-        let catalog = {
-            let databases = self.databases.lock().unwrap();
-            match databases.get(&database_name) {
-                Some(entry) => entry.catalog.clone(),
-                None => return MaterializedCatalog::new(),
-            }
-        };
-        Materializer::new(catalog.clone(), database_name).refresh_all(&self.executor);
-        catalog
+        let databases = self.databases.lock().unwrap();
+        match databases.get(&session.current_database) {
+            Some(entry) => entry.catalog.clone(),
+            None => MaterializedCatalog::new(),
+        }
     }
 }
 

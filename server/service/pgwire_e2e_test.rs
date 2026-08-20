@@ -83,6 +83,7 @@ async fn typeql_data_is_served_over_real_pgwire() {
         .admin_enabled(false)
         .server_pgwire_enabled(true)
         .server_pgwire_address(format!("127.0.0.1:{pgwire_port}"))
+        .server_pgwire_refresh_interval(Duration::from_millis(200))
         .data_directory(data_directory.as_ref())
         .diagnostics(DiagnosticsConfig::disabled())
         .development_mode(true)
@@ -151,18 +152,17 @@ fn exercise_facade(http_port: u16, pgwire_port: u16) {
     assert_eq!(selected.command_tags, vec!["SELECT 2".to_string()], "command tag must report the real row count");
 
     // Data committed after the projection was defined must also be visible:
-    // proves the catalog is re-materialized from TypeDB rather than frozen.
+    // proves the catalog tracks TypeDB rather than being frozen at DDL time.
     run_typeql(&http, &token, "write", INSERT_THIRD);
-    let refreshed = simple_query(&mut pg, "SELECT id, name FROM people ORDER BY id");
-    assert!(refreshed.errors.is_empty(), "re-selecting the projection failed: {:?}", refreshed.errors);
-    assert_eq!(
-        refreshed.rows,
-        vec![
+    await_rows(
+        &mut pg,
+        "SELECT id, name FROM people ORDER BY id",
+        &[
             vec![Some("1".to_string()), Some("Alice".to_string())],
             vec![Some("2".to_string()), Some("Bob".to_string())],
             vec![Some("3".to_string()), Some("Carol".to_string())],
         ],
-        "a row committed through TypeQL after DDL must appear over pgwire"
+        "a row committed through TypeQL after DDL must appear over pgwire",
     );
 
     // Pushdown still runs against live data rather than the whole table.
@@ -198,6 +198,27 @@ fn free_port() -> u16 {
 
 fn deadline(seconds: u64) -> Instant {
     Instant::now() + Duration::from_secs(seconds)
+}
+
+/// Re-run `sql` until it yields exactly `expected`, or fail at the deadline.
+///
+/// Projections are re-materialized by the background refresher, so rows
+/// committed after a projection was defined become visible one poll cycle
+/// later rather than instantly.
+fn await_rows(stream: &mut TcpStream, sql: &str, expected: &[Vec<Option<String>>], context: &str) {
+    let until = deadline(30);
+    let mut last = QueryReply::default();
+    while Instant::now() < until {
+        last = simple_query(stream, sql);
+        if last.errors.is_empty() && last.rows == expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "{context}\nexpected rows: {:?}\nlast rows:     {:?}\nlast errors:   {:?}",
+        expected, last.rows, last.errors
+    );
 }
 
 // ── HTTP client (hand-rolled: the server exposes no test client) ────

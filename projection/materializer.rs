@@ -128,6 +128,7 @@ impl RefreshAllResult {
 /// The materializer does not own any query infrastructure — it delegates
 /// to a [`SourceQueryExecutor`] provided by the caller. This keeps the
 /// `projection` crate decoupled from the TypeDB query engine.
+#[derive(Debug)]
 pub struct Materializer {
     catalog: MaterializedCatalog,
     database_name: String,

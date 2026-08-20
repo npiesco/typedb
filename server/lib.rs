@@ -7,7 +7,7 @@
 #![deny(unused_must_use)]
 #![deny(elided_lifetimes_in_paths)]
 
-use std::{fs, future::Future, net::SocketAddr, path::Path, pin::Pin, sync::Arc};
+use std::{fs, future::Future, net::SocketAddr, path::Path, pin::Pin, sync::Arc, time::Duration};
 
 use axum_server::{Handle, tls_rustls::RustlsConfig};
 use concurrency::{TokioTaskSpawner, TokioTaskTracker};
@@ -317,7 +317,12 @@ impl Server {
 
         if server_config.pgwire.enabled {
             let pgwire_address = ServerState::resolve_address(&server_config.pgwire.address).await?;
-            let pgwire_server = Self::serve_pgwire(pgwire_address, server_state.clone(), shutdown_receiver.clone());
+            let pgwire_server = Self::serve_pgwire(
+                pgwire_address,
+                server_state.clone(),
+                server_config.pgwire.refresh_interval,
+                shutdown_receiver.clone(),
+            );
             servers.push(Box::pin(pgwire_server));
         }
 
@@ -417,13 +422,14 @@ impl Server {
     async fn serve_pgwire(
         address: SocketAddr,
         server_state: Arc<ServerState>,
+        refresh_interval: Duration,
         mut shutdown_receiver: Receiver<()>,
     ) -> Result<(), ServerOpenError> {
         let handler = Arc::new(CatalogQueryHandler::new(server_state.clone()));
         let auth_mode = AuthMode::CleartextPassword(Arc::new(ServerStateAuthenticator::new(server_state)));
         let params = ServerParams::default();
 
-        let listener = PgWireListener::bind(&address.to_string(), handler, params)
+        let listener = PgWireListener::bind(&address.to_string(), handler.clone(), params)
             .await
             .map_err(|source| ServerOpenError::PgWireServe { address, source: Arc::new(source) })?
             .with_auth_mode(auth_mode);
@@ -435,9 +441,29 @@ impl Server {
             let _ = shutdown_tx.send(true);
         });
 
+        // Keep projections tracking the database. The cycle blocks on read
+        // transactions, so it runs on a runtime worker via `block_in_place`
+        // rather than on a blocking-pool thread, which has no runtime context.
+        let mut refresh_shutdown = shutdown_rx.clone();
+        let refresh_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(refresh_interval) => handler.run_refresh_cycle(),
+                    changed = refresh_shutdown.changed() => {
+                        // A dropped sender means the listener is gone, so stop
+                        // rather than spin on an immediately-ready `changed()`.
+                        if changed.is_err() || *refresh_shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
         for handle in listener.run(shutdown_rx).await {
             let _ = handle.await;
         }
+        let _ = refresh_task.await;
 
         Ok(())
     }

@@ -55,16 +55,30 @@ pub struct HttpEndpointConfig {
     pub advertise_address: Option<String>,
 }
 
+#[serde_as]
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PgWireEndpointConfig {
     pub(crate) enabled: bool,
     pub(crate) address: String,
+    /// How often the background refresher re-materializes projections whose
+    /// source data has changed.
+    #[serde_as(as = "DurationSeconds")]
+    #[serde(rename = "refresh-interval-seconds", default = "default_pgwire_refresh_interval")]
+    pub(crate) refresh_interval: Duration,
+}
+
+fn default_pgwire_refresh_interval() -> Duration {
+    Duration::from_secs(1)
 }
 
 impl Default for PgWireEndpointConfig {
     fn default() -> Self {
-        Self { enabled: false, address: "0.0.0.0:5432".to_string() }
+        Self {
+            enabled: false,
+            address: "0.0.0.0:5432".to_string(),
+            refresh_interval: default_pgwire_refresh_interval(),
+        }
     }
 }
 
@@ -330,6 +344,7 @@ impl ConfigBuilder {
             server_admin_socket_path,
             server_pgwire_enabled,
             server_pgwire_address,
+            server_pgwire_refresh_interval_seconds,
             server_authentication_token_expiration_seconds,
             server_encryption_enabled,
             server_encryption_certificate,
@@ -354,6 +369,7 @@ impl ConfigBuilder {
             config.server.admin.socket_path => server_admin_socket_path.map(Some);
             config.server.pgwire.enabled => server_pgwire_enabled;
             config.server.pgwire.address => server_pgwire_address;
+            config.server.pgwire.refresh_interval => server_pgwire_refresh_interval_seconds.map(|secs| Duration::new(secs, 0));
             config.server.authentication.token_expiration => server_authentication_token_expiration_seconds.map(|secs| Duration::new(secs, 0));
 
             config.server.encryption.enabled => server_encryption_enabled;
@@ -463,6 +479,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn server_pgwire_refresh_interval(mut self, interval: Duration) -> Self {
+        self.config.server.pgwire.refresh_interval = interval;
+        self
+    }
+
     pub fn authentication(mut self, config: AuthenticationConfig) -> Self {
         self.config.server.authentication = config;
         self
@@ -491,7 +512,7 @@ impl ConfigBuilder {
 
 #[cfg(test)]
 pub mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use assert as assert_true;
     use clap::Parser;
@@ -616,17 +637,26 @@ logging:
         let config = load_and_parse(config_path(), vec![]).unwrap();
         assert_true!(!config.server.pgwire.enabled);
         assert_eq!(config.server.pgwire.address.as_str(), "0.0.0.0:5432");
+        assert_eq!(config.server.pgwire.refresh_interval, Duration::from_secs(1));
     }
 
     #[test]
     fn pgwire_config_cli_override() {
         let config = load_and_parse(
             config_path(),
-            vec!["--server.pgwire.enabled", "false", "--server.pgwire.address", "127.0.0.1:15432"],
+            vec![
+                "--server.pgwire.enabled",
+                "false",
+                "--server.pgwire.address",
+                "127.0.0.1:15432",
+                "--server.pgwire.refresh-interval-seconds",
+                "7",
+            ],
         )
         .unwrap();
         assert_true!(!config.server.pgwire.enabled);
         assert_eq!(config.server.pgwire.address.as_str(), "127.0.0.1:15432");
+        assert_eq!(config.server.pgwire.refresh_interval, Duration::from_secs(7));
     }
 
     #[test]
@@ -637,5 +667,6 @@ logging:
         let default = PgWireEndpointConfig::default();
         assert_true!(!default.enabled);
         assert_eq!(default.address, "0.0.0.0:5432");
+        assert_eq!(default.refresh_interval, Duration::from_secs(1));
     }
 }

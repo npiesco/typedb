@@ -66,6 +66,11 @@ pub struct CLIArgs {
     #[arg(long = "server.pgwire.address")]
     pub server_pgwire_address: Option<String>,
 
+    /// How often, in seconds, the PgWire endpoint re-materializes projections
+    /// whose source data has changed
+    #[arg(long = "server.pgwire.refresh-interval-seconds")]
+    pub server_pgwire_refresh_interval_seconds: Option<u64>,
+
     /// The amount of seconds generated authentication tokens will remain valid, specified in seconds.
     /// Use smaller values for better security and bigger values for better authentication performance and convenience
     /// (min: 1 second, max: 1 year)

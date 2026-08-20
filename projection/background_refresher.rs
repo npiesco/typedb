@@ -90,6 +90,7 @@ impl CycleResult {
 /// Holds the materializer, per-projection configs, and timing state.
 /// Designed to be driven by an external loop (or a tokio task via
 /// [`run_loop`](Self::run_loop)).
+#[derive(Debug)]
 pub struct BackgroundRefresher {
     materializer: Materializer,
     configs: HashMap<String, ProjectionRefreshConfig>,
