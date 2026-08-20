@@ -174,6 +174,29 @@ psql "host=localhost port=5432 user=admin dbname=typedb sslmode=disable"
 
 Default development credentials: `admin` / `password`. Change them before exposing the endpoint outside local development.
 
+### Defining Projections
+
+The endpoint serves *projections*: named, flat, read-only tables whose rows come from a TypeQL `fetch` query run against a live TypeDB database. Declare one over the same connection:
+
+```sql
+define projection people(id: integer, name: string) as
+    'match $p isa person; fetch { "id": $p.id, "name": $p.name };';
+```
+
+Each declared column must match a key produced by the source query's `fetch` clause, and the query must yield flat documents — nested structures are rejected when the projection is defined. Once declared, the projection is materialized from the database and reads like an ordinary table:
+
+```sql
+SELECT id, name FROM people ORDER BY id;
+```
+
+Drop it again with:
+
+```sql
+undefine projection people;
+```
+
+Projections are re-materialized from the database each time they are queried, so data committed to TypeDB after the projection was defined is visible to subsequent `SELECT`s. Definitions are held in server memory and need to be re-declared after a restart.
+
 ### DuckDB
 
 DuckDB can attach to the pgwire endpoint through its `postgres` extension. The live interoperability coverage in this repository is currently validated against DuckDB CLI `v1.4.4 (Andium)`.
