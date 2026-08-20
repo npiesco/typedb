@@ -135,6 +135,20 @@ rust_test(
     ],
 )
 
+rust_test(
+    name = "test_pgwire_e2e",
+    srcs = ["service/pgwire_e2e_test.rs"],
+    data = [":config.yml"],
+    deps = [
+        ":server",
+        "//projection",
+        "//resource",
+        "//util/test:test_utils",
+        "@crates//:serde_json",
+        "@crates//:tokio",
+    ],
+)
+
 rustfmt_test(
     name = "rustfmt_test",
     targets = [

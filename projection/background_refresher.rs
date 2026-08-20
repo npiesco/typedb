@@ -326,7 +326,7 @@ mod tests {
     }
 
     impl SourceQueryExecutor for MockExecutor {
-        fn execute(&self, _db: &str, _query: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+        fn execute(&self, _db: &str, _query: &str, _columns: &[&str]) -> Result<Vec<Vec<Option<String>>>, String> {
             Ok(self.rows.clone())
         }
     }

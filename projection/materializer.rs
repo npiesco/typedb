@@ -38,12 +38,19 @@ pub trait SourceQueryExecutor: Send + Sync {
     /// Execute a TypeQL source query against the named database.
     ///
     /// Returns rows where each inner `Vec` has one `Option<String>` per
-    /// column (in definition order). `None` represents a NULL value.
+    /// entry in `columns` (in the same order). `None` represents a NULL
+    /// value. `columns` is supplied so the executor can flatten each
+    /// answer document into positional cells.
     ///
     /// # Errors
     ///
     /// Returns a human-readable error message if the query fails.
-    fn execute(&self, database_name: &str, source_query: &str) -> Result<Vec<Vec<Option<String>>>, String>;
+    fn execute(
+        &self,
+        database_name: &str,
+        source_query: &str,
+        columns: &[&str],
+    ) -> Result<Vec<Vec<Option<String>>>, String>;
 }
 
 // ── Error types ────────────────────────────────────────────────────
@@ -159,7 +166,7 @@ impl Materializer {
             .ok_or_else(|| MaterializationError::ProjectionNotFound(name.to_string()))?;
 
         let rows = executor
-            .execute(&self.database_name, definition.source_query())
+            .execute(&self.database_name, definition.source_query(), &definition.column_names())
             .map_err(|message| MaterializationError::QueryExecutionFailed { projection: name.to_string(), message })?;
 
         // Validate column count for every row.
@@ -264,7 +271,12 @@ mod tests {
     }
 
     impl SourceQueryExecutor for MockExecutor {
-        fn execute(&self, database_name: &str, source_query: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+        fn execute(
+            &self,
+            database_name: &str,
+            source_query: &str,
+            _columns: &[&str],
+        ) -> Result<Vec<Vec<Option<String>>>, String> {
             self.calls.lock().unwrap().push((database_name.to_string(), source_query.to_string()));
             self.results.get(source_query).cloned().unwrap_or_else(|| Ok(Vec::new()))
         }
