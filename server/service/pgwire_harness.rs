@@ -13,10 +13,7 @@
 //! pass if the facade actually opened a TypeDB read transaction and ran the
 //! projection's TypeQL source query.
 
-#![allow(dead_code)]
-
 use std::{
-    collections::BTreeSet,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
@@ -95,16 +92,21 @@ where
     T: Send + 'static,
 {
     let data_directory = create_tmp_storage_dir();
-    let (grpc_port, http_port, pgwire_port) = (free_port(), free_port(), free_port());
+    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("gRPC listener should bind");
+    let http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("HTTP listener should bind");
+    let pgwire_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("pgwire listener should bind");
+    let grpc_address = grpc_listener.local_addr().expect("gRPC listener should have a local address");
+    let http_address = http_listener.local_addr().expect("HTTP listener should have a local address");
+    let pgwire_address = pgwire_listener.local_addr().expect("pgwire listener should have a local address");
 
     let config = ConfigBuilder::from_file(config_path())
         .expect("config file should load")
-        .server_listen_address(format!("127.0.0.1:{grpc_port}"))
+        .server_listen_address(grpc_address.to_string())
         .server_http_enabled(true)
-        .server_http_listen_address(format!("127.0.0.1:{http_port}"))
+        .server_http_listen_address(http_address.to_string())
         .admin_enabled(false)
         .server_pgwire_enabled(true)
-        .server_pgwire_address(format!("127.0.0.1:{pgwire_port}"))
+        .server_pgwire_address(pgwire_address.to_string())
         .server_pgwire_refresh_interval(REFRESH_INTERVAL)
         .data_directory(data_directory.as_ref())
         .diagnostics(DiagnosticsConfig::disabled())
@@ -116,6 +118,9 @@ where
     let server = ServerBuilder::new()
         .distribution_info(DISTRIBUTION_INFO)
         .shutdown_channel((shutdown_sender.clone(), shutdown_receiver))
+        .grpc_listener(grpc_listener)
+        .http_listener(http_listener)
+        .pgwire_listener(pgwire_listener)
         .build(config)
         .await
         .expect("server should build");
@@ -132,7 +137,7 @@ where
 
     let database = database.to_string();
     let outcome = tokio::task::spawn_blocking(move || {
-        let http = format!("127.0.0.1:{http_port}");
+        let http = http_address.to_string();
         if let Err(reason) = await_http_ready(&http) {
             panic!("{reason}\nserver error: {:?}", serve_error.lock().unwrap());
         }
@@ -141,7 +146,7 @@ where
         let (status, body) = http_post(&http, &format!("/v1/databases/{database}"), Some(&token), "");
         assert!(status < 300, "creating database failed with {status}: {body}");
 
-        let harness = Harness { http, pgwire_port, database, token };
+        let harness = Harness { http, pgwire_port: pgwire_address.port(), database, token };
         runner(&harness)
     })
     .await;
@@ -161,28 +166,6 @@ fn config_path() -> PathBuf {
     let cwd = std::env::current_dir().expect("current directory should be readable");
     let bazel_layout = cwd.join("server/config.yml");
     if bazel_layout.exists() { bazel_layout } else { cwd.join("config.yml") }
-}
-
-/// Reserve a port by binding and immediately releasing it.
-///
-/// The release opens a window in which the OS may offer the same port to
-/// another caller, so every port handed out in this process is recorded and
-/// never issued twice. Rejected listeners are held until a fresh port is found,
-/// which forces the OS to offer a different one on each retry.
-pub fn free_port() -> u16 {
-    static ISSUED: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-    const ATTEMPTS: usize = 256;
-
-    let mut held = Vec::new();
-    for _ in 0..ATTEMPTS {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port should be available");
-        let port = listener.local_addr().unwrap().port();
-        if ISSUED.lock().unwrap().insert(port) {
-            return port;
-        }
-        held.push(listener);
-    }
-    panic!("no unused ephemeral port after {ATTEMPTS} attempts")
 }
 
 pub fn deadline(seconds: u64) -> Instant {

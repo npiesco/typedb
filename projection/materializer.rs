@@ -246,12 +246,14 @@ mod tests {
         pgwire::query_executor::ProjectionCatalog,
     };
 
+    type SourceResult = Result<Vec<Vec<Option<String>>>, String>;
+
     // ── Mock executor ──────────────────────────────────────────
 
     /// Records calls and returns pre-configured results by source query.
     struct MockExecutor {
         /// source_query → result
-        results: HashMap<String, Result<Vec<Vec<Option<String>>>, String>>,
+        results: HashMap<String, SourceResult>,
         /// Recorded (database_name, source_query) pairs.
         calls: Mutex<Vec<(String, String)>>,
     }
@@ -261,7 +263,7 @@ mod tests {
             Self { results: HashMap::new(), calls: Mutex::new(Vec::new()) }
         }
 
-        fn with_result(mut self, source_query: &str, result: Result<Vec<Vec<Option<String>>>, String>) -> Self {
+        fn with_result(mut self, source_query: &str, result: SourceResult) -> Self {
             self.results.insert(source_query.to_string(), result);
             self
         }

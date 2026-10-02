@@ -17,38 +17,9 @@
 //! test. If the facade were not actually opening TypeDB read transactions and
 //! running the projection's TypeQL source query, these assertions would fail.
 
-mod pgwire_harness;
+pub mod pgwire_harness;
 
-use pgwire_harness::{Harness, await_rows, free_port, simple_query, terminate, with_pgwire_server};
-
-/// `free_port` reserves a port by binding an ephemeral listener and closing it,
-/// so the port is genuinely free when the server binds it. That leaves a window
-/// in which the OS can hand the very same port to a concurrent caller: two
-/// harnesses in one test binary then configure the same port and the second
-/// server dies with `AddrInUse`.
-///
-/// Every port issued in this process must therefore be distinct, even when
-/// callers race.
-#[test]
-fn free_port_never_issues_one_port_twice() {
-    const THREADS: usize = 8;
-    const PER_THREAD: usize = 64;
-
-    let handles: Vec<_> = (0..THREADS)
-        .map(|_| std::thread::spawn(|| (0..PER_THREAD).map(|_| free_port()).collect::<Vec<u16>>()))
-        .collect();
-
-    let issued: Vec<u16> =
-        handles.into_iter().flat_map(|handle| handle.join().expect("thread should not panic")).collect();
-
-    let unique: std::collections::BTreeSet<u16> = issued.iter().copied().collect();
-    assert_eq!(
-        unique.len(),
-        issued.len(),
-        "free_port handed out {} duplicate port(s) across {THREADS} threads",
-        issued.len() - unique.len()
-    );
-}
+use pgwire_harness::{Harness, await_rows, simple_query, terminate, with_pgwire_server};
 
 const DATABASE: &str = "pgwire-e2e";
 

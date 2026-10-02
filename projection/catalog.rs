@@ -168,10 +168,8 @@ impl ProjectionCatalog for MaterializedCatalog {
         // Grab Arc snapshots under the lock, then release before cloning data.
         let (columns, rows_arc) = {
             let inner = self.inner.read().unwrap();
-            match inner.projections.get(&key) {
-                Some(proj) => (proj.columns.clone(), Arc::clone(&proj.rows)),
-                None => return None,
-            }
+            let projection = inner.projections.get(&key)?;
+            (projection.columns.clone(), Arc::clone(&projection.rows))
         }; // read lock released here
         Some(ProjectionInfo { name: key, columns, rows: rows_arc.as_ref().clone() })
     }

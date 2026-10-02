@@ -13,21 +13,20 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::type_mapping::{
-    PG_OID_BOOL, PG_OID_FLOAT8, PG_OID_INT4, PG_OID_INT8, PG_OID_OID, PG_OID_TEXT, PG_OID_VARCHAR,
-};
-
-use crate::pgwire::{
-    authenticator::{decode_password_message, extract_database, extract_username, AuthMode},
-    messages::{
-        encode_auth_cleartext_password, encode_auth_ok, encode_backend_key_data, encode_bind_complete,
-        encode_close_complete, encode_command_complete, encode_copy_data, encode_copy_done, encode_copy_out_response,
-        encode_data_row, encode_error_response, encode_no_data, encode_parameter_description_empty,
-        encode_parameter_status, encode_parse_complete, encode_ready_for_query, encode_row_description,
-        ColumnDescription, ENCRYPTION_NOT_SUPPORTED, GSSENC_REQUEST_CODE, MSG_BIND, MSG_CLOSE, MSG_DESCRIBE,
-        MSG_EXECUTE, MSG_PARSE, MSG_PASSWORD, MSG_QUERY, MSG_SYNC, MSG_TERMINATE, PROTOCOL_VERSION_30,
-        SSL_REQUEST_CODE, TX_IDLE,
+use crate::{
+    pgwire::{
+        authenticator::{decode_password_message, extract_database, extract_username, AuthMode},
+        messages::{
+            encode_auth_cleartext_password, encode_auth_ok, encode_backend_key_data, encode_bind_complete,
+            encode_close_complete, encode_command_complete, encode_copy_data, encode_copy_done,
+            encode_copy_out_response, encode_data_row, encode_error_response, encode_no_data,
+            encode_parameter_description_empty, encode_parameter_status, encode_parse_complete, encode_ready_for_query,
+            encode_row_description, ColumnDescription, ENCRYPTION_NOT_SUPPORTED, GSSENC_REQUEST_CODE, MSG_BIND,
+            MSG_CLOSE, MSG_DESCRIBE, MSG_EXECUTE, MSG_PARSE, MSG_PASSWORD, MSG_QUERY, MSG_SYNC, MSG_TERMINATE,
+            PROTOCOL_VERSION_30, SSL_REQUEST_CODE, TX_IDLE,
+        },
     },
+    type_mapping::{PG_OID_BOOL, PG_OID_FLOAT8, PG_OID_INT4, PG_OID_INT8, PG_OID_OID, PG_OID_TEXT, PG_OID_VARCHAR},
 };
 
 // ── Query handler trait ────────────────────────────────────────────
@@ -1481,9 +1480,7 @@ mod tests {
 
     /// Build a Describe message (portal variant).
     fn build_describe_portal() -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.push(b'P'); // describe portal (not statement)
-        payload.push(0); // unnamed portal
+        let payload = vec![b'P', 0]; // describe unnamed portal
         let len = (payload.len() + 4) as i32;
         let mut msg = Vec::new();
         msg.push(MSG_DESCRIBE);
@@ -1515,9 +1512,7 @@ mod tests {
 
     /// Build a Close message (portal variant).
     fn build_close_portal() -> Vec<u8> {
-        let mut payload = Vec::new();
-        payload.push(b'P'); // close portal
-        payload.push(0); // unnamed portal
+        let payload = vec![b'P', 0]; // close unnamed portal
         let len = (payload.len() + 4) as i32;
         let mut msg = Vec::new();
         msg.push(MSG_CLOSE);

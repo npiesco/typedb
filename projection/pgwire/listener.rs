@@ -236,7 +236,7 @@ mod tests {
     async fn listener_binds_to_random_port() {
         let (listener, addr) = start_listener().await;
         assert!(addr.starts_with("127.0.0.1:"), "Should bind to 127.0.0.1, got: {}", addr);
-        let port: u16 = addr.split(':').last().unwrap().parse().unwrap();
+        let port: u16 = addr.split(':').next_back().unwrap().parse().unwrap();
         assert!(port > 0, "Port should be assigned");
         drop(listener);
     }

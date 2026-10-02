@@ -13,42 +13,17 @@
 //! only satisfiable if the facade actually resolves the projection against a
 //! TypeDB read transaction.
 
-mod pgwire_harness;
+pub mod pgwire_harness;
 
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use pgwire_harness::{Harness, RecordingProxy, simple_query, terminate, with_pgwire_server};
-
-/// `TempDir` names itself from the wall clock, so two directories created in
-/// the same clock tick collide. Concurrent tests then point two DuckDB CLI
-/// processes at one database file and the second dies on DuckDB's file lock.
-///
-/// Every temporary directory in this process must be distinct.
-#[test]
-fn temp_dir_never_hands_out_one_path_twice() {
-    const THREADS: usize = 8;
-    const PER_THREAD: usize = 64;
-
-    let handles: Vec<_> = (0..THREADS)
-        .map(|_| std::thread::spawn(|| (0..PER_THREAD).map(|_| TempDir::new("uniqueness-probe")).collect::<Vec<_>>()))
-        .collect();
-
-    let created: Vec<TempDir> =
-        handles.into_iter().flat_map(|handle| handle.join().expect("thread should not panic")).collect();
-
-    let unique: std::collections::BTreeSet<&Path> = created.iter().map(TempDir::path).collect();
-    assert_eq!(
-        unique.len(),
-        created.len(),
-        "TempDir handed out {} duplicate path(s) across {THREADS} threads",
-        created.len() - unique.len()
-    );
-}
+use pgwire_harness::{Harness, RecordingProxy, await_condition, simple_query, terminate, with_pgwire_server};
 
 /// DuckDB's `ATTACH ... (TYPE postgres)` names the catalog after the Postgres
 /// database, and the dbt profile below connects to the same name.
@@ -104,6 +79,42 @@ impl DuckdbRun {
     }
 }
 
+static DUCKDB_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+
+fn run_duckdb_at(database_path: &Path, sql: &str) -> Output {
+    let _guard = DUCKDB_PROCESS_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    Command::new("duckdb")
+        .args(["-unsigned", "-batch", "-csv", "-noheader", "-no-stdin", "-c", sql])
+        .arg(database_path)
+        .output()
+        .expect("duckdb CLI must be available on PATH for this integration test")
+}
+
+#[test]
+fn concurrent_duckdb_file_access_waits_for_current_process() {
+    let duckdb_dir = TempDir::new("typedb-duckdb-lock");
+    let duckdb_path = duckdb_dir.path().join("integration.duckdb");
+    let first_path = duckdb_path.clone();
+    let first = std::thread::spawn(move || {
+        run_duckdb_at(
+            &first_path,
+            "CREATE TABLE lock_holder(value INTEGER); \
+             SELECT pg_sleep(2);",
+        )
+    });
+
+    await_condition(10, "first DuckDB process should create its database file", || duckdb_path.is_file());
+    let second = run_duckdb_at(&duckdb_path, "SELECT COUNT(*) FROM lock_holder;");
+    let first = first.join().expect("first DuckDB process should not panic");
+
+    assert!(first.status.success(), "first DuckDB process should succeed.\n{}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        second.status.success(),
+        "concurrent DuckDB access should wait rather than fail on the file lock.\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+}
+
 fn duckdb_sql(addr: &str, tail_sql: &str) -> String {
     let (_host, port) = addr.rsplit_once(':').expect("listener address should include a port");
     format!(
@@ -119,11 +130,7 @@ fn run_duckdb(addr: &str, tail_sql: &str) -> DuckdbRun {
     let duckdb_path = duckdb_dir.path().join("integration.duckdb");
     assert!(!duckdb_path.exists(), "temporary DuckDB database {duckdb_path:?} was handed out twice");
 
-    let output = Command::new("duckdb")
-        .args(["-unsigned", "-batch", "-csv", "-noheader", "-no-stdin", "-c", &duckdb_sql(addr, tail_sql)])
-        .arg(&duckdb_path)
-        .output()
-        .expect("duckdb CLI must be available on PATH for this integration test");
+    let output = run_duckdb_at(&duckdb_path, &duckdb_sql(addr, tail_sql));
     let database_file_created = duckdb_path.is_file();
     drop(duckdb_dir);
     let temp_dir_removed = duckdb_path.parent().is_some_and(|path| !path.exists());

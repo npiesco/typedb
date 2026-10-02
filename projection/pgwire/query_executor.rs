@@ -207,26 +207,16 @@ pub fn execute_query_with_session(
                         table,
                         columns,
                         where_clause,
-                        order_by,
                         *limit,
                         *offset,
                     );
                 }
                 if s.eq_ignore_ascii_case("pg_catalog") {
-                    return execute_pg_catalog(
-                        catalog,
-                        table,
-                        columns,
-                        where_clause,
-                        order_by,
-                        *limit,
-                        *offset,
-                        session,
-                    );
+                    return execute_pg_catalog(catalog, table, columns, where_clause, *limit, *offset, session);
                 }
                 // Unknown schema → treat as regular table lookup (will fail if not found).
             } else if is_pg_catalog_table(table) {
-                return execute_pg_catalog(catalog, table, columns, where_clause, order_by, *limit, *offset, session);
+                return execute_pg_catalog(catalog, table, columns, where_clause, *limit, *offset, session);
             }
             execute_select(catalog, table, columns, where_clause, order_by, *limit, *offset)
         }
@@ -801,7 +791,6 @@ fn execute_information_schema(
     table: &str,
     columns: &[SelectColumn],
     where_clause: &[WhereCondition],
-    _order_by: &[OrderByExpr],
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> QueryOutcome {
@@ -932,7 +921,6 @@ fn execute_pg_catalog(
     table: &str,
     columns: &[SelectColumn],
     where_clause: &[WhereCondition],
-    _order_by: &[OrderByExpr],
     limit: Option<u64>,
     offset: Option<u64>,
     session: &SessionContext,

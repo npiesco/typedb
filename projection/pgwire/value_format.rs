@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_double_fractional() {
-        assert_eq!(value_to_pg_text(&Value::Double(3.14)), "3.14");
+        assert_eq!(value_to_pg_text(&Value::Double(3.125)), "3.125");
     }
 
     #[test]

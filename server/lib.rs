@@ -26,7 +26,11 @@ use resource::{
     distribution_info::DistributionInfo,
     server_info::{EndpointInfo, ServingInfo, print_serving_block},
 };
-use tokio::sync::watch::{Receiver, Sender, channel};
+use tokio::{
+    net::TcpListener,
+    sync::watch::{Receiver, Sender, channel},
+};
+use tokio_stream::wrappers::TcpListenerStream;
 use tracing::info;
 
 use crate::{
@@ -55,6 +59,13 @@ pub mod admin_proto {
 
 pub type AdminServeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerOpenError>> + Send>>;
 
+#[derive(Default)]
+struct ServerListeners {
+    grpc: Option<TcpListener>,
+    http: Option<TcpListener>,
+    pgwire: Option<TcpListener>,
+}
+
 pub struct ServerBuilder {
     distribution_info: Option<DistributionInfo>,
     server_state: Option<Arc<ServerState>>,
@@ -62,6 +73,7 @@ pub struct ServerBuilder {
     storage_server_id: Option<String>,
     background_tasks_tracker: Option<TokioTaskTracker>,
     admin_serve_override: Option<AdminServeFuture>,
+    listeners: ServerListeners,
 }
 
 impl std::fmt::Debug for ServerBuilder {
@@ -86,6 +98,7 @@ impl Default for ServerBuilder {
             storage_server_id: None,
             background_tasks_tracker: None,
             admin_serve_override: None,
+            listeners: ServerListeners::default(),
         }
     }
 }
@@ -120,6 +133,21 @@ impl ServerBuilder {
         self
     }
 
+    pub fn grpc_listener(mut self, listener: TcpListener) -> Self {
+        self.listeners.grpc = Some(listener);
+        self
+    }
+
+    pub fn http_listener(mut self, listener: TcpListener) -> Self {
+        self.listeners.http = Some(listener);
+        self
+    }
+
+    pub fn pgwire_listener(mut self, listener: TcpListener) -> Self {
+        self.listeners.pgwire = Some(listener);
+        self
+    }
+
     pub async fn build(mut self, config: Config) -> Result<Server, ServerOpenError> {
         let server_id = self.initialise_storage(&config.storage)?.to_string();
         let distribution_info = self.distribution_info.unwrap_or(DISTRIBUTION_INFO);
@@ -149,7 +177,7 @@ impl ServerBuilder {
             }
         };
 
-        Ok(Server::new(
+        let mut server = Server::new(
             distribution_info,
             config,
             server_state,
@@ -157,7 +185,9 @@ impl ServerBuilder {
             shutdown_receiver,
             background_tasks_tracker,
             self.admin_serve_override,
-        ))
+        );
+        server.listeners = self.listeners;
+        Ok(server)
     }
 
     pub fn initialise_storage(&mut self, storage_config: &StorageConfig) -> Result<&str, ServerOpenError> {
@@ -229,6 +259,7 @@ pub struct Server {
     shutdown_receiver: Receiver<()>,
     background_tasks_tracker: TokioTaskTracker,
     admin_serve_override: Option<AdminServeFuture>,
+    listeners: ServerListeners,
 }
 
 impl std::fmt::Debug for Server {
@@ -263,6 +294,7 @@ impl Server {
             shutdown_receiver,
             background_tasks_tracker,
             admin_serve_override,
+            listeners: ServerListeners::default(),
         }
     }
 
@@ -276,6 +308,7 @@ impl Server {
             self.shutdown_receiver,
             self.background_tasks_tracker.get_spawner(),
             self.admin_serve_override,
+            self.listeners,
         )
         .await;
         let _ = self.shutdown_sender.send(());
@@ -291,13 +324,16 @@ impl Server {
         shutdown_receiver: Receiver<()>,
         background_tasks_spawner: TokioTaskSpawner,
         admin_serve_override: Option<AdminServeFuture>,
+        listeners: ServerListeners,
     ) -> Result<(), ServerOpenError> {
         Self::install_default_encryption_provider()?;
 
+        let ServerListeners { grpc, http, pgwire } = listeners;
         let mut servers: Vec<Pin<Box<dyn Future<Output = Result<(), ServerOpenError>> + Send>>> = Vec::new();
 
         let grpc_server = Self::serve_grpc(
             server_state.grpc_listen_address(),
+            grpc,
             &server_config.encryption,
             server_state.clone(),
             shutdown_receiver.clone(),
@@ -307,6 +343,7 @@ impl Server {
         if let Some(http_listen_address) = server_state.http_listen_address() {
             let http_server = Self::serve_http(
                 http_listen_address,
+                http,
                 &server_config.encryption,
                 server_state.clone(),
                 shutdown_receiver.clone(),
@@ -319,6 +356,7 @@ impl Server {
             let pgwire_address = ServerState::resolve_address(&server_config.pgwire.address).await?;
             let pgwire_server = Self::serve_pgwire(
                 pgwire_address,
+                pgwire,
                 server_state.clone(),
                 server_config.pgwire.refresh_interval,
                 shutdown_receiver.clone(),
@@ -354,6 +392,7 @@ impl Server {
 
     async fn serve_grpc(
         address: SocketAddr,
+        listener: Option<TcpListener>,
         encryption_config: &EncryptionConfig,
         server_state: Arc<ServerState>,
         mut shutdown_receiver: Receiver<()>,
@@ -367,23 +406,27 @@ impl Server {
                 .tls_config(tls_config)
                 .map_err(|source| ServerOpenError::GrpcTlsFailedConfiguration { source: Arc::new(source) })?;
         }
-        grpc_server
-            .layer(&authenticator)
-            .add_service(
-                typedb_protocol::type_db_server::TypeDbServer::new(service)
-                    .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-                    .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE),
-            )
-            .serve_with_shutdown(address, async {
-                // The tonic server starts a shutdown process when this closure execution finishes
-                shutdown_receiver.changed().await.expect("Expected shutdown receiver signal");
-            })
-            .await
-            .map_err(|err| ServerOpenError::GrpcServe { address, source: Arc::new(err) })
+        let grpc_router = grpc_server.layer(&authenticator).add_service(
+            typedb_protocol::type_db_server::TypeDbServer::new(service)
+                .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE),
+        );
+        let shutdown = async move {
+            // The tonic server starts a shutdown process when this closure execution finishes
+            shutdown_receiver.changed().await.expect("Expected shutdown receiver signal");
+        };
+        let serve_result = match listener {
+            Some(listener) => {
+                grpc_router.serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown).await
+            }
+            None => grpc_router.serve_with_shutdown(address, shutdown).await,
+        };
+        serve_result.map_err(|err| ServerOpenError::GrpcServe { address, source: Arc::new(err) })
     }
 
     async fn serve_http(
         address: SocketAddr,
+        listener: Option<TcpListener>,
         encryption_config: &EncryptionConfig,
         server_state: Arc<ServerState>,
         mut shutdown_receiver: Receiver<()>,
@@ -407,20 +450,34 @@ impl Server {
             shutdown_handle_clone.graceful_shutdown(None); // None: indefinite shutdown time
         });
 
-        match encryption_config {
-            Some(encryption_config) => {
+        let listener = listener
+            .map(TcpListener::into_std)
+            .transpose()
+            .map_err(|source| ServerOpenError::HttpServe { address, source: Arc::new(source) })?;
+        match (encryption_config, listener) {
+            (Some(encryption_config), Some(listener)) => {
+                axum_server::from_tcp_rustls(listener, RustlsConfig::from_config(Arc::new(encryption_config)))
+                    .handle(shutdown_handle)
+                    .serve(router_service)
+                    .await
+            }
+            (Some(encryption_config), None) => {
                 axum_server::bind_rustls(address, RustlsConfig::from_config(Arc::new(encryption_config)))
                     .handle(shutdown_handle)
                     .serve(router_service)
                     .await
             }
-            None => axum_server::bind(address).handle(shutdown_handle).serve(router_service).await,
+            (None, Some(listener)) => {
+                axum_server::from_tcp(listener).handle(shutdown_handle).serve(router_service).await
+            }
+            (None, None) => axum_server::bind(address).handle(shutdown_handle).serve(router_service).await,
         }
         .map_err(|source| ServerOpenError::HttpServe { address, source: Arc::new(source) })
     }
 
     async fn serve_pgwire(
         address: SocketAddr,
+        listener: Option<TcpListener>,
         server_state: Arc<ServerState>,
         refresh_interval: Duration,
         mut shutdown_receiver: Receiver<()>,
@@ -429,10 +486,13 @@ impl Server {
         let auth_mode = AuthMode::CleartextPassword(Arc::new(ServerStateAuthenticator::new(server_state)));
         let params = ServerParams::default();
 
-        let listener = PgWireListener::bind(&address.to_string(), handler.clone(), params)
-            .await
-            .map_err(|source| ServerOpenError::PgWireServe { address, source: Arc::new(source) })?
-            .with_auth_mode(auth_mode);
+        let listener = match listener {
+            Some(listener) => PgWireListener::from_listener(listener, handler.clone(), params),
+            None => PgWireListener::bind(&address.to_string(), handler.clone(), params)
+                .await
+                .map_err(|source| ServerOpenError::PgWireServe { address, source: Arc::new(source) })?,
+        }
+        .with_auth_mode(auth_mode);
 
         // Bridge the server's Receiver<()> into the listener's Receiver<bool>.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
